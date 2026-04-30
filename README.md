@@ -91,6 +91,21 @@ A new transcript file is started whenever the gap between chunks exceeds 15 minu
 - `~/Library/LaunchAgents/com.stirredo.meeting-capture.plist` — launchd agent
 - `bin/sysaudio` — built audio-capture binary (gitignored)
 
+## Transcription tuning
+
+Defaults: `mlx-community/whisper-large-v3-turbo` with a generic technical-vocab `initial_prompt`. Both are overridable via environment variables, useful for biasing the model toward project-specific proper nouns and acronyms (e.g. internal product names, service acronyms) that no model size can recover on its own.
+
+```bash
+# Use a different mlx-whisper model
+export MEETING_CAPTURE_WHISPER_MODEL="mlx-community/whisper-large-v3-mlx-4bit"
+
+# Bias toward your own vocabulary (≤224 Whisper tokens, ~150 words).
+# Best as a natural-sounding sentence in the same register as the audio.
+export MEETING_CAPTURE_WHISPER_PROMPT="This is a meeting about <Project>, <Service>, <acronym1>, <acronym2>, ..."
+```
+
+Set these in your shell profile or in the launchd plist's `EnvironmentVariables` block to make them stick across daemon restarts.
+
 ## Tests
 
 ```bash
