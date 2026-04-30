@@ -7,6 +7,7 @@ AUDIO_DIR = STATE_DIR / "audio"
 LOG_FILE = STATE_DIR / "daemon.log"
 PID_FILE = STATE_DIR / "daemon.pid"
 PAUSE_FILE = STATE_DIR / "paused"
+VOCAB_FILE = STATE_DIR / "vocab.txt"
 
 LAUNCHD_LABEL = "com.stirredo.meeting-capture"
 LAUNCHD_PLIST = HOME / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"

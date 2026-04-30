@@ -55,6 +55,7 @@ CLI commands for inspection and control:
 | `meeting-capture uninstall` | Remove the launchd auto-start agent |
 | `meeting-capture start` / `stop` | Manual daemon control |
 | `meeting-capture run` | Run daemon in the foreground (for debugging) |
+| `meeting-capture vocab [edit\|clear\|path]` | Show / edit / clear the per-machine Whisper vocabulary bias |
 
 ## Architecture
 
@@ -93,18 +94,31 @@ A new transcript file is started whenever the gap between chunks exceeds 15 minu
 
 ## Transcription tuning
 
-Defaults: `mlx-community/whisper-large-v3-turbo` with a generic technical-vocab `initial_prompt`. Both are overridable via environment variables, useful for biasing the model toward project-specific proper nouns and acronyms (e.g. internal product names, service acronyms) that no model size can recover on its own.
+Defaults: `mlx-community/whisper-large-v3-turbo` with a generic technical-vocab `initial_prompt`. The prompt biases the model toward project-specific proper nouns and acronyms (e.g. internal product names, service acronyms) that no model size can recover on its own.
+
+### Per-machine vocabulary
+
+The recommended way to tune the prompt is the per-machine vocab file at `~/.meeting-capture/vocab.txt`. The daemon re-reads it on every chunk, so changes apply immediately — no restart needed.
 
 ```bash
-# Use a different mlx-whisper model
-export MEETING_CAPTURE_WHISPER_MODEL="mlx-community/whisper-large-v3-mlx-4bit"
-
-# Bias toward your own vocabulary (≤224 Whisper tokens, ~150 words).
-# Best as a natural-sounding sentence in the same register as the audio.
-export MEETING_CAPTURE_WHISPER_PROMPT="This is a meeting about <Project>, <Service>, <acronym1>, <acronym2>, ..."
+meeting-capture vocab          # show the effective prompt and where it came from
+meeting-capture vocab edit     # open the file in $EDITOR (seeded with the default on first edit)
+meeting-capture vocab clear    # remove the file (fall back to env var or built-in default)
+meeting-capture vocab path     # print the file path (useful for piping)
 ```
 
-Set these in your shell profile or in the launchd plist's `EnvironmentVariables` block to make them stick across daemon restarts.
+Keep it concise — Whisper truncates beyond ~224 tokens (~1000 chars). A natural-sounding sentence in the same register as the audio works best (`This is a meeting about <Project>, <Service>, <acronym1>, ...`). An empty file means "no prompt at all" — useful when biasing turns out to hurt on a particular machine.
+
+### Resolution order
+
+`transcribe()` resolves model and prompt in this order:
+
+1. Explicit `initial_prompt=...` argument (programmatic use)
+2. `~/.meeting-capture/vocab.txt`
+3. `MEETING_CAPTURE_WHISPER_PROMPT` env var
+4. Built-in default
+
+Model resolution is `MEETING_CAPTURE_WHISPER_MODEL` env var, then default.
 
 ## Tests
 
