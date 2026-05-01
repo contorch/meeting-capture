@@ -14,6 +14,15 @@ meeting-capture = "meeting_capture.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
+# Opt-in Gemini audio transcription backend. Install with:
+#   pip install -e '.[gemini]'
+# Then set:
+#   MEETING_CAPTURE_TRANSCRIBER=gemini
+# API key from $GOOGLE_API_KEY, $GEMINI_API_KEY, or
+# ~/.config/google/key (mode 600).
+gemini = [
+    "google-genai>=0.3",
+]
 
 [build-system]
 requires = ["hatchling"]
