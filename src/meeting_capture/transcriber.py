@@ -164,7 +164,14 @@ def _transcribe_gemini(audio_path: Path, model: Optional[str]) -> str:
         )
 
     model = model or os.environ.get(ENV_GEMINI_MODEL, DEFAULT_GEMINI_MODEL)
-    client = genai.Client(api_key=api_key)
+    # The google-genai SDK has no read timeout by default — a half-open TLS
+    # connection (network blip, server idle close) can wedge the daemon
+    # indefinitely on SSL_read. Pass an explicit per-request timeout so a
+    # stuck call surfaces as an error and the next chunk can proceed.
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=60_000),  # ms
+    )
 
     audio_bytes = audio_path.read_bytes()
     response = client.models.generate_content(
