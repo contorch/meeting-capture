@@ -15,8 +15,10 @@ underlying mechanism and worked immediately. Lesson preserved as repo_knowledge.
 from __future__ import annotations
 
 import os
+import select
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -36,6 +38,13 @@ SILENCE_RMS = 0.005
 SILENCE_GAP_SECONDS = 3.0
 MIN_CHUNK_SECONDS = 8.0
 MAX_CHUNK_SECONDS = 600.0
+
+# When sysaudio stops producing PCM without exiting (transient SCK hiccup,
+# display sleep, etc.), the daemon used to block forever on a naive
+# proc.stdout.read(). We poll the pipe via select() and bail after this
+# many seconds of silence so the daemon can respawn the subprocess.
+SELECT_POLL_S = 5.0
+STALL_BAIL_S = 30.0
 
 SYSAUDIO_ENV_VAR = "MEETING_CAPTURE_SYSAUDIO"
 # Back-compat: also accept the old audiotee env var if set.
@@ -144,11 +153,43 @@ def stream_chunks(
         sf.write(path, trimmed, sample_rate, subtype="PCM_16")
         return Chunk(path=path, started_at=started, duration_seconds=len(trimmed) / sample_rate)
 
+    stdout_fd = proc.stdout.fileno()
+    pending = bytearray()
+    silent_pipe_s = 0.0  # seconds since sysaudio last produced any data
+
     try:
         while should_record():
-            raw = proc.stdout.read(block_bytes)
-            if not raw:
+            # Wait up to SELECT_POLL_S for data on the pipe. This lets us
+            # notice a stall (sysaudio alive but not producing PCM) instead
+            # of blocking forever on read().
+            ready, _, _ = select.select([stdout_fd], [], [], SELECT_POLL_S)
+            if not ready:
+                silent_pipe_s += SELECT_POLL_S
+                if silent_pipe_s >= STALL_BAIL_S:
+                    print(
+                        f"sysaudio stalled for {silent_pipe_s:.0f}s without "
+                        "producing PCM — bailing so daemon can respawn it",
+                        file=sys.stderr, flush=True,
+                    )
+                    break
+                continue
+
+            # os.read returns whatever is available (1..N bytes), unlike
+            # proc.stdout.read which blocks until block_bytes arrives.
+            # Accumulate into `pending` until we have a full block.
+            try:
+                got = os.read(stdout_fd, block_bytes - len(pending))
+            except OSError:
                 break
+            if not got:
+                break  # clean EOF — sysaudio exited
+            pending.extend(got)
+            silent_pipe_s = 0.0
+            if len(pending) < block_bytes:
+                continue
+
+            raw = bytes(pending)
+            pending.clear()
             block = np.frombuffer(raw, dtype="<i2")
 
             level = _rms_int16(block)
