@@ -46,6 +46,18 @@ MAX_CHUNK_SECONDS = 600.0
 SELECT_POLL_S = 5.0
 STALL_BAIL_S = 30.0
 
+# When sysaudio is alive AND producing PCM but every byte is zero-amplitude,
+# something has stolen system audio capture out from under us — most often
+# another SCK consumer (Cluely, Loom, OBS, recall.ai-based tools) starting
+# mid-session, or the default output device changing. We can't distinguish
+# "user is just listening quietly" from "audio routing is dead" in real
+# time, so we wait until SILENT_AUDIO_BAIL_S of consecutive silence has
+# passed — long enough that genuine quiet stretches don't trigger it, short
+# enough that we catch a broken meeting before it's all lost. After bailing,
+# the daemon's outer loop respawns sysaudio, which is enough to recover
+# from a routing change in many cases.
+SILENT_AUDIO_BAIL_S = 300.0
+
 SYSAUDIO_ENV_VAR = "MEETING_CAPTURE_SYSAUDIO"
 # Back-compat: also accept the old audiotee env var if set.
 AUDIOTEE_ENV_VAR = "MEETING_CAPTURE_AUDIOTEE"
@@ -155,7 +167,8 @@ def stream_chunks(
 
     stdout_fd = proc.stdout.fileno()
     pending = bytearray()
-    silent_pipe_s = 0.0  # seconds since sysaudio last produced any data
+    silent_pipe_s = 0.0   # seconds since sysaudio last produced any data
+    silent_audio_s = 0.0  # consecutive seconds of all-zero PCM from sysaudio
 
     try:
         while should_record():
@@ -194,6 +207,7 @@ def stream_chunks(
 
             level = _rms_int16(block)
             if level >= SILENCE_RMS:
+                silent_audio_s = 0.0
                 if chunk_started is None:
                     chunk_started = time.time()
                 buffer.append(block)
@@ -201,6 +215,20 @@ def stream_chunks(
             elif buffer:
                 buffer.append(block)
                 silent_run += CHUNK_DURATION
+            else:
+                # Mid-recording but no speech yet (or for a long time): track
+                # consecutive all-silence so we can detect a stolen capture.
+                silent_audio_s += CHUNK_DURATION
+                if silent_audio_s >= SILENT_AUDIO_BAIL_S:
+                    print(
+                        f"audio source has been silent for {silent_audio_s:.0f}s — "
+                        "sysaudio is alive but PCM is all-zero. Likely another app "
+                        "is now capturing system audio (Cluely, Loom, OBS, recall.ai-"
+                        "based tools), or the default output device changed. Bailing "
+                        "so daemon can respawn sysaudio.",
+                        file=sys.stderr, flush=True,
+                    )
+                    break
 
             duration = sum(len(b) for b in buffer) / sample_rate
             if buffer and (
