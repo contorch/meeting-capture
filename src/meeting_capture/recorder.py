@@ -58,6 +58,14 @@ STALL_BAIL_S = 30.0
 # from a routing change in many cases.
 SILENT_AUDIO_BAIL_S = 300.0
 
+# Backstop for the SILENT_AUDIO_BAIL_S logic above: if we've gone this long
+# without successfully emitting ANY chunk (regardless of whether PCM is all-
+# zero or has occasional noise spikes that keep silent_audio_s from ticking),
+# bail. This catches the failure mode where the buffer fills with noise that
+# never accumulates enough to chunk — silent_audio_s never ticks because
+# each noise block resets it, but no real speech is being captured either.
+NO_EMIT_BAIL_S = 300.0
+
 SYSAUDIO_ENV_VAR = "MEETING_CAPTURE_SYSAUDIO"
 # Back-compat: also accept the old audiotee env var if set.
 AUDIOTEE_ENV_VAR = "MEETING_CAPTURE_AUDIOTEE"
@@ -167,8 +175,9 @@ def stream_chunks(
 
     stdout_fd = proc.stdout.fileno()
     pending = bytearray()
-    silent_pipe_s = 0.0   # seconds since sysaudio last produced any data
-    silent_audio_s = 0.0  # consecutive seconds of all-zero PCM from sysaudio
+    silent_pipe_s = 0.0     # seconds since sysaudio last produced any data
+    silent_audio_s = 0.0    # consecutive seconds of all-zero PCM from sysaudio
+    last_emit_ts = time.time()  # wall-clock of the last successful chunk emit
 
     try:
         while should_record():
@@ -204,6 +213,23 @@ def stream_chunks(
             raw = bytes(pending)
             pending.clear()
             block = np.frombuffer(raw, dtype="<i2")
+
+            # Backstop bail: if no chunk has emitted in NO_EMIT_BAIL_S, the
+            # buffer is probably full of inter-speech noise that never
+            # accumulates enough usable audio to chunk. Catches the failure
+            # mode where silent_audio_s never ticks because each noise spike
+            # resets it but no speech is being captured either.
+            since_emit = time.time() - last_emit_ts
+            if since_emit >= NO_EMIT_BAIL_S:
+                print(
+                    f"no chunk emitted for {since_emit:.0f}s — recording is "
+                    "alive but no usable speech is being captured. Likely the "
+                    "audio source changed (output-device switch, BT headphone "
+                    "disconnect, another SCK consumer like Cluely/Loom/OBS). "
+                    "Bailing so daemon can respawn sysaudio.",
+                    file=sys.stderr, flush=True,
+                )
+                break
 
             level = _rms_int16(block)
             if level >= SILENCE_RMS:
@@ -243,6 +269,7 @@ def stream_chunks(
 
                 chunk = _emit(audio, started, MIN_CHUNK_SECONDS)
                 if chunk is not None:
+                    last_emit_ts = time.time()
                     yield chunk
 
         # should_record() went False — flush any in-flight buffer

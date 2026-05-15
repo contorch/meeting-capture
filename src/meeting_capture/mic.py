@@ -31,6 +31,8 @@ def _fourcc(s: str) -> int:
 
 
 _K_HARDWARE_PROPERTY_DEVICES = _fourcc("dev#")
+_K_HARDWARE_PROPERTY_DEFAULT_INPUT_DEVICE = _fourcc("dIn ")
+_K_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE = _fourcc("dOut")
 _K_DEVICE_PROPERTY_IS_RUNNING_SOMEWHERE = _fourcc("gone")
 _K_DEVICE_PROPERTY_STREAM_CONFIGURATION = _fourcc("slay")
 _K_OBJECT_PROPERTY_NAME = _fourcc("lnam")
@@ -191,3 +193,35 @@ def mic_name() -> str | None:
         if _has_input_streams(dev_id):
             return _device_name(dev_id)
     return None
+
+
+def _default_device_id(prop_selector: int) -> int | None:
+    if _CA is None:
+        return None
+    addr = _AudioObjectPropertyAddress(
+        prop_selector, _K_SCOPE_GLOBAL, _K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    )
+    val = ctypes.c_uint32(0)
+    size = ctypes.c_uint32(ctypes.sizeof(val))
+    if _CA.AudioObjectGetPropertyData(
+        _KAUDIO_OBJECT_SYSTEM_OBJECT, ctypes.byref(addr), 0, None,
+        ctypes.byref(size), ctypes.byref(val),
+    ) != 0 or val.value == 0:
+        return None
+    return val.value
+
+
+def default_devices_snapshot() -> dict[str, str | None]:
+    """Names of the current default input and output audio devices.
+
+    The daemon polls this and logs a line when either name changes — useful
+    for diagnosing recording dropouts that correlate with output-device
+    switches (Bluetooth (re)connect, headphone unplug, virtual device
+    insertion by other apps, etc.).
+    """
+    in_id = _default_device_id(_K_HARDWARE_PROPERTY_DEFAULT_INPUT_DEVICE)
+    out_id = _default_device_id(_K_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE)
+    return {
+        "input": _device_name(in_id) if in_id else None,
+        "output": _device_name(out_id) if out_id else None,
+    }
