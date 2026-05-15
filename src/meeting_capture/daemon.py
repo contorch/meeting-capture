@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from .mic import is_mic_active, mic_name
+from .mic import default_devices_snapshot, is_mic_active, mic_name
 from .paths import (
     AUDIO_DIR,
     LOG_FILE,
@@ -85,8 +85,29 @@ def run() -> None:
 
     current_session: Path | None = None
     last_chunk_end: float = 0.0
+    last_devices = default_devices_snapshot()
+    log.info(
+        "audio devices: input=%s output=%s",
+        last_devices.get("input"), last_devices.get("output"),
+    )
+    last_device_check = 0.0
 
     def _should_record() -> bool:
+        # Log default-device changes (input + output). The mic poll runs
+        # ~once per second; this is the same cadence so we catch a Bluetooth
+        # disconnect / output reroute within a second of it happening.
+        nonlocal last_devices, last_device_check
+        now = time.time()
+        if now - last_device_check >= 1.0:
+            last_device_check = now
+            devs = default_devices_snapshot()
+            if devs != last_devices:
+                log.info(
+                    "audio devices changed: input %r → %r, output %r → %r",
+                    last_devices.get("input"), devs.get("input"),
+                    last_devices.get("output"), devs.get("output"),
+                )
+                last_devices = devs
         return is_mic_active() and not _is_paused()
 
     try:
