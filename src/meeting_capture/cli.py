@@ -310,7 +310,35 @@ def cmd_stop(_args) -> int:
     return 0
 
 
+def _preserved_env() -> dict:
+    """Collect MEETING_CAPTURE_* config to carry into the plist.
+
+    Reinstalling regenerates the plist; without this, any backend choice (e.g.
+    MEETING_CAPTURE_TRANSCRIBER=gemini) is silently dropped and the daemon falls
+    back to the local-whisper default. That regression once put a daemon on the
+    GPU for 16 days and leaked 24.5 GB of Metal buffers. Preserve such vars from
+    (1) the existing plist and (2) the current environment (env wins).
+    """
+    env: dict[str, str] = {}
+    if LAUNCHD_PLIST.exists():
+        try:
+            existing = plistlib.loads(LAUNCHD_PLIST.read_bytes())
+            for k, v in (existing.get("EnvironmentVariables") or {}).items():
+                if k.startswith("MEETING_CAPTURE_"):
+                    env[k] = v
+        except Exception:
+            pass
+    for k, v in os.environ.items():
+        if k.startswith("MEETING_CAPTURE_"):
+            env[k] = v
+    return env
+
+
 def _plist_payload(python_exe: str) -> bytes:
+    env_vars = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
+    }
+    env_vars.update(_preserved_env())
     payload = {
         "Label": LAUNCHD_LABEL,
         "ProgramArguments": [python_exe, "-m", "meeting_capture.daemon"],
@@ -319,9 +347,7 @@ def _plist_payload(python_exe: str) -> bytes:
         "StandardOutPath": str(LOG_FILE),
         "StandardErrorPath": str(LOG_FILE),
         "WorkingDirectory": str(Path.home()),
-        "EnvironmentVariables": {
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
-        },
+        "EnvironmentVariables": env_vars,
         "ProcessType": "Background",
     }
     return plistlib.dumps(payload)

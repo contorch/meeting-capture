@@ -20,6 +20,7 @@ from .paths import (
 )
 from .recorder import Chunk, stream_chunks
 from .transcriber import transcribe
+from .watchdog import check_and_maybe_exit
 
 SESSION_GAP_SECONDS = 15 * 60
 MIC_POLL_INTERVAL = 2.0
@@ -82,6 +83,13 @@ def run() -> None:
     signal.signal(signal.SIGINT, _shutdown)
 
     log.info("meeting-capture daemon starting (pid=%s, mic=%s)", os.getpid(), mic_name() or "unknown")
+    backend = os.environ.get("MEETING_CAPTURE_TRANSCRIBER", "whisper").lower()
+    log.info(
+        "transcription backend: %s%s",
+        backend,
+        " (LOCAL GPU — set MEETING_CAPTURE_TRANSCRIBER=gemini to use hosted API)"
+        if backend != "gemini" else "",
+    )
 
     current_session: Path | None = None
     last_chunk_end: float = 0.0
@@ -91,6 +99,15 @@ def run() -> None:
         last_devices.get("input"), last_devices.get("output"),
     )
     last_device_check = 0.0
+    last_footprint_check = 0.0
+
+    def _watchdog_tick() -> None:
+        # Throttle the footprint check to ~once a minute regardless of caller.
+        nonlocal last_footprint_check
+        now = time.time()
+        if now - last_footprint_check >= 60.0:
+            last_footprint_check = now
+            check_and_maybe_exit()
 
     def _should_record() -> bool:
         # Log default-device changes (input + output). The mic poll runs
@@ -114,6 +131,7 @@ def run() -> None:
         while True:
             # Outer loop: idle until the mic is in use by another app (= we're in a call).
             while not _should_record():
+                _watchdog_tick()
                 time.sleep(MIC_POLL_INTERVAL)
 
             log.info("mic active — starting recording session")
@@ -145,6 +163,9 @@ def run() -> None:
                     current_session.name if current_session else "?",
                     len(text),
                 )
+
+                # Per-chunk is where a transcription-path leak would accumulate.
+                _watchdog_tick()
 
             log.info("mic inactive — session ended")
     except KeyboardInterrupt:
