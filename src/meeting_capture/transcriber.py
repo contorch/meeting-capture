@@ -76,6 +76,28 @@ ENV_GEMINI_MODEL = "MEETING_CAPTURE_GEMINI_MODEL"
 
 GEMINI_KEY_FILE = Path.home() / ".config" / "google" / "key"
 
+# Cap MLX's Metal buffer cache (bytes). The cache otherwise grows unbounded in a
+# long-lived daemon. 512 MB is comfortably above one decode's working set while
+# bounding the high-water mark. Override via MEETING_CAPTURE_MLX_CACHE_BYTES.
+ENV_MLX_CACHE_BYTES = "MEETING_CAPTURE_MLX_CACHE_BYTES"
+DEFAULT_MLX_CACHE_BYTES = 512 * 1024 * 1024
+_mlx_cache_bounded = False
+
+
+def _ensure_mlx_cache_bounded(mx) -> None:
+    """Set MLX's Metal buffer-cache limit once per process (idempotent)."""
+    global _mlx_cache_bounded
+    if _mlx_cache_bounded:
+        return
+    try:
+        limit = int(os.environ.get(ENV_MLX_CACHE_BYTES, DEFAULT_MLX_CACHE_BYTES))
+        mx.set_cache_limit(limit)
+    except Exception:
+        # Older/newer mlx may rename this; clear_cache() in the caller still
+        # bounds growth, so a missing set_cache_limit is non-fatal.
+        pass
+    _mlx_cache_bounded = True
+
 
 def resolved_prompt() -> tuple[str | None, str]:
     """Return (prompt_text, source_label). prompt_text is None when the user
@@ -126,17 +148,28 @@ def _transcribe_whisper(
 ) -> str:
     """Local mlx-whisper backend (default)."""
     import mlx_whisper
+    import mlx.core as mx
+
+    # MLX keeps a process-wide Metal buffer cache with NO default limit. In a
+    # long-lived daemon those freed-but-cached GPU buffers ratchet up the
+    # IOAccelerator footprint indefinitely (observed: 24.5 GB / 5328 regions
+    # after ~16 days, triggering a system-wide OOM). Bound the cache once, then
+    # drain it after every chunk so freed Metal buffers return to the OS.
+    _ensure_mlx_cache_bounded(mx)
 
     model = model or os.environ.get(ENV_MODEL, DEFAULT_MODEL)
     if initial_prompt is None:
         initial_prompt, _ = resolved_prompt()
 
-    result = mlx_whisper.transcribe(
-        str(audio_path),
-        path_or_hf_repo=model,
-        initial_prompt=initial_prompt or None,
-    )
-    return (result.get("text") or "").strip()
+    try:
+        result = mlx_whisper.transcribe(
+            str(audio_path),
+            path_or_hf_repo=model,
+            initial_prompt=initial_prompt or None,
+        )
+        return (result.get("text") or "").strip()
+    finally:
+        mx.clear_cache()
 
 
 def _transcribe_gemini(audio_path: Path, model: Optional[str]) -> str:
