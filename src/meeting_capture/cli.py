@@ -20,7 +20,6 @@ from .paths import (
     PAUSE_FILE,
     PID_FILE,
     TRANSCRIPTS_DIR,
-    VOCAB_FILE,
     ensure_dirs,
 )
 
@@ -142,7 +141,6 @@ def cmd_tail(_args) -> int:
 
 def cmd_doctor(_args) -> int:
     """Full health check — every prereq, every binary, every permission, every daemon state."""
-    from shutil import which
     from .recorder import find_audiotee, find_sysaudio
     import platform
 
@@ -168,11 +166,6 @@ def cmd_doctor(_args) -> int:
             _ok(f"macOS {mac_ver}")
         else:
             _fail(f"macOS {mac_ver} too old", "Need 13.0+ for ScreenCaptureKit. Update macOS.")
-    arch = platform.machine()
-    if arch == "arm64":
-        _ok("Apple Silicon (arm64)")
-    else:
-        _fail(f"arch is {arch}", "mlx-whisper requires arm64. No fix on Intel.")
 
     print("\nBinaries:")
     sysaudio = find_sysaudio()
@@ -183,10 +176,6 @@ def cmd_doctor(_args) -> int:
     audiotee = find_audiotee()
     if audiotee is not None:
         print(f"  · audiotee (fallback) — {audiotee}")
-    if which("ffmpeg"):
-        _ok("ffmpeg", which("ffmpeg"))
-    else:
-        _fail("ffmpeg missing", "brew install ffmpeg  (mlx-whisper shells out to it)")
 
     print("\nMic detection:")
     name = mic_name()
@@ -227,16 +216,15 @@ def cmd_doctor(_args) -> int:
     else:
         print(f"  · no log file yet ({LOG_FILE}) — daemon hasn't run")
 
-    print("\nTranscription:")
-    from .transcriber import DEFAULT_MODEL, ENV_MODEL, resolved_prompt
-    model = os.environ.get(ENV_MODEL, DEFAULT_MODEL)
-    _ok("model", model + (f" (via {ENV_MODEL})" if ENV_MODEL in os.environ else ""))
-    prompt, source = resolved_prompt()
-    if prompt is None:
-        print(f"  · vocabulary bias: none — {source}")
+    print("\nTranscription (hosted Gemini):")
+    from .transcriber import DEFAULT_GEMINI_MODEL, ENV_GEMINI_MODEL, _resolve_gemini_api_key
+    model = os.environ.get(ENV_GEMINI_MODEL, DEFAULT_GEMINI_MODEL)
+    _ok("model", model + (f" (via {ENV_GEMINI_MODEL})" if ENV_GEMINI_MODEL in os.environ else ""))
+    if _resolve_gemini_api_key():
+        _ok("Google API key", "found")
     else:
-        print(f"  · vocabulary bias: {len(prompt)} chars — {source}")
-        print(f"     edit with: meeting-capture vocab edit")
+        _fail("Google API key missing",
+              "set GOOGLE_API_KEY / GEMINI_API_KEY or write ~/.config/google/key (mode 600)")
 
     print("\nManual gates (cannot be checked from code):")
     print("  ?  Screen Recording TCC granted to parent terminal (Warp/Terminal/iTerm)")
@@ -400,47 +388,6 @@ def cmd_check(_args) -> int:
     return 0
 
 
-def cmd_vocab(args) -> int:
-    """Show, edit, or clear the per-machine vocabulary bias passed to Whisper."""
-    from .transcriber import DEFAULT_INITIAL_PROMPT, resolved_prompt
-
-    if args.action == "edit":
-        VOCAB_FILE.parent.mkdir(parents=True, exist_ok=True)
-        if not VOCAB_FILE.exists():
-            VOCAB_FILE.write_text(DEFAULT_INITIAL_PROMPT + "\n", encoding="utf-8")
-        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nano"
-        return subprocess.run([editor, str(VOCAB_FILE)]).returncode
-
-    if args.action == "clear":
-        if VOCAB_FILE.exists():
-            VOCAB_FILE.unlink()
-            print(f"removed {VOCAB_FILE}")
-        else:
-            print(f"{VOCAB_FILE} does not exist; resolving from env / default")
-        return 0
-
-    if args.action == "path":
-        print(VOCAB_FILE)
-        return 0
-
-    # Default: show
-    prompt, source = resolved_prompt()
-    print(f"source: {source}")
-    print()
-    if prompt is None:
-        print("effective prompt: (none — Whisper will not be biased)")
-    else:
-        print("effective prompt:")
-        print(prompt)
-        if len(prompt) > 1000:
-            print()
-            print(
-                f"warning: prompt is {len(prompt)} chars; Whisper truncates "
-                f"beyond ~224 tokens (~1000 chars)."
-            )
-    return 0
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="meeting-capture")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -458,19 +405,6 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("last", help="print the path of the most recent transcript").set_defaults(func=cmd_last)
     sub.add_parser("tail", help="follow the daemon log").set_defaults(func=cmd_tail)
     sub.add_parser("doctor", help="full health check (binaries, permissions, daemon)").set_defaults(func=cmd_doctor)
-
-    p_vocab = sub.add_parser(
-        "vocab",
-        help="show / edit / clear the per-machine Whisper vocabulary bias",
-    )
-    p_vocab.add_argument(
-        "action",
-        nargs="?",
-        default="show",
-        choices=["show", "edit", "clear", "path"],
-        help="show (default), edit (in $EDITOR), clear (delete file), path",
-    )
-    p_vocab.set_defaults(func=cmd_vocab)
 
     args = parser.parse_args(argv)
     return args.func(args)

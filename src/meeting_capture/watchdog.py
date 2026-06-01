@@ -24,8 +24,8 @@ import sys
 log = logging.getLogger("meeting_capture.watchdog")
 
 # Self-exit above this footprint. Override via MEETING_CAPTURE_MAX_FOOTPRINT_MB.
-# 2 GB is far above a healthy daemon (~20 MB on Gemini, a few hundred MB on a
-# bounded local-whisper path) but well below the point where the machine thrashes.
+# 2 GB is far above a healthy daemon (~20-80 MB in steady state) but well below
+# the point where the machine starts thrashing.
 ENV_MAX_FOOTPRINT_MB = "MEETING_CAPTURE_MAX_FOOTPRINT_MB"
 DEFAULT_MAX_FOOTPRINT_MB = 2048
 
@@ -76,7 +76,7 @@ def check_and_maybe_exit() -> None:
     if fp >= limit:
         log.error(
             "phys_footprint %.0f MB exceeds limit %.0f MB — exiting for a clean "
-            "launchd respawn (likely a memory leak; check the transcription backend)",
+            "launchd respawn (likely a memory leak)",
             fp / 1024 / 1024,
             limit / 1024 / 1024,
         )
