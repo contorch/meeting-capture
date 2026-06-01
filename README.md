@@ -1,18 +1,19 @@
 # meeting-capture
 
-Always-on, fully local meeting transcription daemon for macOS. Detects when another app is using your microphone (any video/audio call), captures system audio output via ScreenCaptureKit, transcribes it locally with mlx-whisper, and writes timestamped Markdown transcripts to `~/transcripts/`.
+Always-on meeting transcription daemon for macOS. Detects when another app is using your microphone (any video/audio call), captures system audio output via ScreenCaptureKit, transcribes it via Google's hosted Gemini audio models, and writes timestamped Markdown transcripts to `~/transcripts/`.
 
 No driver, no kernel extension, no `sudo`, no reboot. One user-grantable Screen Recording permission.
+
+> **Note:** transcription is hosted (Gemini), so each audio chunk is sent to Google's API and a Google API key is required. A previous local mlx-whisper backend was removed — it ran on the GPU and its unbounded MLX Metal buffer cache leaked tens of GB in a long-lived daemon.
 
 Pairs with [context-orchestrator](https://github.com/stirredo/context-orchestrator), which auto-indexes the transcripts into a searchable vector store. The two are coupled only via the `~/transcripts/` directory; either runs independently.
 
 ## Requirements
 
 - macOS 13.0 or later (ScreenCaptureKit)
-- Apple Silicon (mlx-whisper)
 - Python 3.10+
 - Xcode command-line tools (`xcode-select --install`)
-- Homebrew (for `ffmpeg`)
+- A Google API key for Gemini — from `$GOOGLE_API_KEY`, `$GEMINI_API_KEY`, or `~/.config/google/key` (mode 600)
 
 ## Install
 
@@ -22,7 +23,7 @@ cd meeting-capture
 ./setup.sh
 ```
 
-`setup.sh` checks prerequisites, installs `ffmpeg`, builds the `sysaudio` Swift binary, creates a Python venv, registers the launchd auto-start agent, and triggers the macOS permission prompt.
+`setup.sh` checks prerequisites, builds the `sysaudio` Swift binary, creates a Python venv, registers the launchd auto-start agent, and triggers the macOS permission prompt.
 
 After setup:
 
@@ -55,7 +56,6 @@ CLI commands for inspection and control:
 | `meeting-capture uninstall` | Remove the launchd auto-start agent |
 | `meeting-capture start` / `stop` | Manual daemon control |
 | `meeting-capture run` | Run daemon in the foreground (for debugging) |
-| `meeting-capture vocab [edit\|clear\|path]` | Show / edit / clear the per-machine Whisper vocabulary bias |
 
 ## Architecture
 
@@ -68,7 +68,7 @@ mic activates                                     mic deactivates
 │  - polls Core Audio HAL for mic activity every 2s                │
 │  - while active: spawns sysaudio subprocess                      │
 │  - reads PCM, splits on silence (≥3s gap, ≥8s min, ≤600s max)    │
-│  - hands each chunk to mlx-whisper, appends text to .md file     │
+│  - sends each chunk to Gemini, appends text to .md file          │
 │  - on mic-off: flushes in-flight buffer, terminates sysaudio     │
 └──────────────────────────────────────────────────────────────────┘
             │                                          │
@@ -92,33 +92,23 @@ A new transcript file is started whenever the gap between chunks exceeds 15 minu
 - `~/Library/LaunchAgents/com.stirredo.meeting-capture.plist` — launchd agent
 - `bin/sysaudio` — built audio-capture binary (gitignored)
 
-## Transcription tuning
+## Transcription
 
-Defaults: `mlx-community/whisper-large-v3-turbo` with a generic technical-vocab `initial_prompt`. The prompt biases the model toward project-specific proper nouns and acronyms (e.g. internal product names, service acronyms) that no model size can recover on its own.
+Transcription is hosted via Google's Gemini audio models. Default model: `gemini-2.5-flash` (~$0.0002/min); override with the `MEETING_CAPTURE_GEMINI_MODEL` env var. Gemini returns an empty string for silent/unintelligible audio (no "Thank you." hallucinations) and applies best-effort speaker labels via prompt instructions.
 
-### Per-machine vocabulary
+### API key
 
-The recommended way to tune the prompt is the per-machine vocab file at `~/.meeting-capture/vocab.txt`. The daemon re-reads it on every chunk, so changes apply immediately — no restart needed.
+A Google API key is required, resolved in this order:
 
-```bash
-meeting-capture vocab          # show the effective prompt and where it came from
-meeting-capture vocab edit     # open the file in $EDITOR (seeded with the default on first edit)
-meeting-capture vocab clear    # remove the file (fall back to env var or built-in default)
-meeting-capture vocab path     # print the file path (useful for piping)
-```
+1. `$GOOGLE_API_KEY`
+2. `$GEMINI_API_KEY`
+3. `~/.config/google/key` (mode 600)
 
-Keep it concise — Whisper truncates beyond ~224 tokens (~1000 chars). A natural-sounding sentence in the same register as the audio works best (`This is a meeting about <Project>, <Service>, <acronym1>, ...`). An empty file means "no prompt at all" — useful when biasing turns out to hurt on a particular machine.
+`meeting-capture doctor` reports whether a key is found.
 
-### Resolution order
+### Memory guardrail
 
-`transcribe()` resolves model and prompt in this order:
-
-1. Explicit `initial_prompt=...` argument (programmatic use)
-2. `~/.meeting-capture/vocab.txt`
-3. `MEETING_CAPTURE_WHISPER_PROMPT` env var
-4. Built-in default
-
-Model resolution is `MEETING_CAPTURE_WHISPER_MODEL` env var, then default.
+The daemon self-exits (and launchd respawns it) if its `phys_footprint` exceeds `MEETING_CAPTURE_MAX_FOOTPRINT_MB` (default 2048) — a backstop against any runaway-memory regression. The check uses `phys_footprint`, not RSS, because leaked memory is often compressed/swapped and invisible to RSS.
 
 ## Tests
 

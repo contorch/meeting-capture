@@ -43,14 +43,6 @@ else
     fail "macOS $OS_VERSION is too old. Need 13.0+ for ScreenCaptureKit. Update macOS."
 fi
 
-# Apple Silicon (mlx-whisper)
-ARCH=$(uname -m)
-if [ "$ARCH" = "arm64" ]; then
-    ok "Apple Silicon (arm64)"
-else
-    fail "$ARCH is not Apple Silicon. mlx-whisper requires arm64. No fix available on Intel."
-fi
-
 # Python 3.10+
 if command -v python3 &>/dev/null; then
     PY_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
@@ -79,43 +71,12 @@ else
     fail "swift not found. Install Xcode CLI tools: \`xcode-select --install\` (interactive)."
 fi
 
-# Homebrew — offer to install
-if command -v brew &>/dev/null; then
-    ok "Homebrew $(brew --version | head -1 | awk '{print $2}')"
-else
-    echo "  ⚠ Homebrew not installed. Need it for ffmpeg (required by mlx-whisper)."
-    read -r -p "    Install Homebrew now? Will prompt for sudo. [y/N] " yn
-    case "$yn" in
-        [Yy]*)
-            NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-            # Add brew to PATH for the rest of this script
-            if [ -x /opt/homebrew/bin/brew ]; then
-                eval "$(/opt/homebrew/bin/brew shellenv)"
-                ok "Homebrew installed"
-            else
-                fail "Homebrew install did not produce /opt/homebrew/bin/brew. Install manually from https://brew.sh"
-            fi
-            ;;
-        *)
-            fail "Homebrew required. Install from https://brew.sh and re-run."
-            ;;
-    esac
-fi
-
 if [ "$PREREQS_OK" -eq 0 ]; then
     echo ""
     echo "Prerequisites missing. Fix the items marked ✗ above and re-run."
     exit 1
 fi
 echo ""
-
-# ---------------------------------------------------------------------------
-# 1. ffmpeg (mlx-whisper shells out to it for WAV decode — silent failure if missing)
-# ---------------------------------------------------------------------------
-if ! command -v ffmpeg &>/dev/null; then
-    echo "Installing ffmpeg (mlx-whisper dependency)..."
-    brew install ffmpeg
-fi
 
 # ---------------------------------------------------------------------------
 # 2. Build sysaudio (ScreenCaptureKit)

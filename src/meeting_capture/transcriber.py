@@ -1,38 +1,18 @@
-"""Transcription backends for meeting-capture audio chunks.
+"""Transcription for meeting-capture audio chunks (hosted Gemini backend).
 
-Two backends, switchable via the `MEETING_CAPTURE_TRANSCRIBER` env var:
+Audio chunks are transcribed via Google's Gemini audio models (google-genai):
+cheap (~$0.0002/min on gemini-2.5-flash), with far fewer silence
+hallucinations than local models and best-effort speaker labels via prompt
+instructions.
 
-  - whisper (default) — local mlx-whisper on Apple Silicon. Free, offline,
-    no privacy concerns. `whisper-large-v3-turbo` by default, biased with
-    `initial_prompt` for proper-noun accuracy.
+Requires a Google API key, resolved in order from:
+  $GOOGLE_API_KEY, $GEMINI_API_KEY, or ~/.config/google/key (mode 600).
 
-  - gemini (opt-in) — hosted Gemini audio transcription via google-genai.
-    Cheap (~$0.0002/min on gemini-2.5-flash), much fewer silence
-    hallucinations than whisper-large, best-effort speaker labels via
-    prompt instructions. Requires the `[gemini]` extra and a Google API
-    key from $GOOGLE_API_KEY, $GEMINI_API_KEY, or ~/.config/google/key
-    (mode 600).
+The model defaults to gemini-2.5-flash; override with MEETING_CAPTURE_GEMINI_MODEL.
 
-Whisper's `initial_prompt` biases token prediction toward the listed terms.
-It is the most effective fix for proper-noun and acronym errors (no model
-size will recover terms that aren't in training data — e.g. internal project
-names, custom acronyms).
-
-Configuration precedence for the whisper prompt (most → least specific):
-  1. Explicit `initial_prompt=...` argument to `transcribe()`
-  2. Per-machine file: ~/.meeting-capture/vocab.txt
-  3. Env var:           MEETING_CAPTURE_WHISPER_PROMPT
-  4. Built-in default
-
-The vocab file is the recommended way to bias for project-specific terms —
-edit with `meeting-capture vocab edit`. An empty file means "no prompt at
-all" (explicit opt-out, useful when biasing hurts on a particular machine's
-audio).
-
-Gemini ignores the whisper prompt knobs and uses GEMINI_TRANSCRIBE_INSTRUCTION
-internally — its instruction-following accuracy is high enough that vocab
-biasing is unnecessary, and it doesn't suffer the silence-hallucination
-behavior that makes the whisper prompt important.
+(A local mlx-whisper backend was removed: it ran on the GPU and its unbounded
+MLX Metal buffer cache leaked tens of GB in a long-lived daemon. Transcription
+is hosted-only now.)
 """
 from __future__ import annotations
 
@@ -40,24 +20,13 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from .paths import VOCAB_FILE
-
-DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
-# Generic technical vocabulary — Whisper "small" tends to mishear these.
-# Override per machine via ~/.meeting-capture/vocab.txt for project-specific
-# terms (use `meeting-capture vocab edit`).
-DEFAULT_INITIAL_PROMPT = (
-    "This is a technical engineering meeting discussing software "
-    "architecture, APIs, rate limiting, throttling, retries, JWT and "
-    "OAuth authentication, integrators, gRPC, REST, OpenSearch, "
-    "ChromaDB, Envoy, Kubernetes, design documents, and TDDs."
-)
+ENV_GEMINI_MODEL = "MEETING_CAPTURE_GEMINI_MODEL"
+GEMINI_KEY_FILE = Path.home() / ".config" / "google" / "key"
 
-# Prompt for Gemini: ask for a clean transcript with speaker labels when
-# multiple voices are present. Returns empty for silent audio rather than
-# whisper's "Thank you" hallucinations.
+# Ask for a clean transcript with speaker labels when multiple voices are
+# present. Returns empty for silent audio rather than hallucinated filler.
 GEMINI_TRANSCRIBE_INSTRUCTION = (
     "Transcribe the audio. Return only the spoken text, nothing else. "
     "If multiple speakers are clearly distinguishable, prefix each "
@@ -69,129 +38,36 @@ GEMINI_TRANSCRIBE_INSTRUCTION = (
     "beyond the speaker prefixes."
 )
 
-ENV_TRANSCRIBER = "MEETING_CAPTURE_TRANSCRIBER"
-ENV_MODEL = "MEETING_CAPTURE_WHISPER_MODEL"
-ENV_PROMPT = "MEETING_CAPTURE_WHISPER_PROMPT"
-ENV_GEMINI_MODEL = "MEETING_CAPTURE_GEMINI_MODEL"
 
-GEMINI_KEY_FILE = Path.home() / ".config" / "google" / "key"
-
-# Cap MLX's Metal buffer cache (bytes). The cache otherwise grows unbounded in a
-# long-lived daemon. 512 MB is comfortably above one decode's working set while
-# bounding the high-water mark. Override via MEETING_CAPTURE_MLX_CACHE_BYTES.
-ENV_MLX_CACHE_BYTES = "MEETING_CAPTURE_MLX_CACHE_BYTES"
-DEFAULT_MLX_CACHE_BYTES = 512 * 1024 * 1024
-_mlx_cache_bounded = False
-
-
-def _ensure_mlx_cache_bounded(mx) -> None:
-    """Set MLX's Metal buffer-cache limit once per process (idempotent)."""
-    global _mlx_cache_bounded
-    if _mlx_cache_bounded:
-        return
-    try:
-        limit = int(os.environ.get(ENV_MLX_CACHE_BYTES, DEFAULT_MLX_CACHE_BYTES))
-        mx.set_cache_limit(limit)
-    except Exception:
-        # Older/newer mlx may rename this; clear_cache() in the caller still
-        # bounds growth, so a missing set_cache_limit is non-fatal.
-        pass
-    _mlx_cache_bounded = True
-
-
-def resolved_prompt() -> tuple[str | None, str]:
-    """Return (prompt_text, source_label). prompt_text is None when the user
-    explicitly opted out (empty vocab file or empty env var)."""
-    if VOCAB_FILE.exists():
-        text = VOCAB_FILE.read_text(encoding="utf-8").strip()
-        return (text or None, f"vocab file ({VOCAB_FILE})")
-    if ENV_PROMPT in os.environ:
-        v = os.environ[ENV_PROMPT]
-        return (v or None, f"{ENV_PROMPT} env var")
-    return (DEFAULT_INITIAL_PROMPT, "built-in default")
-
-
-def transcribe(
-    audio_path: Path,
-    model: Optional[str] = None,
-    initial_prompt: Optional[str] = None,
-) -> str:
-    """Transcribe a single audio chunk.
-
-    Backend chosen by `MEETING_CAPTURE_TRANSCRIBER` env var (default
-    "whisper"). Whisper is free + offline; Gemini is hosted, cheap, and
-    has noticeably fewer silence hallucinations.
+def transcribe(audio_path: Path, model: Optional[str] = None) -> str:
+    """Transcribe a single audio chunk via Gemini.
 
     Args:
         audio_path: WAV file (16kHz mono int16 expected).
-        model: backend-specific override. Whisper: HF repo path. Gemini:
-            model name like "gemini-2.5-flash". Defaults from the
-            corresponding ENV_* var.
-        initial_prompt: whisper-only — biasing prompt for proper nouns.
-            Ignored by Gemini (which uses GEMINI_TRANSCRIBE_INSTRUCTION).
+        model: Gemini model name override (defaults from ENV_GEMINI_MODEL /
+            DEFAULT_GEMINI_MODEL).
 
     Returns:
-        Transcribed text. Empty string for silent / unintelligible audio
-        (Gemini's preferred behavior; whisper unfortunately hallucinates
-        "Thank you." instead).
+        Transcribed text. Empty string for silent / unintelligible audio.
     """
-    backend = os.environ.get(ENV_TRANSCRIBER, "whisper").lower()
-    if backend == "gemini":
-        return _transcribe_gemini(audio_path, model)
-    return _transcribe_whisper(audio_path, model, initial_prompt)
-
-
-def _transcribe_whisper(
-    audio_path: Path,
-    model: Optional[str],
-    initial_prompt: Optional[str],
-) -> str:
-    """Local mlx-whisper backend (default)."""
-    import mlx_whisper
-    import mlx.core as mx
-
-    # MLX keeps a process-wide Metal buffer cache with NO default limit. In a
-    # long-lived daemon those freed-but-cached GPU buffers ratchet up the
-    # IOAccelerator footprint indefinitely (observed: 24.5 GB / 5328 regions
-    # after ~16 days, triggering a system-wide OOM). Bound the cache once, then
-    # drain it after every chunk so freed Metal buffers return to the OS.
-    _ensure_mlx_cache_bounded(mx)
-
-    model = model or os.environ.get(ENV_MODEL, DEFAULT_MODEL)
-    if initial_prompt is None:
-        initial_prompt, _ = resolved_prompt()
-
-    try:
-        result = mlx_whisper.transcribe(
-            str(audio_path),
-            path_or_hf_repo=model,
-            initial_prompt=initial_prompt or None,
-        )
-        return (result.get("text") or "").strip()
-    finally:
-        mx.clear_cache()
+    return _transcribe_gemini(audio_path, model)
 
 
 def _transcribe_gemini(audio_path: Path, model: Optional[str]) -> str:
-    """Hosted Gemini audio transcription backend.
-
-    Reads the audio file inline (Gemini accepts up to 20 MB inline; our
-    8-second 16 kHz mono int16 chunks are ~256 KB). Uses temperature 0.0
-    for stability.
-    """
+    """Hosted Gemini audio transcription backend."""
     try:
         from google import genai
         from google.genai import types
     except ImportError as e:
         raise RuntimeError(
-            f"{ENV_TRANSCRIBER}=gemini requires the 'gemini' extra. "
-            "Install with: pip install -e '.[gemini]'"
+            "meeting-capture requires the google-genai package. "
+            "Install with: pip install -e ."
         ) from e
 
     api_key = _resolve_gemini_api_key()
     if not api_key:
         raise RuntimeError(
-            f"{ENV_TRANSCRIBER}=gemini needs a Google API key. "
+            "Gemini transcription needs a Google API key. "
             "Set GOOGLE_API_KEY or GEMINI_API_KEY, or write the key to "
             f"{GEMINI_KEY_FILE} (mode 600)."
         )

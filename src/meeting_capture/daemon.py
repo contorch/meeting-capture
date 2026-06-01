@@ -83,12 +83,11 @@ def run() -> None:
     signal.signal(signal.SIGINT, _shutdown)
 
     log.info("meeting-capture daemon starting (pid=%s, mic=%s)", os.getpid(), mic_name() or "unknown")
-    backend = os.environ.get("MEETING_CAPTURE_TRANSCRIBER", "whisper").lower()
+    from .transcriber import DEFAULT_GEMINI_MODEL, ENV_GEMINI_MODEL, _resolve_gemini_api_key
     log.info(
-        "transcription backend: %s%s",
-        backend,
-        " (LOCAL GPU — set MEETING_CAPTURE_TRANSCRIBER=gemini to use hosted API)"
-        if backend != "gemini" else "",
+        "transcription: gemini (model=%s, api_key=%s)",
+        os.environ.get(ENV_GEMINI_MODEL, DEFAULT_GEMINI_MODEL),
+        "present" if _resolve_gemini_api_key() else "MISSING — transcription will fail",
     )
 
     current_session: Path | None = None
