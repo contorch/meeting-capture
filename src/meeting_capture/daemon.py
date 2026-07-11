@@ -18,8 +18,8 @@ from .paths import (
     TRANSCRIPTS_DIR,
     ensure_dirs,
 )
-from .recorder import Chunk, stream_chunks
-from .transcriber import transcribe
+from .recorder import Chunk, mic_capture_enabled, mic_capture_supported, stream_chunks
+from .transcriber import GEMINI_TRANSCRIBE_INSTRUCTION_ME, transcribe
 from .watchdog import check_and_maybe_exit
 
 SESSION_GAP_SECONDS = 15 * 60
@@ -47,6 +47,12 @@ def _session_path(started_at: float) -> Path:
     return TRANSCRIPTS_DIR / f"meeting-{stamp}.md"
 
 
+# Chunk roles → transcript speaker labels. "them" chunks may still contain
+# per-clip [SPEAKER_n] prefixes from Gemini when several remote voices are
+# distinguishable within the clip.
+ROLE_LABELS = {"me": "**Me:**", "them": "**Them:**"}
+
+
 def _append(transcript_path: Path, chunk: Chunk, text: str) -> None:
     if not text:
         return
@@ -54,8 +60,10 @@ def _append(transcript_path: Path, chunk: Chunk, text: str) -> None:
         header = f"# Meeting transcript {transcript_path.stem}\n\n"
         transcript_path.write_text(header, encoding="utf-8")
     ts = dt.datetime.fromtimestamp(chunk.started_at).strftime("%H:%M:%S")
+    label = ROLE_LABELS.get(chunk.role)
+    prefix = f"[{ts}] {label} " if label else f"[{ts}] "
     with transcript_path.open("a", encoding="utf-8") as f:
-        f.write(f"[{ts}] {text}\n\n")
+        f.write(f"{prefix}{text}\n\n")
 
 
 def _write_pid() -> None:
@@ -89,6 +97,12 @@ def run() -> None:
         os.environ.get(ENV_GEMINI_MODEL, DEFAULT_GEMINI_MODEL),
         "present" if _resolve_gemini_api_key() else "MISSING — transcription will fail",
     )
+    if mic_capture_enabled():
+        log.info("mic capture (own voice): enabled — two-channel me/them transcripts")
+    elif not mic_capture_supported():
+        log.info("mic capture (own voice): disabled — needs macOS 15+ (system audio only)")
+    else:
+        log.info("mic capture (own voice): disabled via MEETING_CAPTURE_MIC (system audio only)")
 
     current_session: Path | None = None
     last_chunk_end: float = 0.0
@@ -143,7 +157,8 @@ def run() -> None:
                     log.info("new session: %s", current_session.name)
 
                 try:
-                    text = transcribe(chunk.path)
+                    instruction = GEMINI_TRANSCRIBE_INSTRUCTION_ME if chunk.role == "me" else None
+                    text = transcribe(chunk.path, instruction=instruction)
                 except Exception as exc:
                     log.exception("transcription failed for %s: %s", chunk.path, exc)
                     text = ""
@@ -157,8 +172,9 @@ def run() -> None:
                     pass
 
                 log.info(
-                    "chunk %.1fs -> %s (%d chars)",
+                    "chunk %.1fs [%s] -> %s (%d chars)",
                     chunk.duration_seconds,
+                    chunk.role,
                     current_session.name if current_session else "?",
                     len(text),
                 )

@@ -29,3 +29,14 @@ def test_append_skips_empty(tmp_path):
     chunk = Chunk(path=Path("/tmp/x.wav"), started_at=1714003200.0, duration_seconds=5.0)
     daemon._append(transcript, chunk, "")
     assert not transcript.exists()
+
+
+def test_append_labels_roles(tmp_path):
+    transcript = tmp_path / "meeting-z.md"
+    them = Chunk(path=Path("/tmp/a.wav"), started_at=1714003200.0, duration_seconds=5.0, role="them")
+    me = Chunk(path=Path("/tmp/b.wav"), started_at=1714003210.0, duration_seconds=5.0, role="me")
+    daemon._append(transcript, them, "how was the launch?")
+    daemon._append(transcript, me, "shipped last night")
+    text = transcript.read_text()
+    assert "**Them:** how was the launch?" in text
+    assert "**Me:** shipped last night" in text

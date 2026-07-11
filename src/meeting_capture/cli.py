@@ -141,7 +141,13 @@ def cmd_tail(_args) -> int:
 
 def cmd_doctor(_args) -> int:
     """Full health check — every prereq, every binary, every permission, every daemon state."""
-    from .recorder import find_audiotee, find_sysaudio
+    from .recorder import (
+        MIC_ENV_VAR,
+        find_audiotee,
+        find_sysaudio,
+        mic_capture_enabled,
+        mic_capture_supported,
+    )
     import platform
 
     failures = 0
@@ -186,6 +192,14 @@ def cmd_doctor(_args) -> int:
     in_use = is_mic_active()
     print(f"  · mic in use right now: {in_use}{(' — ' + (active_mic_name() or '?')) if in_use else ''}")
 
+    print("\nTwo-channel capture (own voice):")
+    if mic_capture_enabled():
+        _ok("mic capture enabled", "transcripts get **Me:** / **Them:** labels")
+    elif not mic_capture_supported():
+        print("  · mic capture unavailable — needs macOS 15+ (system audio only)")
+    else:
+        print(f"  · mic capture disabled via {MIC_ENV_VAR} (system audio only)")
+
     print("\nDaemon:")
     pid = _read_pid()
     if pid and _is_running(pid):
@@ -229,6 +243,8 @@ def cmd_doctor(_args) -> int:
     print("\nManual gates (cannot be checked from code):")
     print("  ?  Screen Recording TCC granted to parent terminal (Warp/Terminal/iTerm)")
     print("     System Settings -> Privacy & Security -> Screen & System Audio Recording")
+    print("  ?  Microphone TCC granted to the same parent terminal (for own-voice capture)")
+    print("     System Settings -> Privacy & Security -> Microphone")
     print("  ?  Terminal restarted once after granting permission")
     print("  ?  Claude Code restarted (so the orchestrator MCP server is live)")
 

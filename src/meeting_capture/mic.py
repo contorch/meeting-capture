@@ -1,11 +1,24 @@
 """Microphone activity detection — proxy for 'we are in a call right now'.
 
-Queries the Core Audio HAL property `kAudioDevicePropertyDeviceIsRunningSomewhere`
-on every input device. This is the same signal that drives the orange mic
-indicator in the macOS menu bar — true when ANY process has the device opened
-for IO. Catches Zoom, Teams, FaceTime, browser meetings, Slack calls,
-Discord, etc. — anything that uses the mic, regardless of whether it goes
-through AVCaptureSession or Core Audio directly.
+Enumerates Core Audio HAL process objects (`kAudioHardwarePropertyProcessObjectList`,
+macOS 14+) and reports the mic as active when a process OTHER than Apple's
+`replayd` has audio input running (`kAudioProcessPropertyIsRunningInput`).
+Catches Zoom, Teams, FaceTime, browser meetings, Slack calls, Discord,
+etc. — anything that opens the mic, regardless of whether it goes through
+AVCaptureSession or Core Audio directly.
+
+Why replayd is excluded: ALL ScreenCaptureKit capture — including our own
+sysaudio --mic (own-voice channel) — is attributed to `com.apple.replayd`,
+not to the SCK client process. Without the exclusion, the daemon's own
+recording session flips the mic-activity gate and the session never ends
+(and replayd's input session even lingers a while after the SCK client
+exits). Real meeting apps hold the mic under their own process, so gating
+still catches them; other SCK-only consumers (Cluely, OBS, Loom) are
+excluded too — correct, since "some tool is recording" is not "the user is
+in a call". On macOS 13 (no process objects) we fall back to the device-wide
+`kAudioDevicePropertyDeviceIsRunningSomewhere` — the same signal that drives
+the orange menu-bar mic indicator — which is safe there because we never
+open the mic ourselves on macOS < 15.
 
 (We previously tried AVCaptureDevice.isInUseByAnotherApplication, which only
 fires when another AVCaptureSession-using app holds the device. Almost no
@@ -33,11 +46,19 @@ def _fourcc(s: str) -> int:
 _K_HARDWARE_PROPERTY_DEVICES = _fourcc("dev#")
 _K_HARDWARE_PROPERTY_DEFAULT_INPUT_DEVICE = _fourcc("dIn ")
 _K_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE = _fourcc("dOut")
+_K_HARDWARE_PROPERTY_PROCESS_OBJECT_LIST = _fourcc("prs#")
 _K_DEVICE_PROPERTY_IS_RUNNING_SOMEWHERE = _fourcc("gone")
 _K_DEVICE_PROPERTY_STREAM_CONFIGURATION = _fourcc("slay")
 _K_OBJECT_PROPERTY_NAME = _fourcc("lnam")
+_K_PROCESS_PROPERTY_BUNDLE_ID = _fourcc("pbid")
+_K_PROCESS_PROPERTY_IS_RUNNING_INPUT = _fourcc("piri")
 _K_SCOPE_GLOBAL = _fourcc("glob")
 _K_SCOPE_INPUT = _fourcc("inpt")
+
+# HAL process objects whose input activity does NOT mean "the user is in a
+# call". replayd is ScreenCaptureKit's capture backend: our own sysaudio
+# --mic session lands there, as do Cluely/Loom/OBS-style recorders.
+_EXCLUDED_INPUT_BUNDLES = frozenset({"com.apple.replayd"})
 
 
 class _AudioObjectPropertyAddress(ctypes.Structure):
@@ -135,18 +156,19 @@ def _is_device_running(device_id: int) -> bool:
     return val.value == 1
 
 
-def _device_name(device_id: int) -> str | None:
+def _cf_string_prop(object_id: int, selector: int) -> str | None:
+    """Read a CFString-valued HAL property off any audio object."""
     if _CA is None:
         return None
     addr = _AudioObjectPropertyAddress(
-        _K_OBJECT_PROPERTY_NAME,
+        selector,
         _K_SCOPE_GLOBAL,
         _K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
     )
     cf_str = ctypes.c_void_p(0)
     size = ctypes.c_uint32(ctypes.sizeof(cf_str))
     if _CA.AudioObjectGetPropertyData(
-        device_id, ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(cf_str)
+        object_id, ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(cf_str)
     ) != 0 or not cf_str.value:
         return None
     cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
@@ -171,8 +193,74 @@ def _device_name(device_id: int) -> str | None:
         cf.CFRelease(cf_str.value)
 
 
+def _device_name(device_id: int) -> str | None:
+    return _cf_string_prop(device_id, _K_OBJECT_PROPERTY_NAME)
+
+
+def _process_object_ids() -> list[int]:
+    """HAL process objects (macOS 14+). Empty list on older macOS / query failure."""
+    if _CA is None:
+        return []
+    addr = _AudioObjectPropertyAddress(
+        _K_HARDWARE_PROPERTY_PROCESS_OBJECT_LIST,
+        _K_SCOPE_GLOBAL,
+        _K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    )
+    size = ctypes.c_uint32(0)
+    if _CA.AudioObjectGetPropertyDataSize(
+        _KAUDIO_OBJECT_SYSTEM_OBJECT, ctypes.byref(addr), 0, None, ctypes.byref(size)
+    ) != 0:
+        return []
+    n = size.value // ctypes.sizeof(ctypes.c_uint32)
+    if n == 0:
+        return []
+    ids = (ctypes.c_uint32 * n)()
+    if _CA.AudioObjectGetPropertyData(
+        _KAUDIO_OBJECT_SYSTEM_OBJECT, ctypes.byref(addr), 0, None, ctypes.byref(size), ids
+    ) != 0:
+        return []
+    return list(ids)
+
+
+def _process_is_running_input(process_obj: int) -> bool:
+    if _CA is None:
+        return False
+    addr = _AudioObjectPropertyAddress(
+        _K_PROCESS_PROPERTY_IS_RUNNING_INPUT,
+        _K_SCOPE_GLOBAL,
+        _K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    )
+    val = ctypes.c_uint32(0)
+    size = ctypes.c_uint32(ctypes.sizeof(val))
+    if _CA.AudioObjectGetPropertyData(
+        process_obj, ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(val)
+    ) != 0:
+        return False
+    return val.value == 1
+
+
+def _process_bundle_id(process_obj: int) -> str | None:
+    return _cf_string_prop(process_obj, _K_PROCESS_PROPERTY_BUNDLE_ID)
+
+
 def is_mic_active() -> bool:
-    """True if any audio input device on the system is currently being used by some process."""
+    """True if a non-excluded process is currently running audio input.
+
+    "In a call" gating signal: process-level attribution (macOS 14+) so our
+    own SCK mic capture — attributed to com.apple.replayd — doesn't trip the
+    gate; device-level fallback on older macOS.
+    """
+    procs = _process_object_ids()
+    if procs:
+        for obj in procs:
+            if not _process_is_running_input(obj):
+                continue
+            if _process_bundle_id(obj) in _EXCLUDED_INPUT_BUNDLES:
+                continue
+            return True
+        return False
+    # Fallback (macOS 13 / query failure): device-wide check. Safe there
+    # because we never open the mic ourselves on macOS < 15.
     for dev_id in _all_device_ids():
         if _has_input_streams(dev_id) and _is_device_running(dev_id):
             return True
