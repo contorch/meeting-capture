@@ -128,6 +128,10 @@ The daemon self-exits (and launchd respawns it) if its `phys_footprint` exceeds 
 .venv/bin/pytest
 ```
 
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE).
+
 ## Troubleshooting
 
 If `meeting-capture doctor` reports everything green but no transcripts appear:

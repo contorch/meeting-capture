@@ -2,6 +2,7 @@
 name = "meeting-capture"
 version = "0.2.0"
 description = "Always-on audio capture daemon — system audio to transcripts on disk via hosted Gemini transcription."
+license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
