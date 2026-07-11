@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.stirredo.meeting-capture.sysaudio</string>
+	<key>CFBundleName</key>
+	<string>sysaudio</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>meeting-capture records your side of meetings (the "Me" channel in transcripts). Audio is transcribed and deleted; nothing is kept.</string>
+</dict>
+</plist>

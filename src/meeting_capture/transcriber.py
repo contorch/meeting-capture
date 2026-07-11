@@ -38,22 +38,44 @@ GEMINI_TRANSCRIBE_INSTRUCTION = (
     "beyond the speaker prefixes."
 )
 
+# Mic ("me") chunks are a single known speaker — the device owner talking into
+# their own microphone — so speaker labels are noise there.
+GEMINI_TRANSCRIBE_INSTRUCTION_ME = (
+    "Transcribe the audio. It is a single speaker talking into their own "
+    "microphone during a meeting. Return only the spoken text, nothing else. "
+    "Do not add speaker labels. If the audio is silent, contains only "
+    "background noise, or has no intelligible speech, return an empty "
+    "string. Do not invent or filler-fill text. Do not add commentary, "
+    "summary, or formatting."
+)
 
-def transcribe(audio_path: Path, model: Optional[str] = None) -> str:
+
+def transcribe(
+    audio_path: Path,
+    model: Optional[str] = None,
+    instruction: Optional[str] = None,
+) -> str:
     """Transcribe a single audio chunk via Gemini.
 
     Args:
         audio_path: WAV file (16kHz mono int16 expected).
         model: Gemini model name override (defaults from ENV_GEMINI_MODEL /
             DEFAULT_GEMINI_MODEL).
+        instruction: Prompt override (defaults to the multi-speaker
+            GEMINI_TRANSCRIBE_INSTRUCTION; mic chunks pass the single-speaker
+            GEMINI_TRANSCRIBE_INSTRUCTION_ME).
 
     Returns:
         Transcribed text. Empty string for silent / unintelligible audio.
     """
-    return _transcribe_gemini(audio_path, model)
+    return _transcribe_gemini(audio_path, model, instruction)
 
 
-def _transcribe_gemini(audio_path: Path, model: Optional[str]) -> str:
+def _transcribe_gemini(
+    audio_path: Path,
+    model: Optional[str],
+    instruction: Optional[str] = None,
+) -> str:
     """Hosted Gemini audio transcription backend."""
     try:
         from google import genai
@@ -86,7 +108,7 @@ def _transcribe_gemini(audio_path: Path, model: Optional[str]) -> str:
     response = client.models.generate_content(
         model=model,
         contents=[
-            GEMINI_TRANSCRIBE_INSTRUCTION,
+            instruction or GEMINI_TRANSCRIBE_INSTRUCTION,
             types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
         ],
         config={"temperature": 0.0},

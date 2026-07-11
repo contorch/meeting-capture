@@ -1,8 +1,8 @@
 # meeting-capture
 
-Always-on meeting transcription daemon for macOS. Detects when another app is using your microphone (any video/audio call), captures system audio output via ScreenCaptureKit, transcribes it via Google's hosted Gemini audio models, and writes timestamped Markdown transcripts to `~/transcripts/`.
+Always-on meeting transcription daemon for macOS. Detects when another app is using your microphone (any video/audio call), captures **both sides of the meeting** — system audio output (the other participants) and your own microphone — via ScreenCaptureKit, transcribes each side via Google's hosted Gemini audio models, and writes timestamped, speaker-attributed (`**Me:**` / `**Them:**`) Markdown transcripts to `~/transcripts/`.
 
-No driver, no kernel extension, no `sudo`, no reboot. One user-grantable Screen Recording permission.
+No driver, no kernel extension, no `sudo`, no reboot. Two user-grantable permissions: Screen Recording (system audio) and Microphone (your voice; macOS 15+, optional — without it you get system audio only).
 
 > **Note:** transcription is hosted (Gemini), so each audio chunk is sent to Google's API and a Google API key is required. A previous local mlx-whisper backend was removed — it ran on the GPU and its unbounded MLX Metal buffer cache leaked tens of GB in a long-lived daemon.
 
@@ -10,7 +10,7 @@ Pairs with [context-orchestrator](https://github.com/stirredo/context-orchestrat
 
 ## Requirements
 
-- macOS 13.0 or later (ScreenCaptureKit)
+- macOS 13.0 or later (ScreenCaptureKit); macOS 15.0+ for own-voice ("me") capture
 - Python 3.10+
 - Xcode command-line tools (`xcode-select --install`)
 - A Google API key for Gemini — from `$GOOGLE_API_KEY`, `$GEMINI_API_KEY`, or `~/.config/google/key` (mode 600)
@@ -27,9 +27,9 @@ cd meeting-capture
 
 After setup:
 
-1. Open **System Settings → Privacy & Security → Screen & System Audio Recording**.
-2. Add the parent terminal application (Warp, Terminal, iTerm, etc.) — macOS attributes the permission to the parent process, not to the CLI binary itself.
-3. Restart that terminal once for the grant to take effect.
+1. Open **System Settings → Privacy & Security → Screen & System Audio Recording**, click **+**, and add `bin/sysaudio` from the repo (⌘⇧G in the file dialog to type the path). Make sure it's enabled under the **System Audio Recording Only** list in the same pane too — system audio captures as silence until that grant lands. The daemon spawns sysaudio with TCC responsibility disclaimed, so permissions attach to the `sysaudio` binary itself — the same grant works under your terminal and under launchd, with no terminal-restart dance.
+2. The first recording session pops a **Microphone** permission prompt titled "sysaudio" (for own-voice capture) — click Allow. Deny it (or skip it) and you get system-audio-only transcripts.
+3. After rebuilding sysaudio (`setup.sh` or `swift build`), re-add it in step 1 — the ad-hoc code signature changes with each build, which invalidates the previous grant.
 
 To verify the install:
 
@@ -66,22 +66,33 @@ mic activates                                     mic deactivates
 ┌──────────────────────────────────────────────────────────────────┐
 │  meeting-capture daemon (Python, launchd-managed)                │
 │  - polls Core Audio HAL for mic activity every 2s                │
+│    (per-process attribution; our own capture is excluded)        │
 │  - while active: spawns sysaudio subprocess                      │
-│  - reads PCM, splits on silence (≥3s gap, ≥8s min, ≤600s max)    │
-│  - sends each chunk to Gemini, appends text to .md file          │
-│  - on mic-off: flushes in-flight buffer, terminates sysaudio     │
+│  - two channels: system audio = "them", microphone = "me"        │
+│  - each channel splits on silence (≥3s gap, ≥8s min, ≤600s max)  │
+│  - sends each chunk to Gemini, appends labeled text to .md file  │
+│  - on mic-off: flushes in-flight buffers, terminates sysaudio    │
 └──────────────────────────────────────────────────────────────────┘
             │                                          │
             ▼                                          ▼
-   ┌──────────────────┐                    ┌────────────────────────┐
-   │ sysaudio (Swift) │                    │ ~/transcripts/         │
-   │ ScreenCaptureKit │                    │   meeting-{ISO}.md     │
-   │ → int16 LE PCM   │                    │ (chunks appended       │
-   │   on stdout      │                    │  during the meeting)   │
-   └──────────────────┘                    └────────────────────────┘
+   ┌────────────────────┐                  ┌────────────────────────┐
+   │ sysaudio (Swift)   │                  │ ~/transcripts/         │
+   │ ScreenCaptureKit   │                  │   meeting-{ISO}.md     │
+   │ system out + mic   │                  │ [ts] **Them:** ...     │
+   │ → framed int16 LE  │                  │ [ts] **Me:** ...       │
+   │   PCM on stdout    │                  │ (appended live)        │
+   └────────────────────┘                  └────────────────────────┘
 ```
 
 A new transcript file is started whenever the gap between chunks exceeds 15 minutes. Mid-meeting mic mutes do not fragment the file. Raw audio chunks are deleted from disk after transcription.
+
+### Two-channel (me/them) capture
+
+On macOS 15+ `sysaudio` captures the microphone alongside system audio in the same ScreenCaptureKit stream (`--mic`; framed stdout protocol, both channels 16 kHz mono int16). Each channel runs through its own silence chunker, and transcript lines are labeled `**Me:**` (your mic) or `**Them:**` (system audio). Speaker attribution across the me/them boundary is therefore exact; multiple remote speakers within a "them" chunk still get best-effort `[SPEAKER_n]` labels from Gemini. Set `MEETING_CAPTURE_MIC=0` to opt out (system audio only). On macOS 13/14 the daemon runs system-audio-only automatically.
+
+Mic-activity gating uses per-process Core Audio HAL attribution (`kAudioProcessPropertyIsRunningInput`) and ignores `com.apple.replayd`, ScreenCaptureKit's capture backend — otherwise the daemon's own mic capture would hold the "mic in use" gate open forever. Real meeting apps hold the mic under their own process, so gating is unaffected.
+
+Note on echo: without headphones, your mic also picks up the other side from the speakers, so "me" chunks can contain "them" speech. Headphones (incl. AirPods) avoid this; OS-level echo cancellation is a possible future addition.
 
 ## Files
 

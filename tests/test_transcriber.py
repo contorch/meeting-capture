@@ -17,20 +17,35 @@ class TestTranscribeEntrypoint:
     def test_transcribe_calls_gemini(self, monkeypatch):
         called = {}
 
-        def fake_gemini(p, m):
-            called["gemini"] = (p, m)
+        def fake_gemini(p, m, instruction=None):
+            called["gemini"] = (p, m, instruction)
             return "fake gemini output"
 
         monkeypatch.setattr(t, "_transcribe_gemini", fake_gemini)
         out = t.transcribe(Path("/tmp/fake.wav"))
         assert out == "fake gemini output"
         assert called["gemini"][0] == Path("/tmp/fake.wav")
+        assert called["gemini"][2] is None  # default multi-speaker instruction
 
     def test_model_override_passed_through(self, monkeypatch):
         seen = {}
-        monkeypatch.setattr(t, "_transcribe_gemini", lambda p, m: seen.setdefault("m", m) or "ok")
+        monkeypatch.setattr(
+            t, "_transcribe_gemini", lambda p, m, i=None: seen.setdefault("m", m) or "ok"
+        )
         t.transcribe(Path("/tmp/fake.wav"), model="gemini-2.5-pro")
         assert seen["m"] == "gemini-2.5-pro"
+
+    def test_me_instruction_passed_through(self, monkeypatch):
+        seen = {}
+
+        def fake_gemini(p, m, instruction=None):
+            seen["instruction"] = instruction
+            return "ok"
+
+        monkeypatch.setattr(t, "_transcribe_gemini", fake_gemini)
+        t.transcribe(Path("/tmp/fake.wav"), instruction=t.GEMINI_TRANSCRIBE_INSTRUCTION_ME)
+        assert seen["instruction"] == t.GEMINI_TRANSCRIBE_INSTRUCTION_ME
+        assert "speaker labels" in t.GEMINI_TRANSCRIBE_INSTRUCTION_ME
 
 
 class TestGeminiKeyResolution:
