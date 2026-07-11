@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>com.stirredo.meeting-capture.sysaudio</string>
+	<string>com.contorch.meeting-capture.sysaudio</string>
 	<key>CFBundleName</key>
 	<string>sysaudio</string>
 	<key>CFBundleShortVersionString</key>

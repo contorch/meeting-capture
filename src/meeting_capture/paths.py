@@ -8,7 +8,7 @@ LOG_FILE = STATE_DIR / "daemon.log"
 PID_FILE = STATE_DIR / "daemon.pid"
 PAUSE_FILE = STATE_DIR / "paused"
 
-LAUNCHD_LABEL = "com.stirredo.meeting-capture"
+LAUNCHD_LABEL = "com.contorch.meeting-capture"
 LAUNCHD_PLIST = HOME / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 
 

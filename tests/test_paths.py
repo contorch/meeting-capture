@@ -8,7 +8,7 @@ def test_paths_under_home():
     assert paths.STATE_DIR == home / ".meeting-capture"
     assert paths.TRANSCRIPTS_DIR == home / "transcripts"
     assert paths.PAUSE_FILE == paths.STATE_DIR / "paused"
-    assert paths.LAUNCHD_PLIST == home / "Library" / "LaunchAgents" / "com.stirredo.meeting-capture.plist"
+    assert paths.LAUNCHD_PLIST == home / "Library" / "LaunchAgents" / "com.contorch.meeting-capture.plist"
 
 
 def test_ensure_dirs(tmp_path, monkeypatch):

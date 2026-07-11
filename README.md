@@ -6,7 +6,7 @@ No driver, no kernel extension, no `sudo`, no reboot. Two user-grantable permiss
 
 > **Note:** transcription is hosted (Gemini), so each audio chunk is sent to Google's API and a Google API key is required. A previous local mlx-whisper backend was removed — it ran on the GPU and its unbounded MLX Metal buffer cache leaked tens of GB in a long-lived daemon.
 
-Pairs with [context-orchestrator](https://github.com/stirredo/context-orchestrator), which auto-indexes the transcripts into a searchable vector store. The two are coupled only via the `~/transcripts/` directory; either runs independently.
+Pairs with [context-orchestrator](https://github.com/contorch/context-orchestrator), which auto-indexes the transcripts into a searchable vector store. The two are coupled only via the `~/transcripts/` directory; either runs independently.
 
 ## Requirements
 
@@ -18,7 +18,7 @@ Pairs with [context-orchestrator](https://github.com/stirredo/context-orchestrat
 ## Install
 
 ```bash
-git clone https://github.com/stirredo/meeting-capture.git
+git clone https://github.com/contorch/meeting-capture.git
 cd meeting-capture
 ./setup.sh
 ```
@@ -100,7 +100,7 @@ Note on echo: without headphones, your mic also picks up the other side from the
 - `~/.meeting-capture/daemon.log` — daemon log (rotated by macOS)
 - `~/.meeting-capture/paused` — pause sentinel
 - `~/.meeting-capture/audio/` — temporary chunk WAVs (deleted post-transcription)
-- `~/Library/LaunchAgents/com.stirredo.meeting-capture.plist` — launchd agent
+- `~/Library/LaunchAgents/com.contorch.meeting-capture.plist` — launchd agent
 - `bin/sysaudio` — built audio-capture binary (gitignored)
 
 ## Transcription
