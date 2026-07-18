@@ -1,0 +1,83 @@
+name: release-sysaudio
+
+# Builds a universal (arm64 + x86_64) sysaudio, signs it with the Developer ID
+# certificate from repo secrets, and attaches it to the release for tag pushes.
+# The stable Developer ID signature is what lets macOS TCC permission grants
+# survive upgrades (ad-hoc builds are cdhash-pinned and break on every rebuild).
+#
+# Secrets required:
+#   MACOS_CERT_P12       — base64 of the Developer ID Application .p12 (key + cert + G2 chain)
+#   MACOS_CERT_PASSWORD  — the .p12 passphrase
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-sign:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Import signing identity into a throwaway keychain
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$CERT_P12" | base64 -d > /tmp/cert.p12
+          security create-keychain -p ci-tmp ci.keychain
+          security set-keychain-settings -lut 900 ci.keychain
+          security unlock-keychain -p ci-tmp ci.keychain
+          security import /tmp/cert.p12 -k ci.keychain -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci-tmp ci.keychain
+          security list-keychains -d user -s ci.keychain login.keychain
+          rm /tmp/cert.p12
+
+      - name: Build universal sysaudio
+        run: |
+          set -euo pipefail
+          cd swift
+          swift build -c release --arch arm64 --arch x86_64
+          BIN=$(find .build -path '*apple/Products/Release/sysaudio' | head -1)
+          [ -n "$BIN" ] || BIN=".build/release/sysaudio"
+          lipo -info "$BIN"
+          cp "$BIN" ../sysaudio
+
+      - name: Sign with Developer ID (hardened runtime + timestamp)
+        run: |
+          set -euo pipefail
+          IDENTITY=$(security find-identity -v -p codesigning ci.keychain | grep -oE '[A-F0-9]{40}' | head -1)
+          [ -n "$IDENTITY" ] || { echo "no signing identity found"; exit 1; }
+          codesign --sign "$IDENTITY" --force --timestamp --options runtime sysaudio
+          codesign --verify --strict --verbose=2 sysaudio
+          codesign -dv sysaudio 2>&1 | grep -E "Identifier|TeamIdentifier|Authority" || true
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          tar -czf sysaudio-universal-macos.tar.gz sysaudio
+          shasum -a 256 sysaudio-universal-macos.tar.gz | tee sysaudio-universal-macos.tar.gz.sha256
+
+      - name: Upload artifact (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sysaudio-universal-macos
+          path: |
+            sysaudio-universal-macos.tar.gz
+            sysaudio-universal-macos.tar.gz.sha256
+
+      - name: Attach to release (tag pushes)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Signed universal sysaudio attached." 2>/dev/null || true
+          gh release upload "$TAG" sysaudio-universal-macos.tar.gz sysaudio-universal-macos.tar.gz.sha256 --repo "$GITHUB_REPOSITORY" --clobber
