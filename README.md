@@ -105,7 +105,7 @@ Note on echo: without headphones, your mic also picks up the other side from the
 
 ## Transcription
 
-Transcription is hosted via Google's Gemini audio models. Default model: `gemini-2.5-flash` (~$0.0002/min); override with the `MEETING_CAPTURE_GEMINI_MODEL` env var. Gemini returns an empty string for silent/unintelligible audio (no "Thank you." hallucinations) and applies best-effort speaker labels via prompt instructions.
+Transcription is hosted via Google's Gemini audio models. Default model: `gemini-2.5-flash` (~$0.002 per meeting-minute per channel at current list prices); override with the `MEETING_CAPTURE_GEMINI_MODEL` env var. Gemini returns an empty string for silent/unintelligible audio (no "Thank you." hallucinations) and applies best-effort speaker labels via prompt instructions.
 
 ### API key
 
