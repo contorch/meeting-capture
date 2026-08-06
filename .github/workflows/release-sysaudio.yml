@@ -20,6 +20,7 @@ permissions:
 jobs:
   build-sign:
     runs-on: macos-14
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -31,7 +32,6 @@ jobs:
           set -euo pipefail
           echo "$CERT_P12" | base64 -d > /tmp/cert.p12
           security create-keychain -p ci-tmp ci.keychain
-          security set-keychain-settings -lut 900 ci.keychain
           security unlock-keychain -p ci-tmp ci.keychain
           security import /tmp/cert.p12 -k ci.keychain -P "$CERT_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k ci-tmp ci.keychain
@@ -41,8 +41,9 @@ jobs:
       - name: Build universal sysaudio
         run: |
           set -euo pipefail
+          sw_vers && xcodebuild -version | head -1
           cd swift
-          swift build -c release --arch arm64 --arch x86_64
+          swift build -c release --arch arm64 --arch x86_64 2>&1 | tail -20
           BIN=$(find .build -path '*apple/Products/Release/sysaudio' | head -1)
           [ -n "$BIN" ] || BIN=".build/release/sysaudio"
           lipo -info "$BIN"
