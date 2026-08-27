@@ -269,6 +269,20 @@ def cmd_doctor(_args) -> int:
         return 1
 
 
+def cmd_copilot(args) -> int:
+    """Watch the live meeting feed and whisper help from your past-meeting memory."""
+    from .copilot import watch
+    from .paths import LIVE_DIR
+    feed = None
+    if args.session:
+        cand = LIVE_DIR / (args.session if args.session.endswith(".jsonl") else f"{args.session}.jsonl")
+        if not cand.exists():
+            print(f"no such feed: {cand}", file=sys.stderr)
+            return 1
+        feed = cand
+    return watch(feed=feed, model=args.model)
+
+
 def cmd_live(args) -> int:
     """Tail the live in-meeting transcript feed (finals; --interim for partials too)."""
     import json
@@ -493,6 +507,10 @@ def main(argv: list[str] | None = None) -> int:
     live = sub.add_parser("live", help="tail the live in-meeting transcript feed (MEETING_CAPTURE_MODE=live)")
     live.add_argument("--interim", action="store_true", help="also show low-latency partial hypotheses")
     live.set_defaults(func=cmd_live)
+    copilot = sub.add_parser("copilot", help="watch the live meeting and whisper help from past-meeting memory")
+    copilot.add_argument("--session", help="feed stem to watch (default: newest)")
+    copilot.add_argument("--model", default=os.environ.get("MEETING_CAPTURE_COPILOT_MODEL", "gemini-2.5-flash"))
+    copilot.set_defaults(func=cmd_copilot)
 
     args = parser.parse_args(argv)
     return args.func(args)

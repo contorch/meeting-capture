@@ -107,6 +107,19 @@ Note on echo: without headphones, your mic also picks up the other side from the
 
 Transcription is hosted on Google's Gemini. Default model: `gemini-3.5-transcribe` — Google's purpose-built speech-to-text model (~$0.005 per meeting-minute per channel at list prices), called through the Interactions API in verbatim mode. If it errors, the chunk automatically falls back to `gemini-2.5-flash` (prompted transcription, ~$0.0025/min) so nothing is lost. Override with `MEETING_CAPTURE_GEMINI_MODEL`; both models return an empty string for silence/noise rather than hallucinated filler.
 
+### Live mode & the in-meeting copilot
+
+By default the daemon runs in **batch** mode: it chunks audio and transcribes after each pause (cheapest, most robust). Set `MEETING_CAPTURE_MODE=live` and it streams to `gemini-3.5-transcribe-live` instead — ~1-second interim hypotheses and finalized utterances — which is what the in-meeting copilot needs. Finals still land in `~/transcripts/*.md` exactly as in batch mode; live *additionally* writes a per-session feed under `~/.meeting-capture/live/`.
+
+Two panes during a meeting:
+
+```bash
+MEETING_CAPTURE_MODE=live meeting-capture run   # pane 1: the daemon, streaming
+meeting-capture copilot                          # pane 2: whispers from your memory
+```
+
+`meeting-capture copilot` watches the live feed and, when the other side asks something you'd want help answering, retrieves from your **past meetings** and whispers the fact, decision, or number — with the meeting it came from — or stays silent when it has nothing useful. `meeting-capture live [--interim]` tails the raw transcript feed. Costs are higher in live mode (~$0.009/min per channel streaming, plus a cheap LLM call per copilot whisper), so it's opt-in.
+
 ### Vocabulary
 
 Proper nouns are where transcription goes wrong. Put yours — names, products, jargon — in `~/.meeting-capture/vocab.txt` (one per line, up to 1,000; `meeting-capture vocab edit`) and the transcribe model spells them deterministically. Without it, "contorch" came back as "Concourse" in our tests; with it, never.
