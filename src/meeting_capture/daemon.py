@@ -19,6 +19,7 @@ from .paths import (
     ensure_dirs,
 )
 from .recorder import Chunk, mic_capture_enabled, mic_capture_supported, stream_chunks
+from .live import live_mode_enabled, run_live_session
 from .transcriber import transcribe
 from .watchdog import check_and_maybe_exit
 
@@ -66,6 +67,21 @@ def _append(transcript_path: Path, chunk: Chunk, text: str) -> None:
         f.write(f"{prefix}{text}\n\n")
 
 
+def _append_text(transcript_path: Path, role: str, text: str, started_at: float | None = None) -> None:
+    """Append a role-labeled line to a transcript (live path; no Chunk object)."""
+    text = text.strip()
+    if not text:
+        return
+    if not transcript_path.exists():
+        header = f"# Meeting transcript {transcript_path.stem}\n\n"
+        transcript_path.write_text(header, encoding="utf-8")
+    ts = dt.datetime.fromtimestamp(started_at or time.time()).strftime("%H:%M:%S")
+    label = ROLE_LABELS.get(role)
+    prefix = f"[{ts}] {label} " if label else f"[{ts}] "
+    with transcript_path.open("a", encoding="utf-8") as f:
+        f.write(f"{prefix}{text}\n\n")
+
+
 def _write_pid() -> None:
     PID_FILE.write_text(str(os.getpid()))
 
@@ -104,6 +120,10 @@ def run() -> None:
         len(load_vocabulary()),
         diarization_enabled(),
     )
+    if live_mode_enabled():
+        log.info("MODE: live — real-time streaming transcription (in-meeting copilot feed)")
+    else:
+        log.info("MODE: batch — chunked transcription (default)")
     if mic_capture_enabled():
         log.info("mic capture (own voice): enabled — two-channel me/them transcripts")
     elif not mic_capture_supported():
@@ -156,7 +176,27 @@ def run() -> None:
 
             log.info("mic active — starting recording session")
 
-            # Inner loop: stream chunks until the mic goes off (or pause is set).
+            if live_mode_enabled():
+                # Live path: stream to Gemini in real time; finals land in the
+                # same .md and in the copilot feed. One session file per meeting.
+                started = time.time()
+                if current_session is None or (started - last_chunk_end) > SESSION_GAP_SECONDS:
+                    current_session = _session_path(started)
+                    log.info("new session: %s", current_session.name)
+                sess = current_session
+
+                def _live_append(role: str, text: str, _sess=sess) -> None:
+                    _append_text(_sess, role, text)
+
+                try:
+                    run_live_session(_should_record, sess.stem, _live_append)
+                except Exception as exc:
+                    log.exception("live session failed: %s", exc)
+                last_chunk_end = time.time()
+                log.info("mic inactive — session ended")
+                continue
+
+            # Batch path: stream chunks until the mic goes off (or pause is set).
             for chunk in stream_chunks(AUDIO_DIR, _should_record):
                 chunk_end = chunk.started_at + chunk.duration_seconds
                 if current_session is None or (chunk.started_at - last_chunk_end) > SESSION_GAP_SECONDS:

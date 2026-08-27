@@ -269,6 +269,37 @@ def cmd_doctor(_args) -> int:
         return 1
 
 
+def cmd_live(args) -> int:
+    """Tail the live in-meeting transcript feed (finals; --interim for partials too)."""
+    import json
+    from .paths import LIVE_DIR
+    ensure_dirs()
+    feeds = sorted(LIVE_DIR.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True) if LIVE_DIR.exists() else []
+    if not feeds:
+        print("(no live feed yet — start a meeting with MEETING_CAPTURE_MODE=live)", file=sys.stderr)
+        return 1
+    feed = feeds[0]
+    print(f"— live: {feed.name} —  (Ctrl-C to stop)")
+    labels = {"me": "Me  ", "them": "Them"}
+    proc = subprocess.Popen(["tail", "-n", "0", "-F", str(feed)], stdout=subprocess.PIPE, text=True)
+    try:
+        for line in proc.stdout:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("kind") == "interim" and not args.interim:
+                continue
+            who = labels.get(rec.get("role"), rec.get("role", "?"))
+            mark = "  …" if rec.get("kind") == "interim" else ""
+            print(f"[{rec.get('clock','')}] {who}  {rec.get('text','')}{mark}")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        proc.terminate()
+    return 0
+
+
 def cmd_vocab(args) -> int:
     """Show or edit the custom vocabulary fed to the transcription model."""
     from .paths import VOCAB_FILE
@@ -459,6 +490,9 @@ def main(argv: list[str] | None = None) -> int:
     vocab = sub.add_parser("vocab", help="show or edit the transcription vocabulary (proper nouns)")
     vocab.add_argument("action", nargs="?", choices=["show", "edit"], default="show")
     vocab.set_defaults(func=cmd_vocab)
+    live = sub.add_parser("live", help="tail the live in-meeting transcript feed (MEETING_CAPTURE_MODE=live)")
+    live.add_argument("--interim", action="store_true", help="also show low-latency partial hypotheses")
+    live.set_defaults(func=cmd_live)
 
     args = parser.parse_args(argv)
     return args.func(args)
