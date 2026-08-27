@@ -1,8 +1,8 @@
-"""Tests for the Gemini transcription backend + key resolution.
+"""Tests for the transcription backends + key resolution.
 
 We don't exercise the actual Gemini API in unit tests — that would require a
-network call. Live verification happens via a separate manual script that
-generates a known audio sample with macOS `say` and round-trips it.
+network call. Live verification uses `say`-generated audio through the real
+transcriber (see repo knowledge for the A/B harness).
 """
 from __future__ import annotations
 
@@ -13,39 +13,97 @@ import pytest
 from meeting_capture import transcriber as t
 
 
-class TestTranscribeEntrypoint:
-    def test_transcribe_calls_gemini(self, monkeypatch):
-        called = {}
-
-        def fake_gemini(p, m, instruction=None):
-            called["gemini"] = (p, m, instruction)
-            return "fake gemini output"
-
-        monkeypatch.setattr(t, "_transcribe_gemini", fake_gemini)
-        out = t.transcribe(Path("/tmp/fake.wav"))
-        assert out == "fake gemini output"
-        assert called["gemini"][0] == Path("/tmp/fake.wav")
-        assert called["gemini"][2] is None  # default multi-speaker instruction
-
-    def test_model_override_passed_through(self, monkeypatch):
+class TestDispatch:
+    def test_transcribe_model_uses_interactions(self, monkeypatch):
         seen = {}
-        monkeypatch.setattr(
-            t, "_transcribe_gemini", lambda p, m, i=None: seen.setdefault("m", m) or "ok"
-        )
-        t.transcribe(Path("/tmp/fake.wav"), model="gemini-2.5-pro")
-        assert seen["m"] == "gemini-2.5-pro"
+        monkeypatch.setattr(t, "_transcribe_interactions", lambda p, m, r: seen.update(m=m, r=r) or "ok")
+        monkeypatch.setattr(t, "_transcribe_gemini", lambda *a, **k: pytest.fail("should not hit generate_content"))
+        assert t.transcribe(Path("/tmp/x.wav"), model="gemini-3.5-transcribe", role="me") == "ok"
+        assert seen == {"m": "gemini-3.5-transcribe", "r": "me"}
 
-    def test_me_instruction_passed_through(self, monkeypatch):
+    def test_flash_model_uses_generate_content(self, monkeypatch):
         seen = {}
+        monkeypatch.setattr(t, "_transcribe_interactions", lambda *a: pytest.fail("wrong backend"))
+        monkeypatch.setattr(t, "_transcribe_gemini", lambda p, m, i=None, r="them": seen.update(m=m, r=r) or "ok")
+        assert t.transcribe(Path("/tmp/x.wav"), model="gemini-2.5-flash", role="them") == "ok"
+        assert seen == {"m": "gemini-2.5-flash", "r": "them"}
 
-        def fake_gemini(p, m, instruction=None):
-            seen["instruction"] = instruction
-            return "ok"
+    def test_default_model_is_transcribe(self, monkeypatch):
+        monkeypatch.delenv(t.ENV_GEMINI_MODEL, raising=False)
+        assert t.resolve_model() == t.DEFAULT_GEMINI_MODEL
+        assert t.is_transcribe_model(t.DEFAULT_GEMINI_MODEL)
 
-        monkeypatch.setattr(t, "_transcribe_gemini", fake_gemini)
-        t.transcribe(Path("/tmp/fake.wav"), instruction=t.GEMINI_TRANSCRIBE_INSTRUCTION_ME)
-        assert seen["instruction"] == t.GEMINI_TRANSCRIBE_INSTRUCTION_ME
-        assert "speaker labels" in t.GEMINI_TRANSCRIBE_INSTRUCTION_ME
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv(t.ENV_GEMINI_MODEL, "gemini-2.5-flash")
+        assert t.resolve_model() == "gemini-2.5-flash"
+
+    def test_live_model_rejected_for_batch(self):
+        with pytest.raises(RuntimeError, match="streaming"):
+            t.transcribe(Path("/tmp/x.wav"), model="gemini-3.5-transcribe-live")
+
+    def test_falls_back_to_flash_when_transcribe_fails(self, monkeypatch):
+        def boom(p, m, r):
+            raise RuntimeError("503 preview hiccup")
+        seen = {}
+        monkeypatch.setattr(t, "_transcribe_interactions", boom)
+        monkeypatch.setattr(t, "_transcribe_gemini", lambda p, m, i=None, r="them": seen.update(m=m) or "fallback text")
+        assert t.transcribe(Path("/tmp/x.wav"), model="gemini-3.5-transcribe") == "fallback text"
+        assert seen["m"] == t.FALLBACK_GEMINI_MODEL
+
+
+class TestTranscriptionConfig:
+    def test_me_channel_always_vocab_verbatim(self):
+        cfg = t._transcription_config("me", ["Priya"], diarize=True)
+        assert cfg == {"mode": {"type": "verbatim"}, "custom_vocabulary": ["Priya"]}
+
+    def test_them_diarize_drops_vocab(self):
+        cfg = t._transcription_config("them", ["Priya"], diarize=True)
+        assert cfg == {"mode": {"type": "verbatim", "diarization_mode": "speaker", "timestamp_granularities": ["word"]}}
+
+    def test_them_default_uses_vocab(self):
+        cfg = t._transcription_config("them", ["Priya", "Chroma"], diarize=False)
+        assert cfg["custom_vocabulary"] == ["Priya", "Chroma"]
+        assert "diarization_mode" not in cfg["mode"]
+
+    def test_no_vocab_no_key(self):
+        assert "custom_vocabulary" not in t._transcription_config("me", [], diarize=False)
+
+    def test_diarization_env(self, monkeypatch):
+        monkeypatch.delenv(t.ENV_DIARIZE, raising=False)
+        assert t.diarization_enabled() is False
+        monkeypatch.setenv(t.ENV_DIARIZE, "1")
+        assert t.diarization_enabled() is True
+
+
+class TestVocabulary:
+    def test_load_parses_comments_blanks_dupes(self, tmp_path):
+        f = tmp_path / "vocab.txt"
+        f.write_text("# header\nPriya\n\nChroma  # the vector db\nPriya\nJWT\n")
+        assert t.load_vocabulary(f) == ["Priya", "Chroma", "JWT"]
+
+    def test_missing_file_is_empty(self, tmp_path):
+        assert t.load_vocabulary(tmp_path / "nope.txt") == []
+
+    def test_capped_at_api_limit(self, tmp_path):
+        f = tmp_path / "vocab.txt"
+        f.write_text("\n".join(f"term{i}" for i in range(t.MAX_VOCAB_TERMS + 50)))
+        assert len(t.load_vocabulary(f)) == t.MAX_VOCAB_TERMS
+
+
+class TestDiarizedFormatting:
+    def test_groups_consecutive_speakers(self):
+        anns = [
+            {"text": "can", "speaker": "spk:0"}, {"text": "we", "speaker": "spk:0"},
+            {"text": "done.", "speaker": "spk:1"}, {"text": "tonight", "speaker": "spk:1"},
+            {"text": "great", "speaker": "spk:0"},
+        ]
+        assert t.format_diarized(anns) == "[SPEAKER_1] can we\n[SPEAKER_2] done. tonight\n[SPEAKER_1] great"
+
+    def test_empty(self):
+        assert t.format_diarized([]) == ""
+
+    def test_skips_blank_words(self):
+        assert t.format_diarized([{"text": " ", "speaker": "spk:0"}, {"text": "hi", "speaker": "spk:0"}]) == "[SPEAKER_1] hi"
 
 
 class TestGeminiKeyResolution:
@@ -85,5 +143,4 @@ class TestGeminiBackendErrors:
         with pytest.raises(RuntimeError) as exc:
             t._transcribe_gemini(Path("/tmp/fake.wav"), None)
         msg = str(exc.value)
-        # Either missing package OR missing key — both have actionable hints.
         assert ("API key" in msg) or ("google-genai" in msg.lower())

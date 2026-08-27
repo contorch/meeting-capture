@@ -231,9 +231,21 @@ def cmd_doctor(_args) -> int:
         print(f"  · no log file yet ({LOG_FILE}) — daemon hasn't run")
 
     print("\nTranscription (hosted Gemini):")
-    from .transcriber import DEFAULT_GEMINI_MODEL, ENV_GEMINI_MODEL, _resolve_gemini_api_key
-    model = os.environ.get(ENV_GEMINI_MODEL, DEFAULT_GEMINI_MODEL)
-    _ok("model", model + (f" (via {ENV_GEMINI_MODEL})" if ENV_GEMINI_MODEL in os.environ else ""))
+    from .transcriber import (
+        ENV_GEMINI_MODEL, _resolve_gemini_api_key, diarization_enabled,
+        is_transcribe_model, load_vocabulary, resolve_model,
+    )
+    from .paths import VOCAB_FILE
+    model = resolve_model()
+    backend = "Interactions API (speech-to-text)" if is_transcribe_model(model) else "generate_content (prompted)"
+    _ok("model", model + (f" (via {ENV_GEMINI_MODEL})" if ENV_GEMINI_MODEL in os.environ else "") + f" — {backend}")
+    vocab = load_vocabulary()
+    if vocab:
+        _ok("custom vocabulary", f"{len(vocab)} terms from {VOCAB_FILE}")
+    else:
+        print(f"  · no custom vocabulary yet — `meeting-capture vocab edit` (proper nouns, product names)")
+    if diarization_enabled():
+        print("  · diarization ON for the 'them' channel (vocabulary disabled there per API)")
     if _resolve_gemini_api_key():
         _ok("Google API key", "found")
     else:
@@ -255,6 +267,29 @@ def cmd_doctor(_args) -> int:
     else:
         print(f"{failures} issue(s) above. Fix and re-run `meeting-capture doctor`.")
         return 1
+
+
+def cmd_vocab(args) -> int:
+    """Show or edit the custom vocabulary fed to the transcription model."""
+    from .paths import VOCAB_FILE
+    from .transcriber import MAX_VOCAB_TERMS, load_vocabulary
+
+    ensure_dirs()
+    if args.action == "edit":
+        if not VOCAB_FILE.exists():
+            VOCAB_FILE.write_text(
+                "# One term per line: names, products, jargon the transcriber should\n"
+                "# spell correctly (e.g. Priya, Chroma, JWT). '#' starts a comment.\n"
+                f"# Up to {MAX_VOCAB_TERMS} terms. Takes effect on the next chunk.\n",
+                encoding="utf-8",
+            )
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nano"
+        subprocess.run([editor, str(VOCAB_FILE)])
+    terms = load_vocabulary()
+    print(f"{len(terms)} term(s) in {VOCAB_FILE}")
+    for t in terms:
+        print(f"  {t}")
+    return 0
 
 
 def cmd_pause(_args) -> int:
@@ -421,6 +456,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("last", help="print the path of the most recent transcript").set_defaults(func=cmd_last)
     sub.add_parser("tail", help="follow the daemon log").set_defaults(func=cmd_tail)
     sub.add_parser("doctor", help="full health check (binaries, permissions, daemon)").set_defaults(func=cmd_doctor)
+    vocab = sub.add_parser("vocab", help="show or edit the transcription vocabulary (proper nouns)")
+    vocab.add_argument("action", nargs="?", choices=["show", "edit"], default="show")
+    vocab.set_defaults(func=cmd_vocab)
 
     args = parser.parse_args(argv)
     return args.func(args)

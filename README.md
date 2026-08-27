@@ -105,7 +105,13 @@ Note on echo: without headphones, your mic also picks up the other side from the
 
 ## Transcription
 
-Transcription is hosted via Google's Gemini audio models. Default model: `gemini-2.5-flash` (~$0.002 per meeting-minute per channel at current list prices); override with the `MEETING_CAPTURE_GEMINI_MODEL` env var. Gemini returns an empty string for silent/unintelligible audio (no "Thank you." hallucinations) and applies best-effort speaker labels via prompt instructions.
+Transcription is hosted on Google's Gemini. Default model: `gemini-3.5-transcribe` — Google's purpose-built speech-to-text model (~$0.005 per meeting-minute per channel at list prices), called through the Interactions API in verbatim mode. If it errors, the chunk automatically falls back to `gemini-2.5-flash` (prompted transcription, ~$0.0025/min) so nothing is lost. Override with `MEETING_CAPTURE_GEMINI_MODEL`; both models return an empty string for silence/noise rather than hallucinated filler.
+
+### Vocabulary
+
+Proper nouns are where transcription goes wrong. Put yours — names, products, jargon — in `~/.meeting-capture/vocab.txt` (one per line, up to 1,000; `meeting-capture vocab edit`) and the transcribe model spells them deterministically. Without it, "contorch" came back as "Concourse" in our tests; with it, never.
+
+`MEETING_CAPTURE_DIARIZE=1` turns on speaker diarization for the `Them` channel (`[SPEAKER_n]` per turn). The API makes diarization and vocabulary mutually exclusive, so it's off by default — memory fidelity beats speaker labels within a channel; the Me/Them split is exact regardless.
 
 ### API key
 

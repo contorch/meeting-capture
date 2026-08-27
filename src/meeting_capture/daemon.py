@@ -19,7 +19,7 @@ from .paths import (
     ensure_dirs,
 )
 from .recorder import Chunk, mic_capture_enabled, mic_capture_supported, stream_chunks
-from .transcriber import GEMINI_TRANSCRIBE_INSTRUCTION_ME, transcribe
+from .transcriber import transcribe
 from .watchdog import check_and_maybe_exit
 
 SESSION_GAP_SECONDS = 15 * 60
@@ -91,11 +91,18 @@ def run() -> None:
     signal.signal(signal.SIGINT, _shutdown)
 
     log.info("meeting-capture daemon starting (pid=%s, mic=%s)", os.getpid(), mic_name() or "unknown")
-    from .transcriber import DEFAULT_GEMINI_MODEL, ENV_GEMINI_MODEL, _resolve_gemini_api_key
+    from .transcriber import (
+        _resolve_gemini_api_key, diarization_enabled, is_transcribe_model,
+        load_vocabulary, resolve_model,
+    )
+    _model = resolve_model()
     log.info(
-        "transcription: gemini (model=%s, api_key=%s)",
-        os.environ.get(ENV_GEMINI_MODEL, DEFAULT_GEMINI_MODEL),
+        "transcription: %s via %s (api_key=%s, vocab=%d terms, diarize=%s)",
+        _model,
+        "interactions API" if is_transcribe_model(_model) else "generate_content",
         "present" if _resolve_gemini_api_key() else "MISSING — transcription will fail",
+        len(load_vocabulary()),
+        diarization_enabled(),
     )
     if mic_capture_enabled():
         log.info("mic capture (own voice): enabled — two-channel me/them transcripts")
@@ -157,8 +164,7 @@ def run() -> None:
                     log.info("new session: %s", current_session.name)
 
                 try:
-                    instruction = GEMINI_TRANSCRIBE_INSTRUCTION_ME if chunk.role == "me" else None
-                    text = transcribe(chunk.path, instruction=instruction)
+                    text = transcribe(chunk.path, role=chunk.role)
                 except Exception as exc:
                     log.exception("transcription failed for %s: %s", chunk.path, exc)
                     text = ""

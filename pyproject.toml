@@ -9,7 +9,7 @@ dependencies = [
     "soundfile>=0.12",
     # Hosted Gemini audio transcription. Needs a Google API key from
     # $GOOGLE_API_KEY, $GEMINI_API_KEY, or ~/.config/google/key (mode 600).
-    "google-genai>=0.3",
+    "google-genai>=2.0",
 ]
 
 [project.scripts]
