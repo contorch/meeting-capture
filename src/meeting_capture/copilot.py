@@ -214,7 +214,7 @@ def watch(feed: Optional[Path] = None, model: str = COPILOT_MODEL,
     whispers_path = feed.with_suffix(".whispers.jsonl")
 
     def _default_emit(w: dict) -> None:
-        print(f"\n  💡 {w['text']}\n")
+        print(f"\n  💡 {w['text']}\n", flush=True)
 
     emit = emit or _default_emit
     context_turns: list[str] = []
@@ -222,7 +222,7 @@ def watch(feed: Optional[Path] = None, model: str = COPILOT_MODEL,
     stem = feed.stem
 
     log.info("copilot watching %s (model=%s)", feed.name, model)
-    print(f"— copilot: watching {feed.name} —  (Ctrl-C to stop)\n")
+    print(f"— copilot: watching {feed.name} —  (Ctrl-C to stop)\n", flush=True)
 
     import subprocess
     proc = subprocess.Popen(["tail", "-n", "0", "-F", str(feed)], stdout=subprocess.PIPE, text=True)
