@@ -59,6 +59,16 @@ class TestRetrieval:
         self._write(tmp_path, "m", "[10:00] **Me:** entirely unrelated content")
         assert c.retrieve_transcripts("pricing discount", transcripts_dir=tmp_path) == []
 
+    def test_window_carries_the_answer(self, tmp_path):
+        # The answer follows the question on the next line and shares none of
+        # the query keywords — the window must bring it along.
+        self._write(tmp_path, "meeting-x",
+                    "# header",
+                    "[14:34] **Them:** and the API rate limit for the Acme integration?",
+                    "[14:34] **Me:** hard cap is 50 requests per second, do not exceed it")
+        snips = c.retrieve_transcripts("what is the rate limit on the Acme API", transcripts_dir=tmp_path)
+        assert snips and "50 requests per second" in snips[0].text
+
 
 class TestConsider:
     def test_non_trigger_returns_none(self):

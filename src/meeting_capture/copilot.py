@@ -109,13 +109,19 @@ def retrieve_transcripts(query: str, exclude_stem: str = "", limit: int = MAX_SN
             continue
         mtime = f.stat().st_mtime
         try:
-            for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
-                low = line.lower()
-                score = sum(1 for term in terms if term in low)
-                if score >= 1:  # any keyword match; the LLM filters precision via NONE
-                    scored.append((score, mtime, f.stem, line.strip()[:SNIPPET_CHARS]))
+            # Content lines only (drop the header + blank lines). A meeting is
+            # Q-then-A across adjacent lines, so a matched line is returned with
+            # the next couple of lines — otherwise the *answer* (which rarely
+            # shares the question's keywords) never comes along.
+            lines = [ln.strip() for ln in f.read_text(encoding="utf-8", errors="replace").splitlines()
+                     if ln.strip() and not ln.startswith("#")]
         except OSError:
             continue
+        for i, line in enumerate(lines):
+            score = sum(1 for term in terms if term in line.lower())
+            if score >= 1:  # any keyword match; the LLM filters precision via NONE
+                window = " ".join(lines[i:i + 3])[:SNIPPET_CHARS]
+                scored.append((score, mtime, f.stem, window))
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
     out: list[Snippet] = []
     seen: set[str] = set()
