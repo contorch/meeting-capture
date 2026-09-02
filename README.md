@@ -118,7 +118,7 @@ MEETING_CAPTURE_MODE=live meeting-capture run   # pane 1: the daemon, streaming
 meeting-capture copilot                          # pane 2: whispers from your memory
 ```
 
-`meeting-capture copilot` watches the live feed and, when the other side asks something you'd want help answering, retrieves from your **past meetings** and whispers the fact, decision, or number — with the meeting it came from — or stays silent when it has nothing useful. `meeting-capture live [--interim]` tails the raw transcript feed. Costs are higher in live mode (~$0.009/min per channel streaming, plus a cheap LLM call per copilot whisper), so it's opt-in.
+`meeting-capture copilot` watches the live feed and, when the other side asks something you'd want help answering, retrieves from your **past meetings** and whispers the fact, decision, or number — with the meeting it came from — or stays silent when it has nothing useful. Inside Claude Code there's a richer surface: install the `skills/meeting` skill and type `/meeting` mid-call — Claude reads the same feed but searches your *entire* contorch memory (notes, tasks, repo knowledge, every meeting), not just transcripts. `/loop 15s /meeting` watches continuously. `meeting-capture live [--interim]` tails the raw transcript feed. Costs are higher in live mode (~$0.009/min per channel streaming, plus a cheap LLM call per copilot whisper), so it's opt-in.
 
 ### Vocabulary
 
