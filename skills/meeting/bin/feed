@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Read the live meeting-capture transcript feed for the /meeting copilot skill.
+
+Usage:
+  feed recent [N]       last N finalized lines (default 12), "[clock] ROLE: text"
+  feed question         the most recent 'them' final that looks like a question
+  feed since <ts>       finalized 'them' lines with ts > <ts> (for /loop watching)
+  feed status           newest feed path + counts
+
+Reads the newest ~/.meeting-capture/live/*.jsonl (the current/last meeting).
+"""
+import json, sys, glob, os
+
+LIVE = os.path.expanduser("~/.meeting-capture/live")
+
+def newest():
+    feeds = [f for f in glob.glob(os.path.join(LIVE, "*.jsonl")) if not f.endswith(".whispers.jsonl")]
+    return max(feeds, key=os.path.getmtime) if feeds else None
+
+def finals(path):
+    out = []
+    with open(path) as f:
+        for line in f:
+            try: r = json.loads(line)
+            except ValueError: continue
+            if r.get("kind") == "final" and (r.get("text") or "").strip():
+                out.append(r)
+    return out
+
+def looks_like_question(t):
+    t = t.strip().lower()
+    return t.endswith("?") or any(t.startswith(w) or f" {w} " in f" {t} " for w in
+        ("what","when","where","who","why","how","which","did you","do you","are you",
+         "can you","should we","could you","remind","have you","is there"))
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "recent"
+    path = newest()
+    if not path:
+        print("(no live feed — start a meeting with MEETING_CAPTURE_MODE=live)"); return 1
+    if cmd == "status":
+        fs = finals(path); them = [r for r in fs if r["role"]=="them"]
+        print(f"feed: {os.path.basename(path)}\nfinals: {len(fs)} (them: {len(them)}, me: {len(fs)-len(them)})")
+        return 0
+    if cmd == "question":
+        for r in reversed(finals(path)):
+            if r["role"]=="them" and looks_like_question(r["text"]):
+                print(f"[{r.get('clock','')}] {r['text']}"); return 0
+        print("(no recent question from the other side)"); return 0
+    if cmd == "since":
+        ts = float(sys.argv[2]) if len(sys.argv) > 2 else 0
+        for r in finals(path):
+            if r["role"]=="them" and r.get("ts",0) > ts:
+                print(f"{r.get('ts')}\t[{r.get('clock','')}] {r['text']}")
+        return 0
+    n = int(sys.argv[2]) if len(sys.argv) > 2 else 12
+    for r in finals(path)[-n:]:
+        print(f"[{r.get('clock','')}] {'Me' if r['role']=='me' else 'Them'}: {r['text']}")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -16,3 +16,9 @@ def ensure_dirs() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    LIVE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Custom vocabulary for transcription (one term per line, '#' comments).
+VOCAB_FILE = STATE_DIR / "vocab.txt"
+# Live-mode transcript feeds (JSONL per session) for the in-meeting copilot.
+LIVE_DIR = STATE_DIR / "live"
