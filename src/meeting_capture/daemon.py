@@ -18,13 +18,30 @@ from .paths import (
     TRANSCRIPTS_DIR,
     ensure_dirs,
 )
-from .recorder import Chunk, mic_capture_enabled, mic_capture_supported, stream_chunks
+from .recorder import (
+    Chunk,
+    find_sysaudio,
+    mic_capture_enabled,
+    mic_capture_supported,
+    stream_chunks,
+)
 from .live import live_mode_enabled, run_live_session
 from .transcriber import transcribe
 from .watchdog import check_and_maybe_exit
 
 SESSION_GAP_SECONDS = 15 * 60
 MIC_POLL_INTERVAL = 2.0
+
+# A capture session that dies this quickly without producing a single chunk
+# means sysaudio failed to start at all — almost always because its Screen
+# Recording TCC grant is missing (a macOS update or a sysaudio rebuild
+# invalidates it). Without a backoff the outer loop respawns sysaudio
+# immediately while the mic is still active, and every spawn pops the
+# "sysaudio would like to record this computer's screen and audio" dialog
+# again — observed at ~15 prompts/second (225 in 14s on 2026-09-03).
+FAST_FAIL_SECONDS = 10.0
+BACKOFF_BASE_SECONDS = 5.0
+BACKOFF_MAX_SECONDS = 300.0
 
 log = logging.getLogger("meeting-capture")
 
@@ -80,6 +97,52 @@ def _append_text(transcript_path: Path, role: str, text: str, started_at: float 
     prefix = f"[{ts}] {label} " if label else f"[{ts}] "
     with transcript_path.open("a", encoding="utf-8") as f:
         f.write(f"{prefix}{text}\n\n")
+
+
+class FailureBackoff:
+    """Escalating delay after consecutive fast-failing capture sessions.
+
+    ``record()`` is called once per ended session with how long it ran and how
+    many chunks it produced. A session that emitted a chunk, or simply stayed
+    up longer than ``fast_fail_s``, resets the streak. Otherwise the streak
+    grows and ``delay`` doubles from ``base_s`` up to ``max_s``.
+    """
+
+    def __init__(
+        self,
+        fast_fail_s: float = FAST_FAIL_SECONDS,
+        base_s: float = BACKOFF_BASE_SECONDS,
+        max_s: float = BACKOFF_MAX_SECONDS,
+    ) -> None:
+        self.fast_fail_s = fast_fail_s
+        self.base_s = base_s
+        self.max_s = max_s
+        self.failures = 0
+
+    def record(self, session_seconds: float, chunks: int) -> float:
+        """Register an ended session; return seconds to wait before the next one."""
+        if chunks > 0 or session_seconds >= self.fast_fail_s:
+            self.failures = 0
+            return 0.0
+        self.failures += 1
+        return self.delay
+
+    @property
+    def delay(self) -> float:
+        if self.failures == 0:
+            return 0.0
+        return min(self.base_s * (2 ** (self.failures - 1)), self.max_s)
+
+
+def _permission_hint() -> str:
+    binary = find_sysaudio()
+    where = str(binary) if binary else "bin/sysaudio"
+    return (
+        "sysaudio is most likely being denied Screen Recording. Re-add "
+        f"{where} under System Settings -> Privacy & Security -> Screen & System "
+        "Audio Recording (a macOS update or a sysaudio rebuild invalidates the "
+        "previous grant), then the next session will pick it up automatically."
+    )
 
 
 def _write_pid() -> None:
@@ -140,6 +203,7 @@ def run() -> None:
     )
     last_device_check = 0.0
     last_footprint_check = 0.0
+    backoff = FailureBackoff()
 
     def _watchdog_tick() -> None:
         # Throttle the footprint check to ~once a minute regardless of caller.
@@ -148,6 +212,29 @@ def run() -> None:
         if now - last_footprint_check >= 60.0:
             last_footprint_check = now
             check_and_maybe_exit()
+
+    def _after_session(session_started: float, session_chunks: int) -> None:
+        # Fast-fail backoff: if sysaudio died at once with no audio, hold off
+        # before the outer loop respawns it so a missing TCC grant can't turn
+        # into a storm of permission dialogs (see FAST_FAIL_SECONDS).
+        session_seconds = time.time() - session_started
+        delay = backoff.record(session_seconds, session_chunks)
+        if delay <= 0:
+            return
+        log.warning(
+            "capture session ended after %.1fs with no audio (%d in a row) — %s "
+            "Retrying in %.0fs.",
+            session_seconds, backoff.failures, _permission_hint(), delay,
+        )
+        resume_at = time.time() + delay
+        while time.time() < resume_at and _is_mic_still_active_for_backoff():
+            _watchdog_tick()
+            time.sleep(min(MIC_POLL_INTERVAL, max(0.0, resume_at - time.time())))
+
+    def _is_mic_still_active_for_backoff() -> bool:
+        # Only worth waiting while the mic is still held (the storm condition);
+        # if the call ended, drop back to the idle poll immediately.
+        return is_mic_active() and not _is_paused()
 
     def _should_record() -> bool:
         # Log default-device changes (input + output). The mic poll runs
@@ -175,6 +262,7 @@ def run() -> None:
                 time.sleep(MIC_POLL_INTERVAL)
 
             log.info("mic active — starting recording session")
+            session_started = time.time()
 
             if live_mode_enabled():
                 # Live path: stream to Gemini in real time; finals land in the
@@ -184,8 +272,11 @@ def run() -> None:
                     current_session = _session_path(started)
                     log.info("new session: %s", current_session.name)
                 sess = current_session
+                session_chunks = 0
 
                 def _live_append(role: str, text: str, _sess=sess) -> None:
+                    nonlocal session_chunks
+                    session_chunks += 1
                     _append_text(_sess, role, text)
 
                 try:
@@ -194,10 +285,13 @@ def run() -> None:
                     log.exception("live session failed: %s", exc)
                 last_chunk_end = time.time()
                 log.info("mic inactive — session ended")
+                _after_session(started, session_chunks)
                 continue
 
             # Batch path: stream chunks until the mic goes off (or pause is set).
+            session_chunks = 0
             for chunk in stream_chunks(AUDIO_DIR, _should_record):
+                session_chunks += 1
                 chunk_end = chunk.started_at + chunk.duration_seconds
                 if current_session is None or (chunk.started_at - last_chunk_end) > SESSION_GAP_SECONDS:
                     current_session = _session_path(chunk.started_at)
@@ -229,6 +323,7 @@ def run() -> None:
                 _watchdog_tick()
 
             log.info("mic inactive — session ended")
+            _after_session(session_started, session_chunks)
     except KeyboardInterrupt:
         log.info("interrupted")
     finally:

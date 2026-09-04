@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Required when the hardened runtime is enabled: without it macOS denies
+	     microphone access silently (no prompt, no TCC row), so own-voice ("Me:")
+	     capture never works on the signed/notarized binary. The ad-hoc source
+	     build has no hardened runtime, which is why it worked in dev. -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>

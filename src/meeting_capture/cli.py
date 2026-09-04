@@ -177,6 +177,24 @@ def cmd_doctor(_args) -> int:
     sysaudio = find_sysaudio()
     if sysaudio is not None:
         _ok("sysaudio (SCK)", str(sysaudio))
+        # Hardened-runtime binaries (Developer ID / notarized) MUST carry the
+        # audio-input entitlement or macOS denies the mic silently — every
+        # "Me:" line vanishes. The ad-hoc dev build has no runtime, so skip it.
+        try:
+            dv = subprocess.run(["codesign", "-dvv", str(sysaudio)],
+                                capture_output=True, text=True, timeout=5)
+            hardened = "runtime" in (dv.stderr + dv.stdout)
+            if hardened:
+                ent = subprocess.run(["codesign", "-d", "--entitlements", "-", "--xml", str(sysaudio)],
+                                     capture_output=True, text=True, timeout=5)
+                if "audio-input" in (ent.stdout + ent.stderr):
+                    _ok("sysaudio mic entitlement", "audio-input present (hardened runtime)")
+                else:
+                    _fail("sysaudio hardened but missing mic entitlement",
+                          "own-voice (Me:) capture will be denied silently. Re-sign with "
+                          "--entitlements swift/sysaudio.entitlements (release pipeline handles this).")
+        except (OSError, subprocess.SubprocessError):
+            pass
     else:
         _fail("sysaudio not built", "Run setup.sh from the repo root.")
     audiotee = find_audiotee()
@@ -253,11 +271,12 @@ def cmd_doctor(_args) -> int:
               "set GOOGLE_API_KEY / GEMINI_API_KEY or write ~/.config/google/key (mode 600)")
 
     print("\nManual gates (cannot be checked from code):")
-    print("  ?  Screen Recording TCC granted to parent terminal (Warp/Terminal/iTerm)")
+    print("  ?  Screen Recording TCC granted to the sysaudio binary itself (bin/sysaudio)")
     print("     System Settings -> Privacy & Security -> Screen & System Audio Recording")
-    print("  ?  Microphone TCC granted to the same parent terminal (for own-voice capture)")
+    print("     (re-add it after a macOS update or a sysaudio rebuild — either")
+    print("      invalidates the grant; the daemon log then shows 'declined TCCs')")
+    print("  ?  Microphone TCC granted to sysaudio (own-voice capture; prompt fires on first session)")
     print("     System Settings -> Privacy & Security -> Microphone")
-    print("  ?  Terminal restarted once after granting permission")
     print("  ?  Claude Code restarted (so the orchestrator MCP server is live)")
 
     print()
@@ -472,7 +491,8 @@ def cmd_check(_args) -> int:
     if sysaudio is not None:
         print(f"sysaudio (SCK):    {sysaudio}")
         print("  Permission: System Settings -> Privacy & Security -> Screen & System Audio Recording.")
-        print("  Permission attaches to the parent terminal/launcher (Warp, Terminal, iTerm, etc.).")
+        print("  Permission attaches to the sysaudio binary itself (spawned with TCC")
+        print("  responsibility disclaimed) — re-add it after a macOS update or rebuild.")
     else:
         print("sysaudio (SCK):    NOT FOUND")
 

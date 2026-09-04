@@ -40,3 +40,30 @@ def test_append_labels_roles(tmp_path):
     text = transcript.read_text()
     assert "**Them:** how was the launch?" in text
     assert "**Me:** shipped last night" in text
+
+
+def test_backoff_escalates_on_fast_failures_and_resets():
+    b = daemon.FailureBackoff(fast_fail_s=10.0, base_s=5.0, max_s=40.0)
+    assert b.record(0.2, 0) == 5.0
+    assert b.record(0.2, 0) == 10.0
+    assert b.record(0.2, 0) == 20.0
+    assert b.record(0.2, 0) == 40.0
+    assert b.record(0.2, 0) == 40.0  # capped
+    assert b.failures == 5
+    assert b.record(0.2, 1) == 0.0   # a chunk resets the streak
+    assert b.failures == 0
+    assert b.delay == 0.0
+
+
+def test_backoff_ignores_long_sessions_without_chunks():
+    b = daemon.FailureBackoff(fast_fail_s=10.0)
+    assert b.record(45.0, 0) == 0.0  # quiet-but-alive session is not a failure
+    assert b.failures == 0
+
+
+def test_permission_hint_names_binary(monkeypatch):
+    from pathlib import Path
+    monkeypatch.setattr(daemon, "find_sysaudio", lambda: Path("/x/bin/sysaudio"))
+    hint = daemon._permission_hint()
+    assert "/x/bin/sysaudio" in hint
+    assert "Screen & System Audio Recording" in hint

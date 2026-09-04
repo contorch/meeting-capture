@@ -54,9 +54,16 @@ jobs:
           set -euo pipefail
           IDENTITY=$(security find-identity -v -p codesigning ci.keychain | grep -oE '[A-F0-9]{40}' | head -1)
           [ -n "$IDENTITY" ] || { echo "no signing identity found"; exit 1; }
-          codesign --sign "$IDENTITY" --force --timestamp --options runtime sysaudio
+          # --entitlements is CRITICAL: with the hardened runtime on, mic access
+          # needs com.apple.security.device.audio-input or macOS denies it
+          # silently and every brew user gets system-audio-only transcripts.
+          codesign --sign "$IDENTITY" --force --timestamp --options runtime \
+            --entitlements swift/sysaudio.entitlements sysaudio
           codesign --verify --strict --verbose=2 sysaudio
           codesign -dv sysaudio 2>&1 | grep -E "Identifier|TeamIdentifier|Authority" || true
+          echo "== entitlements ==" && codesign -d --entitlements - --xml sysaudio 2>/dev/null | grep -q "audio-input" \
+            && echo "audio-input entitlement present" \
+            || { echo "FATAL: audio-input entitlement missing after signing"; exit 1; }
 
       - name: Package
         run: |

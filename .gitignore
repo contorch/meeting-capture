@@ -13,3 +13,4 @@ swift/.build/
 *.wav
 *.flac
 *.aiff
+!skills/**
