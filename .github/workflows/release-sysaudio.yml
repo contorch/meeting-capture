@@ -43,7 +43,17 @@ jobs:
           set -euo pipefail
           sw_vers && xcodebuild -version | head -1
           cd swift
-          swift build -c release --arch arm64 --arch x86_64 2>&1 | tail -20
+          # `swift build` intermittently SIGABRTs (exit 134) with an
+          # NSFileHandle crash on the GitHub runner — a known-flaky toolchain
+          # bug, not our code. Retry a few times before giving up.
+          for attempt in 1 2 3; do
+            if swift build -c release --arch arm64 --arch x86_64 2>&1 | tail -20; then
+              break
+            fi
+            echo "swift build attempt $attempt failed (likely the flaky NSFileHandle SIGABRT) — retrying"
+            rm -rf .build/apple 2>/dev/null || true
+            sleep 5
+          done
           BIN=$(find .build -path '*apple/Products/Release/sysaudio' | head -1)
           [ -n "$BIN" ] || BIN=".build/release/sysaudio"
           lipo -info "$BIN"
