@@ -67,3 +67,55 @@ def test_permission_hint_names_binary(monkeypatch):
     hint = daemon._permission_hint()
     assert "/x/bin/sysaudio" in hint
     assert "Screen & System Audio Recording" in hint
+
+
+def _wav(path, seconds=1.0, rate=16000):
+    import wave
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
+        w.writeframes(b"\x00\x00" * int(seconds * rate))
+
+
+def test_park_failed_keeps_audio(tmp_path, monkeypatch):
+    failed = tmp_path / "failed"
+    monkeypatch.setattr(daemon, "FAILED_AUDIO_DIR", failed)
+    src = tmp_path / "chunk-1714003200-them.wav"; _wav(src)
+    chunk = Chunk(path=src, started_at=1714003200.0, duration_seconds=1.0, role="them")
+    dest = daemon._park_failed(chunk, RuntimeError("no key"))
+    assert dest == failed / "chunk-1714003200-them.wav"
+    assert dest.exists() and not src.exists()
+
+
+def test_retry_recovers_parked_chunks_into_sessions(tmp_path, monkeypatch):
+    failed = tmp_path / "failed"; failed.mkdir()
+    monkeypatch.setattr(daemon, "FAILED_AUDIO_DIR", failed)
+    monkeypatch.setattr(daemon, "TRANSCRIPTS_DIR", tmp_path / "transcripts")
+    (tmp_path / "transcripts").mkdir()
+    _wav(failed / "chunk-1714003200-them.wav", 2.0)
+    _wav(failed / "chunk-1714003203-me.wav", 2.0)
+    _wav(failed / "chunk-1714010000-them.wav", 2.0)   # > SESSION_GAP later → new session
+    (failed / "not-a-chunk.wav").write_bytes(b"junk")
+    said = {"them": "how was the launch?", "me": "shipped last night"}
+    monkeypatch.setattr(daemon, "transcribe", lambda path, role: said[role])
+    assert daemon.retry_failed_chunks() == 3
+    assert sorted(p.name for p in failed.iterdir()) == ["not-a-chunk.wav"]
+    sessions = sorted((tmp_path / "transcripts").glob("meeting-*.md"))
+    assert len(sessions) == 2
+    first = sessions[0].read_text()
+    assert "**Them:** how was the launch?" in first and "**Me:** shipped last night" in first
+
+
+def test_retry_stops_at_first_failure_and_keeps_the_rest(tmp_path, monkeypatch):
+    failed = tmp_path / "failed"; failed.mkdir()
+    monkeypatch.setattr(daemon, "FAILED_AUDIO_DIR", failed)
+    monkeypatch.setattr(daemon, "TRANSCRIPTS_DIR", tmp_path)
+    _wav(failed / "chunk-1714003200-them.wav"); _wav(failed / "chunk-1714003205-me.wav")
+    def boom(path, role): raise RuntimeError("still no key")
+    monkeypatch.setattr(daemon, "transcribe", boom)
+    assert daemon.retry_failed_chunks() == 0
+    assert len(list(failed.glob("chunk-*.wav"))) == 2
+
+
+def test_retry_noop_without_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(daemon, "FAILED_AUDIO_DIR", tmp_path / "missing")
+    assert daemon.retry_failed_chunks() == 0

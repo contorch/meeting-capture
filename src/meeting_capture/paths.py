@@ -4,6 +4,10 @@ HOME = Path.home()
 STATE_DIR = HOME / ".meeting-capture"
 TRANSCRIPTS_DIR = HOME / "transcripts"
 AUDIO_DIR = STATE_DIR / "audio"
+# Chunks whose transcription failed (no key, quota, outage) wait here for a retry
+# instead of being deleted — a recording made before the key was configured
+# is otherwise gone for good.
+FAILED_AUDIO_DIR = AUDIO_DIR / "failed"
 LOG_FILE = STATE_DIR / "daemon.log"
 PID_FILE = STATE_DIR / "daemon.pid"
 PAUSE_FILE = STATE_DIR / "paused"
@@ -16,6 +20,7 @@ def ensure_dirs() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    FAILED_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     LIVE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Custom vocabulary for transcription (one term per line, '#' comments).
