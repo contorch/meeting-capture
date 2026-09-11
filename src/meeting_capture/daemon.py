@@ -4,14 +4,17 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import re
 import signal
 import sys
 import time
+import wave
 from pathlib import Path
 
 from .mic import default_devices_snapshot, is_mic_active, mic_name
 from .paths import (
     AUDIO_DIR,
+    FAILED_AUDIO_DIR,
     LOG_FILE,
     PAUSE_FILE,
     PID_FILE,
@@ -82,6 +85,81 @@ def _append(transcript_path: Path, chunk: Chunk, text: str) -> None:
     prefix = f"[{ts}] {label} " if label else f"[{ts}] "
     with transcript_path.open("a", encoding="utf-8") as f:
         f.write(f"{prefix}{text}\n\n")
+
+
+_FAILED_NAME = re.compile(r"^chunk-(\d+)-(me|them)\.wav$")
+
+
+def _park_failed(chunk: Chunk, reason: BaseException) -> Path | None:
+    """Move a chunk whose transcription failed into FAILED_AUDIO_DIR for a later retry."""
+    try:
+        FAILED_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+        dest = FAILED_AUDIO_DIR / chunk.path.name
+        chunk.path.replace(dest)
+    except OSError as exc:
+        log.error("could not park failed chunk %s: %s", chunk.path, exc)
+        return None
+    log.warning(
+        "transcription failed (%s) — kept %.1fs of audio at %s; retried once a key/network is back",
+        reason, chunk.duration_seconds, dest,
+    )
+    return dest
+
+
+def _wav_duration(path: Path) -> float:
+    with wave.open(str(path), "rb") as w:
+        return w.getnframes() / float(w.getframerate() or 16000)
+
+
+def parked_chunks() -> list[Chunk]:
+    """Failed chunks waiting for a retry, oldest first."""
+    out: list[Chunk] = []
+    if not FAILED_AUDIO_DIR.is_dir():
+        return out
+    for path in sorted(FAILED_AUDIO_DIR.glob("chunk-*.wav")):
+        m = _FAILED_NAME.match(path.name)
+        if not m:
+            continue
+        try:
+            dur = _wav_duration(path)
+        except (OSError, wave.Error):
+            continue
+        out.append(Chunk(path=path, started_at=float(m.group(1)), duration_seconds=dur, role=m.group(2)))
+    return out
+
+
+def retry_failed_chunks() -> int:
+    """Transcribe parked chunks, regrouping them into sessions like the live loop.
+
+    Stops at the first failure (the key/network is still not there — no point
+    hammering) and returns how many chunks were recovered.
+    """
+    chunks = parked_chunks()
+    if not chunks:
+        return 0
+    log.info("retrying %d parked chunk(s) from earlier failed transcriptions", len(chunks))
+    recovered = 0
+    session: Path | None = None
+    last_end = 0.0
+    for chunk in chunks:
+        if session is None or (chunk.started_at - last_end) > SESSION_GAP_SECONDS:
+            session = _session_path(chunk.started_at)
+        try:
+            text = transcribe(chunk.path, role=chunk.role)
+        except Exception as exc:
+            log.warning("retry still failing (%s) — %d chunk(s) remain parked in %s",
+                        exc, len(chunks) - recovered, FAILED_AUDIO_DIR)
+            break
+        _append(session, chunk, text)
+        last_end = chunk.started_at + chunk.duration_seconds
+        try:
+            chunk.path.unlink()
+        except FileNotFoundError:
+            pass
+        recovered += 1
+    if recovered:
+        log.info("recovered %d parked chunk(s) into transcripts", recovered)
+    return recovered
 
 
 def _append_text(transcript_path: Path, role: str, text: str, started_at: float | None = None) -> None:
@@ -205,6 +283,9 @@ def run() -> None:
     last_footprint_check = 0.0
     backoff = FailureBackoff()
 
+    # Anything parked by an earlier run (e.g. recorded before the key existed).
+    retry_failed_chunks()
+
     def _watchdog_tick() -> None:
         # Throttle the footprint check to ~once a minute regardless of caller.
         nonlocal last_footprint_check
@@ -300,8 +381,12 @@ def run() -> None:
                 try:
                     text = transcribe(chunk.path, role=chunk.role)
                 except Exception as exc:
-                    log.exception("transcription failed for %s: %s", chunk.path, exc)
-                    text = ""
+                    # Keep the audio. Deleting it here meant a call recorded
+                    # before the Gemini key was set up was lost for good.
+                    _park_failed(chunk, exc)
+                    last_chunk_end = chunk_end
+                    _watchdog_tick()
+                    continue
 
                 _append(current_session, chunk, text)
                 last_chunk_end = chunk_end
@@ -324,6 +409,7 @@ def run() -> None:
 
             log.info("mic inactive — session ended")
             _after_session(session_started, session_chunks)
+            retry_failed_chunks()
     except KeyboardInterrupt:
         log.info("interrupted")
     finally:

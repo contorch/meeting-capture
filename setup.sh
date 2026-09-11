@@ -44,8 +44,9 @@ else
 fi
 
 # Python 3.10+
-if command -v python3 &>/dev/null; then
-    PY_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+PYTHON="${PYTHON:-python3}"   # bootstrap.sh exports this when Apple's 3.9 is too old
+if command -v "$PYTHON" &>/dev/null; then
+    PY_VERSION=$("$PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
     PY_MAJOR=$(echo "$PY_VERSION" | cut -d. -f1)
     PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
     if [ "$PY_MAJOR" -ge 3 ] && [ "$PY_MINOR" -ge 10 ]; then
@@ -54,7 +55,7 @@ if command -v python3 &>/dev/null; then
         fail "Python $PY_VERSION is too old. Need 3.10+. Install via Homebrew (\`brew install python@3.11\`) or python.org."
     fi
 else
-    fail "python3 not on PATH. Install via Homebrew (\`brew install python@3.11\`) or python.org."
+    fail "$PYTHON not on PATH. Install via Homebrew (\`brew install python@3.12\`) or python.org."
 fi
 
 # git
@@ -104,7 +105,7 @@ echo "sysaudio binary: $SYSAUDIO_BIN"
 # ---------------------------------------------------------------------------
 if [ ! -d "$VENV" ]; then
     echo "Creating virtual environment..."
-    python3 -m venv "$VENV"
+    "$PYTHON" -m venv "$VENV"
 fi
 echo "Installing meeting-capture Python package..."
 "$VENV/bin/pip" install -q --upgrade pip
@@ -143,11 +144,13 @@ Done. Diagnostic:
   $VENV/bin/meeting-capture doctor   # full health check (binaries, permissions, daemon)
   $VENV/bin/meeting-capture status   # daemon + mic + last transcript
 
-Permission setup (the only manual step):
+Permission setup (the only manual step) — grant it to sysaudio, not your terminal:
   1. System Settings -> Privacy & Security -> Screen & System Audio Recording
-  2. Add the parent terminal app (Warp / Terminal / iTerm) AND/OR add
-     the binary $SYSAUDIO_BIN directly to the list
-  3. Restart the terminal so the grant takes effect
+  2. Click +, press Cmd-Shift-G, paste this path, add it and enable it (also
+     under "System Audio Recording Only" if that list is shown):
+       $SYSAUDIO_BIN
+  3. macOS 15+: the first real recording pops a Microphone prompt for
+     "sysaudio" — click Allow to get your own voice as "Me". No terminal restart.
 
 Then you're done. Next time you join a Zoom/Teams/Meet/FaceTime call, the
 daemon will detect mic activity within 2s and start capturing.
