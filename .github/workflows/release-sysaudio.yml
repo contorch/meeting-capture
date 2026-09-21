@@ -41,7 +41,10 @@ jobs:
       - name: Build universal sysaudio
         run: |
           set -euo pipefail
-          sw_vers && xcodebuild -version | head -1
+          sw_vers
+          # Cosmetic, and it can hit the same flaky NSFileHandle SIGABRT as the
+          # build — outside the retry loop that would have killed the job.
+          xcodebuild -version 2>/dev/null | head -1 || true
           cd swift
           # `swift build` intermittently SIGABRTs (exit 134) with an
           # NSFileHandle crash on the GitHub runner — a known-flaky toolchain
