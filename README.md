@@ -109,14 +109,17 @@ Transcription is hosted on Google's Gemini. Default model: `gemini-3.5-transcrib
 
 ### Live mode & the in-meeting copilot
 
-By default the daemon runs in **batch** mode: it chunks audio and transcribes after each pause (cheapest, most robust). Set `MEETING_CAPTURE_MODE=live` and it streams to `gemini-3.5-transcribe-live` instead — ~1-second interim hypotheses and finalized utterances — which is what the in-meeting copilot needs. Finals still land in `~/transcripts/*.md` exactly as in batch mode; live *additionally* writes a per-session feed under `~/.meeting-capture/live/`.
+By default the daemon runs in **batch** mode: it chunks audio and transcribes after each pause (cheapest, most robust). Run `meeting-capture mode live` once and the launchd daemon streams to `gemini-3.5-transcribe-live` instead — ~1-second interim hypotheses and finalized utterances — which is what the in-meeting copilot needs. Finals still land in `~/transcripts/*.md` exactly as in batch mode; live *additionally* writes a per-session feed under `~/.meeting-capture/live/`.
 
-Two panes during a meeting:
+Switch once, then one pane during a meeting:
 
 ```bash
-MEETING_CAPTURE_MODE=live meeting-capture run   # pane 1: the daemon, streaming
-meeting-capture copilot                          # pane 2: whispers from your memory
+meeting-capture mode live        # persists into the launchd plist and restarts the daemon
+meeting-capture copilot          # during the call: whispers from your memory
+meeting-capture mode batch       # back to chunked transcription
 ```
+
+Keep using the launchd daemon for live mode rather than `MEETING_CAPTURE_MODE=live meeting-capture run` in a terminal: a terminal-spawned sysaudio is a different binary path to macOS, so it asks for Screen Recording again, and declining that prompt also revokes the grant the daemon depends on.
 
 `meeting-capture copilot` watches the live feed and, when the other side asks something you'd want help answering, retrieves from your **past meetings** and whispers the fact, decision, or number — with the meeting it came from — or stays silent when it has nothing useful. Inside Claude Code there's a richer surface: install the `skills/meeting` skill and type `/meeting` mid-call — Claude reads the same feed but searches your *entire* contorch memory (notes, tasks, repo knowledge, every meeting), not just transcripts. `/loop 15s /meeting` watches continuously. `meeting-capture live [--interim]` tails the raw transcript feed. Costs are higher in live mode (~$0.009/min per channel streaming, plus a cheap LLM call per copilot whisper), so it's opt-in.
 

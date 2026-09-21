@@ -41,6 +41,8 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from .paths import LAUNCHD_PLIST
+
 SAMPLE_RATE = 16_000
 CHANNELS = 1
 BYTES_PER_SAMPLE = 2  # int16 little-endian (audiotee resampled mode)
@@ -123,8 +125,42 @@ def find_audiotee() -> Path | None:
     return Path(on_path) if on_path else None
 
 
+def plist_sysaudio() -> Path | None:
+    """The sysaudio path recorded in the launchd plist by `meeting-capture install`.
+
+    macOS keys the Screen Recording grant of an unbundled executable to its
+    path. The daemon under launchd, `run` in a terminal, `check`, `doctor` and
+    the brew wrapper each used to resolve sysaudio independently (plist env,
+    shell env, package bin/, PATH), so two of them could pick two different
+    copies of the same binary — a second "app" to TCC, a fresh permission
+    prompt, and a decline that revoked the grant the daemon depended on.
+    Whatever path the installed agent uses is therefore the one every entry
+    point must use.
+    """
+    try:
+        if not LAUNCHD_PLIST.is_file():
+            return None
+        import plistlib
+        env = plistlib.loads(LAUNCHD_PLIST.read_bytes()).get("EnvironmentVariables") or {}
+    except Exception:
+        return None
+    recorded = env.get(SYSAUDIO_ENV_VAR)
+    if recorded and Path(recorded).is_file():
+        return Path(recorded)
+    return None
+
+
 def find_sysaudio() -> Path | None:
-    """Locate the sysaudio (ScreenCaptureKit) binary."""
+    """Locate the sysaudio (ScreenCaptureKit) binary.
+
+    Resolution order: the path recorded in the launchd plist (one binary, one
+    TCC grant — see plist_sysaudio), then MEETING_CAPTURE_SYSAUDIO from the
+    environment, then bin/sysaudio beside the package, then PATH.
+    """
+    recorded = plist_sysaudio()
+    if recorded is not None:
+        return recorded
+
     env = os.environ.get(SYSAUDIO_ENV_VAR)
     if env and Path(env).is_file():
         return Path(env)

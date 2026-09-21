@@ -164,9 +164,25 @@ def _client():
             "Set GOOGLE_API_KEY or GEMINI_API_KEY, or write the key to "
             f"{GEMINI_KEY_FILE} (mode 600)."
         )
-    # The SDK has no read timeout by default — a half-open TLS connection can
-    # wedge the daemon indefinitely on SSL_read. Explicit per-request timeout.
-    return genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS)), types
+    return genai.Client(api_key=api_key, http_options=_http_options(types)), types
+
+
+def _http_options(types):
+    """Bounded HTTP behaviour for every batch transcription call.
+
+    * timeout: the SDK has no read timeout by default — a half-open TLS
+      connection can wedge the daemon indefinitely on SSL_read.
+    * attempts=1: the SDK retries 429/5xx on its own and honours Retry-After.
+      A daily-quota 429 carries a Retry-After of hours, so one transcribe()
+      call sat inside the SDK's retry loop for two days while the batch loop
+      never reached its "session ended" line and the chunk was never parked.
+      Fail fast instead; transcribe() already falls back to the flash model
+      and the daemon parks the audio for a later retry.
+    """
+    return types.HttpOptions(
+        timeout=REQUEST_TIMEOUT_MS,
+        retry_options=types.HttpRetryOptions(attempts=1),
+    )
 
 
 # --- backend: Interactions API (gemini-3.5-transcribe) --------------------------------

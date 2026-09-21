@@ -49,10 +49,40 @@ def test_find_audiotee_returns_none_when_missing(monkeypatch):
 
 
 def test_find_sysaudio_via_env(tmp_path, monkeypatch):
+    monkeypatch.setattr(recorder, "LAUNCHD_PLIST", tmp_path / "no-agent.plist")
     fake = tmp_path / "sysaudio"
     fake.write_text("")
     monkeypatch.setenv(recorder.SYSAUDIO_ENV_VAR, str(fake))
     assert recorder.find_sysaudio() == fake
+
+
+def _plist_with_sysaudio(path, sysaudio):
+    import plistlib
+    path.write_bytes(plistlib.dumps({"EnvironmentVariables": {recorder.SYSAUDIO_ENV_VAR: str(sysaudio)}}))
+
+
+def test_find_sysaudio_prefers_plist_over_env(tmp_path, monkeypatch):
+    # One binary, one TCC grant: the agent's recorded path beats the shell's.
+    pinned = tmp_path / "pinned" / "sysaudio"
+    pinned.parent.mkdir()
+    pinned.write_text("")
+    other = tmp_path / "other-sysaudio"
+    other.write_text("")
+    plist = tmp_path / "agent.plist"
+    _plist_with_sysaudio(plist, pinned)
+    monkeypatch.setattr(recorder, "LAUNCHD_PLIST", plist)
+    monkeypatch.setenv(recorder.SYSAUDIO_ENV_VAR, str(other))
+    assert recorder.find_sysaudio() == pinned
+
+
+def test_find_sysaudio_ignores_plist_path_that_is_gone(tmp_path, monkeypatch):
+    plist = tmp_path / "agent.plist"
+    _plist_with_sysaudio(plist, tmp_path / "deleted-sysaudio")
+    monkeypatch.setattr(recorder, "LAUNCHD_PLIST", plist)
+    fallback = tmp_path / "sysaudio"
+    fallback.write_text("")
+    monkeypatch.setenv(recorder.SYSAUDIO_ENV_VAR, str(fallback))
+    assert recorder.find_sysaudio() == fallback
 
 
 def test_find_sysaudio_returns_none_when_missing(monkeypatch):
@@ -63,6 +93,7 @@ def test_find_sysaudio_returns_none_when_missing(monkeypatch):
 
 
 def test_find_capture_binary_prefers_sysaudio(tmp_path, monkeypatch):
+    monkeypatch.setattr(recorder, "LAUNCHD_PLIST", tmp_path / "no-agent.plist")
     fake_sysaudio = tmp_path / "sysaudio"
     fake_audiotee = tmp_path / "audiotee"
     fake_sysaudio.write_text("")
