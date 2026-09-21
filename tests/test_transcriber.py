@@ -144,3 +144,13 @@ class TestGeminiBackendErrors:
             t._transcribe_gemini(Path("/tmp/fake.wav"), None)
         msg = str(exc.value)
         assert ("API key" in msg) or ("google-genai" in msg.lower())
+
+
+class TestHttpOptions:
+    def test_no_sdk_retries_and_bounded_timeout(self):
+        types = pytest.importorskip("google.genai.types")
+        opts = t._http_options(types)
+        assert opts.timeout == t.REQUEST_TIMEOUT_MS
+        # One attempt: a daily-quota 429 must raise now, not sit in the SDK's
+        # Retry-After loop for hours (that wedged the daemon for two days).
+        assert opts.retry_options.attempts == 1

@@ -205,7 +205,7 @@ async def _pump_pcm(proc, queues: dict, stop: asyncio.Event) -> None:
 async def _run(should_record: Callable[[], bool], session_stem: str, append: Callable[[str, str], None]) -> None:
     from google import genai
     from google.genai import types
-    from .transcriber import REQUEST_TIMEOUT_MS, _resolve_gemini_api_key
+    from .transcriber import _http_options, _resolve_gemini_api_key
 
     api_key = _resolve_gemini_api_key()
     if not api_key:
@@ -218,7 +218,7 @@ async def _run(should_record: Callable[[], bool], session_stem: str, append: Cal
     cmd = [str(binary), "--sample-rate", str(SAMPLE_RATE)] + (["--mic"] if want_mic else [])
     proc = _spawn_capture(cmd, disclaim=want_mic)
 
-    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS))
+    client = genai.Client(api_key=api_key, http_options=_http_options(types))
     feed = _FeedWriter(session_stem)
     stop = asyncio.Event()
 

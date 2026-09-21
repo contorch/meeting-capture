@@ -1,4 +1,4 @@
-"""CLI: meeting-capture {start,stop,pause,resume,status,install,uninstall,run,mic,last,tail,doctor}."""
+"""CLI: meeting-capture {start,stop,pause,resume,status,install,uninstall,run,mic,last,tail,doctor,mode,live,copilot}."""
 from __future__ import annotations
 
 import argparse
@@ -111,6 +111,7 @@ def cmd_status(_args) -> int:
     print(f"  transcripts dir:  {TRANSCRIPTS_DIR}")
     print(f"  log file:         {LOG_FILE}")
     print(f"  launchd:          {'installed' if LAUNCHD_PLIST.exists() else 'not installed'}")
+    print(f"  mode:             {_plist_mode()} ({'launchd plist' if LAUNCHD_PLIST.exists() else 'default'})")
     return 0
 
 
@@ -309,7 +310,7 @@ def cmd_live(args) -> int:
     ensure_dirs()
     feeds = sorted(LIVE_DIR.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True) if LIVE_DIR.exists() else []
     if not feeds:
-        print("(no live feed yet — start a meeting with MEETING_CAPTURE_MODE=live)", file=sys.stderr)
+        print("(no live feed yet — switch the daemon with `meeting-capture mode live`, then start a meeting)", file=sys.stderr)
         return 1
     feed = feeds[0]
     print(f"— live: {feed.name} —  (Ctrl-C to stop)")
@@ -437,11 +438,102 @@ def _preserved_env() -> dict:
     return env
 
 
+MODE_ENV_VAR = "MEETING_CAPTURE_MODE"
+MODES = ("batch", "live")
+
+
+def _plist_env() -> dict:
+    if not LAUNCHD_PLIST.exists():
+        return {}
+    try:
+        return dict(plistlib.loads(LAUNCHD_PLIST.read_bytes()).get("EnvironmentVariables") or {})
+    except Exception:
+        return {}
+
+
+def _plist_mode() -> str:
+    """Capture mode the launchd daemon runs in ("batch" unless the plist says live)."""
+    v = _plist_env().get(MODE_ENV_VAR, "batch").strip().lower()
+    return v if v in MODES else "batch"
+
+
+def _set_plist_mode(mode: str) -> None:
+    """Persist MEETING_CAPTURE_MODE in the launchd plist, touching nothing else.
+
+    Live mode used to require `MEETING_CAPTURE_MODE=live meeting-capture run`
+    in a terminal. That spawns sysaudio from the terminal's environment — a
+    different binary path than the launchd daemon uses — so macOS treats it as
+    a second app and asks for Screen Recording again; declining that prompt
+    also revokes the grant the launchd daemon relies on. Switching the mode
+    inside the plist keeps one daemon, one sysaudio, one TCC grant.
+    """
+    payload = plistlib.loads(LAUNCHD_PLIST.read_bytes())
+    env = dict(payload.get("EnvironmentVariables") or {})
+    if mode == "batch":
+        env.pop(MODE_ENV_VAR, None)
+    else:
+        env[MODE_ENV_VAR] = mode
+    payload["EnvironmentVariables"] = env
+    LAUNCHD_PLIST.write_bytes(plistlib.dumps(payload))
+
+
+def _relaunch() -> None:
+    subprocess.run(["launchctl", "unload", "-w", str(LAUNCHD_PLIST)], check=False, stderr=subprocess.DEVNULL)
+    subprocess.run(["launchctl", "load", "-w", str(LAUNCHD_PLIST)], check=False)
+
+
+def cmd_mode(args) -> int:
+    if args.mode is None:
+        print(_plist_mode())
+        return 0
+    if not LAUNCHD_PLIST.exists():
+        print("no launchd agent installed — run `meeting-capture install` first", file=sys.stderr)
+        return 1
+    current = _plist_mode()
+    if args.mode == current:
+        print(f"already in {current} mode")
+        return 0
+    _set_plist_mode(args.mode)
+    _relaunch()
+    print(f"switched to {args.mode} mode; daemon restarted via launchd")
+    if args.mode == "live":
+        print("tail the feed with `meeting-capture live`, or `meeting-capture copilot` for whispers")
+    return 0
+
+
+def _resolved_sysaudio_env(env: dict) -> dict:
+    """Pin the sysaudio path the agent will use, as an absolute path.
+
+    The plist is the single source of truth for which sysaudio binary runs
+    (recorder.plist_sysaudio explains why: one path, one Screen Recording
+    grant). An explicit MEETING_CAPTURE_SYSAUDIO — from the shell, the brew
+    wrapper, or a previous plist — is kept if it points at a real file;
+    otherwise the path is resolved now so it is never left to whatever the
+    daemon's environment happens to contain at launch.
+    """
+    from .recorder import SYSAUDIO_ENV_VAR, find_sysaudio
+
+    env = dict(env)
+    given = env.get(SYSAUDIO_ENV_VAR)
+    # abspath, not resolve(): the brew wrapper hands us
+    # /opt/homebrew/opt/meeting-capture/bin/sysaudio, and opt/ is a symlink into
+    # Cellar/<version>/. Following it would pin a path that dangles on the next
+    # `brew upgrade` — and it is the stable opt/ path the TCC grant lives on.
+    if given and Path(given).is_file():
+        env[SYSAUDIO_ENV_VAR] = os.path.abspath(given)
+        return env
+    env.pop(SYSAUDIO_ENV_VAR, None)
+    found = find_sysaudio()
+    if found is not None:
+        env[SYSAUDIO_ENV_VAR] = os.path.abspath(found)
+    return env
+
+
 def _plist_payload(python_exe: str) -> bytes:
     env_vars = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
     }
-    env_vars.update(_preserved_env())
+    env_vars.update(_resolved_sysaudio_env(_preserved_env()))
     payload = {
         "Label": LAUNCHD_LABEL,
         "ProgramArguments": [python_exe, "-m", "meeting_capture.daemon"],
@@ -465,6 +557,11 @@ def cmd_install(_args) -> int:
     subprocess.run(["launchctl", "load", "-w", str(LAUNCHD_PLIST)], check=False)
     print(f"installed launchd agent at {LAUNCHD_PLIST}")
     print("daemon will auto-start at login.")
+    recorded = _plist_env().get("MEETING_CAPTURE_SYSAUDIO")
+    if recorded:
+        print(f"sysaudio pinned to {recorded} — grant Screen Recording to that path, once.")
+    else:
+        print("warning: no sysaudio binary found to pin; run `meeting-capture doctor`.", file=sys.stderr)
     return 0
 
 
@@ -524,7 +621,10 @@ def main(argv: list[str] | None = None) -> int:
     vocab = sub.add_parser("vocab", help="show or edit the transcription vocabulary (proper nouns)")
     vocab.add_argument("action", nargs="?", choices=["show", "edit"], default="show")
     vocab.set_defaults(func=cmd_vocab)
-    live = sub.add_parser("live", help="tail the live in-meeting transcript feed (MEETING_CAPTURE_MODE=live)")
+    mode = sub.add_parser("mode", help="show or switch the launchd daemon between batch and live capture")
+    mode.add_argument("mode", nargs="?", choices=list(MODES), help="omit to print the current mode")
+    mode.set_defaults(func=cmd_mode)
+    live = sub.add_parser("live", help="tail the live in-meeting transcript feed (`meeting-capture mode live`)")
     live.add_argument("--interim", action="store_true", help="also show low-latency partial hypotheses")
     live.set_defaults(func=cmd_live)
     copilot = sub.add_parser("copilot", help="watch the live meeting and whisper help from past-meeting memory")

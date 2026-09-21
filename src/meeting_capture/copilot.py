@@ -12,8 +12,8 @@ conversational beat, not read afterwards.
 
 Run it in a terminal pane during a meeting:
 
-    MEETING_CAPTURE_MODE=live meeting-capture run     # (one pane: the daemon)
-    meeting-capture copilot                           # (another: the whispers)
+    meeting-capture mode live                         # (once: launchd daemon streams live)
+    meeting-capture copilot                           # (in a pane: the whispers)
 
 Design choices:
   * Triggers on FINAL "them" utterances only (the other person addressing you
@@ -209,7 +209,7 @@ def watch(feed: Optional[Path] = None, model: str = COPILOT_MODEL,
     """Follow a live feed and emit whispers on triggery 'them' finals."""
     feed = feed or _newest_feed()
     if feed is None:
-        log.error("no live feed found — start a meeting with MEETING_CAPTURE_MODE=live")
+        log.error("no live feed found — run `meeting-capture mode live`, then start a meeting")
         return 1
     whispers_path = feed.with_suffix(".whispers.jsonl")
 
