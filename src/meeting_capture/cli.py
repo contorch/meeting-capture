@@ -477,6 +477,74 @@ def _set_plist_mode(mode: str) -> None:
     LAUNCHD_PLIST.write_bytes(plistlib.dumps(payload))
 
 
+def _update_plist_env(set_: dict, remove: tuple = ()) -> None:
+    """Set/remove launchd env keys, touching nothing else in the plist."""
+    payload = plistlib.loads(LAUNCHD_PLIST.read_bytes())
+    env = dict(payload.get("EnvironmentVariables") or {})
+    for k in remove:
+        env.pop(k, None)
+    env.update(set_)
+    payload["EnvironmentVariables"] = env
+    LAUNCHD_PLIST.write_bytes(plistlib.dumps(payload))
+
+
+def cmd_source(args) -> int:
+    """Where audio comes from: `sck` (this Mac's own call audio, the default) or
+    `linein` (a USB audio interface — for a separate Mac that isn't in the call)."""
+    from .linein import DEVICE_ENV, ME_CHANNEL_ENV, SOURCE_ENV, THEM_CHANNEL_ENV, validate
+
+    keys = (SOURCE_ENV, DEVICE_ENV, ME_CHANNEL_ENV, THEM_CHANNEL_ENV)
+    env = _plist_env()
+    current = "linein" if env.get(SOURCE_ENV, "").strip().lower() == "linein" else "sck"
+    if args.source is None:
+        print(current)
+        if current == "linein":
+            print(f"  device: {env.get(DEVICE_ENV) or '(system default input)'}")
+            print(f"  me = channel {env.get(ME_CHANNEL_ENV, '0')}, them = channel {env.get(THEM_CHANNEL_ENV, '1')}")
+        return 0
+    if not LAUNCHD_PLIST.exists():
+        print("no launchd agent installed — run `meeting-capture install` first", file=sys.stderr)
+        return 1
+
+    if args.source == "sck":
+        _update_plist_env({}, remove=keys)
+        _relaunch()
+        print("source: sck (this Mac's own call audio); daemon restarted")
+        return 0
+
+    me = args.me if args.me is not None else int(env.get(ME_CHANNEL_ENV, 0))
+    them = args.them if args.them is not None else int(env.get(THEM_CHANNEL_ENV, 1))
+    device = args.device if args.device is not None else env.get(DEVICE_ENV)
+    try:
+        info = validate(device, me, them)
+    except RuntimeError as exc:
+        print(f"can't use that input: {exc}", file=sys.stderr)
+        print("see the choices with `meeting-capture devices`", file=sys.stderr)
+        return 1
+    updates = {SOURCE_ENV: "linein", ME_CHANNEL_ENV: str(me), THEM_CHANNEL_ENV: str(them)}
+    if device:
+        updates[DEVICE_ENV] = device
+    _update_plist_env(updates, remove=() if device else (DEVICE_ENV,))
+    _relaunch()
+    print(f"source: line-in from {info['name']!r} — me = input {me + 1}, them = input {them + 1}")
+    print("daemon restarted. It records whenever either input carries speech.")
+    return 0
+
+
+def cmd_devices(_args) -> int:
+    from .linein import list_input_devices
+
+    devs = list_input_devices()
+    if not devs:
+        print("no input devices found — or the line-in extra is missing: "
+              "pip install 'meeting-capture[linein]'", file=sys.stderr)
+        return 1
+    print("audio inputs (use a name with `meeting-capture source linein --device NAME`):")
+    for d in devs:
+        print(f"  {d['name']}  — {d['channels']} channel(s)")
+    return 0
+
+
 def _relaunch() -> None:
     subprocess.run(["launchctl", "unload", "-w", str(LAUNCHD_PLIST)], check=False, stderr=subprocess.DEVNULL)
     subprocess.run(["launchctl", "load", "-w", str(LAUNCHD_PLIST)], check=False)
@@ -624,6 +692,13 @@ def main(argv: list[str] | None = None) -> int:
     mode = sub.add_parser("mode", help="show or switch the launchd daemon between batch and live capture")
     mode.add_argument("mode", nargs="?", choices=list(MODES), help="omit to print the current mode")
     mode.set_defaults(func=cmd_mode)
+    source = sub.add_parser("source", help="show or switch where audio comes from: sck (this Mac) or linein (USB interface)")
+    source.add_argument("source", nargs="?", choices=["sck", "linein"], help="omit to print the current source")
+    source.add_argument("--device", help="input device name (substring) or index; see `meeting-capture devices`")
+    source.add_argument("--me", type=int, help="0-based channel carrying your voice (default 0 = input 1)")
+    source.add_argument("--them", type=int, help="0-based channel carrying the other side (default 1 = input 2)")
+    source.set_defaults(func=cmd_source)
+    sub.add_parser("devices", help="list audio input devices (for line-in)").set_defaults(func=cmd_devices)
     live = sub.add_parser("live", help="tail the live in-meeting transcript feed (`meeting-capture mode live`)")
     live.add_argument("--interim", action="store_true", help="also show low-latency partial hypotheses")
     live.set_defaults(func=cmd_live)

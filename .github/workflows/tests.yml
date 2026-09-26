@@ -1,0 +1,30 @@
+name: tests
+
+# The unit suite, on every PR and push to main. Until this existed the tests
+# only ever ran on a developer's machine — the only workflow was the tag-
+# triggered release build.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  pytest:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install (with the line-in extra, so its real imports are exercised)
+        run: python -m pip install -q -e '.[dev,linein]'
+      - name: pytest
+        run: python -m pytest -q tests
+      - name: line-in extra imports and lists devices on a real macOS runner
+        run: |
+          python - <<'PY'
+          from meeting_capture import linein
+          devs = linein.list_input_devices()   # real PortAudio, no hardware assumed
+          print(f"sounddevice OK; {len(devs)} input device(s) on the runner")
+          PY
