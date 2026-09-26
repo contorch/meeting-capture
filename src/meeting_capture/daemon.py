@@ -28,11 +28,15 @@ from .recorder import (
     mic_capture_supported,
     stream_chunks,
 )
+from .linein import linein_mode_enabled, stream_chunks_linein
 from .live import live_mode_enabled, run_live_session
 from .transcriber import transcribe
 from .watchdog import check_and_maybe_exit
 
 SESSION_GAP_SECONDS = 15 * 60
+# Line-in mode: how long to wait before retrying when the USB interface can't be
+# opened (unplugged, wrong name), so a missing device doesn't crash-loop launchd.
+LINEIN_RETRY_SECONDS = 30.0
 MIC_POLL_INTERVAL = 2.0
 
 # A capture session that dies this quickly without producing a single chunk
@@ -261,7 +265,11 @@ def run() -> None:
         len(load_vocabulary()),
         diarization_enabled(),
     )
-    if live_mode_enabled():
+    linein = linein_mode_enabled()
+    if linein:
+        log.info("SOURCE: line-in — reading the USB audio interface continuously "
+                 "(not a call participant; chunks only on speech)")
+    elif live_mode_enabled():
         log.info("MODE: live — real-time streaming transcription (in-meeting copilot feed)")
     else:
         log.info("MODE: batch — chunked transcription (default)")
@@ -333,7 +341,19 @@ def run() -> None:
                     last_devices.get("output"), devs.get("output"),
                 )
                 last_devices = devs
+        if linein:
+            # Not a call participant, so there is no "mic in use" to wait for:
+            # read continuously; the chunker only emits on actual speech.
+            return not _is_paused()
         return is_mic_active() and not _is_paused()
+
+    def _linein_chunks():
+        try:
+            yield from stream_chunks_linein(AUDIO_DIR, _should_record)
+        except RuntimeError as exc:
+            log.error("line-in capture unavailable: %s — retrying in %.0fs",
+                      exc, LINEIN_RETRY_SECONDS)
+            time.sleep(LINEIN_RETRY_SECONDS)
 
     try:
         while True:
@@ -342,10 +362,11 @@ def run() -> None:
                 _watchdog_tick()
                 time.sleep(MIC_POLL_INTERVAL)
 
-            log.info("mic active — starting recording session")
+            log.info("line-in: listening on the interface" if linein
+                     else "mic active — starting recording session")
             session_started = time.time()
 
-            if live_mode_enabled():
+            if live_mode_enabled() and not linein:
                 # Live path: stream to Gemini in real time; finals land in the
                 # same .md and in the copilot feed. One session file per meeting.
                 started = time.time()
@@ -371,7 +392,8 @@ def run() -> None:
 
             # Batch path: stream chunks until the mic goes off (or pause is set).
             session_chunks = 0
-            for chunk in stream_chunks(AUDIO_DIR, _should_record):
+            chunk_source = _linein_chunks() if linein else stream_chunks(AUDIO_DIR, _should_record)
+            for chunk in chunk_source:
                 session_chunks += 1
                 chunk_end = chunk.started_at + chunk.duration_seconds
                 if current_session is None or (chunk.started_at - last_chunk_end) > SESSION_GAP_SECONDS:

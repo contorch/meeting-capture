@@ -199,3 +199,83 @@ def test_resolved_sysaudio_env_keeps_symlink_path(tmp_path):
     env = cli._resolved_sysaudio_env({"MEETING_CAPTURE_SYSAUDIO": str(given)})
     assert env["MEETING_CAPTURE_SYSAUDIO"] == str(given)
     assert "Cellar" not in env["MEETING_CAPTURE_SYSAUDIO"]
+
+
+# ---- `meeting-capture source` (line-in) — against a temp plist, fake audio devices
+
+class _FakeSD:
+    DEVICES = [
+        {"name": "MacBook Pro Microphone", "max_input_channels": 1},
+        {"name": "UMC202HD 192k", "max_input_channels": 2},
+    ]
+
+    def query_devices(self, dev=None, kind=None):
+        if dev is None and kind is None:
+            return self.DEVICES
+        if dev is None:
+            return self.DEVICES[0]           # "system default input"
+        return self.DEVICES[dev]
+
+
+@pytest.fixture
+def linein_env(tmp_path, monkeypatch):
+    from meeting_capture import linein
+    monkeypatch.setattr(linein, "_import_sounddevice", lambda: _FakeSD())
+    plist = tmp_path / "agent.plist"
+    _write_plist(plist, {"PATH": "/usr/bin", "MEETING_CAPTURE_SYSAUDIO": "/x/sysaudio"})
+    monkeypatch.setattr(cli, "LAUNCHD_PLIST", plist)
+    calls = []
+    monkeypatch.setattr(cli, "_relaunch", lambda: calls.append("relaunch"))
+    return plist, calls
+
+
+def test_source_linein_writes_env_and_relaunches(linein_env, capsys):
+    plist, calls = linein_env
+    assert cli.main(["source", "linein", "--device", "umc202"]) == 0
+    env = _read_env(plist)
+    assert env["MEETING_CAPTURE_SOURCE"] == "linein"
+    assert env["MEETING_CAPTURE_INPUT_DEVICE"] == "umc202"
+    assert (env["MEETING_CAPTURE_ME_CHANNEL"], env["MEETING_CAPTURE_THEM_CHANNEL"]) == ("0", "1")
+    assert env["MEETING_CAPTURE_SYSAUDIO"] == "/x/sysaudio"  # unrelated keys untouched
+    assert calls == ["relaunch"]
+    assert "UMC202HD 192k" in capsys.readouterr().out
+
+
+def test_source_linein_rejects_bad_device_without_touching_plist(linein_env, capsys):
+    plist, calls = linein_env
+    before = plist.read_bytes()
+    assert cli.main(["source", "linein", "--device", "focusrite"]) == 1
+    assert plist.read_bytes() == before and calls == []
+    assert "can't use that input" in capsys.readouterr().err
+
+
+def test_source_linein_rejects_one_channel_device(linein_env, capsys):
+    plist, calls = linein_env
+    assert cli.main(["source", "linein", "--device", "MacBook Pro Microphone"]) == 1
+    assert calls == []
+    assert "needs 2" in capsys.readouterr().err
+
+
+def test_source_linein_rejects_same_channel_for_both(linein_env, capsys):
+    _, calls = linein_env
+    assert cli.main(["source", "linein", "--device", "umc202", "--me", "1", "--them", "1"]) == 1
+    assert calls == []
+    assert "transcribed twice" in capsys.readouterr().err
+
+
+def test_source_sck_removes_linein_keys_only(linein_env):
+    plist, calls = linein_env
+    cli.main(["source", "linein", "--device", "umc202"])
+    assert cli.main(["source", "sck"]) == 0
+    env = _read_env(plist)
+    assert not any(k.startswith(("MEETING_CAPTURE_SOURCE", "MEETING_CAPTURE_INPUT", "MEETING_CAPTURE_ME_", "MEETING_CAPTURE_THEM_")) for k in env)
+    assert env["MEETING_CAPTURE_SYSAUDIO"] == "/x/sysaudio"
+    assert calls == ["relaunch", "relaunch"]
+
+
+def test_source_shows_current_mapping(linein_env, capsys):
+    cli.main(["source", "linein", "--device", "umc202", "--me", "1", "--them", "0"])
+    capsys.readouterr()
+    assert cli.main(["source"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("linein") and "umc202" in out and "me = channel 1, them = channel 0" in out
