@@ -155,7 +155,7 @@ Permission setup (the only manual step) — grant it to sysaudio, not your termi
 Then you're done. Next time you join a Zoom/Teams/Meet/FaceTime call, the
 daemon will detect mic activity within 2s and start capturing.
 
-Transcripts land in ~/transcripts/ (picked up by context-orchestrator's transcript-watcher).
+Transcripts are stored in ~/.context-orchestrator/context.db (indexed by context-orchestrator).
 Pause:  touch ~/.meeting-capture/paused
 Resume: rm    ~/.meeting-capture/paused
 EOF

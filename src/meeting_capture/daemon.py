@@ -1,4 +1,4 @@
-"""Daemon: record system audio, transcribe each chunk, append to a session transcript."""
+"""Daemon: record system audio, transcribe each chunk, append to the meeting's transcript row."""
 from __future__ import annotations
 
 import datetime as dt
@@ -18,9 +18,9 @@ from .paths import (
     LOG_FILE,
     PAUSE_FILE,
     PID_FILE,
-    TRANSCRIPTS_DIR,
     ensure_dirs,
 )
+from . import store
 from .recorder import (
     Chunk,
     find_sysaudio,
@@ -67,9 +67,18 @@ def _is_paused() -> bool:
     return PAUSE_FILE.exists()
 
 
-def _session_path(started_at: float) -> Path:
+def _session_id(started_at: float) -> str:
+    """One transcript row per meeting, e.g. meeting-2026-09-28T14-00-00."""
     stamp = dt.datetime.fromtimestamp(started_at).strftime("%Y-%m-%dT%H-%M-%S")
-    return TRANSCRIPTS_DIR / f"meeting-{stamp}.md"
+    return f"meeting-{stamp}"
+
+
+def _started_iso(meeting_id: str) -> str:
+    stamp = meeting_id[len("meeting-"):]
+    try:
+        return dt.datetime.strptime(stamp, "%Y-%m-%dT%H-%M-%S").isoformat()
+    except ValueError:
+        return ""
 
 
 # Chunk roles → transcript speaker labels. "them" chunks may still contain
@@ -78,17 +87,17 @@ def _session_path(started_at: float) -> Path:
 ROLE_LABELS = {"me": "**Me:**", "them": "**Them:**"}
 
 
-def _append(transcript_path: Path, chunk: Chunk, text: str) -> None:
+def _line(started_at: float, role: str, text: str) -> str:
+    ts = dt.datetime.fromtimestamp(started_at).strftime("%H:%M:%S")
+    label = ROLE_LABELS.get(role)
+    prefix = f"[{ts}] {label} " if label else f"[{ts}] "
+    return f"{prefix}{text}\n\n"
+
+
+def _append(meeting_id: str, chunk: Chunk, text: str) -> None:
     if not text:
         return
-    if not transcript_path.exists():
-        header = f"# Meeting transcript {transcript_path.stem}\n\n"
-        transcript_path.write_text(header, encoding="utf-8")
-    ts = dt.datetime.fromtimestamp(chunk.started_at).strftime("%H:%M:%S")
-    label = ROLE_LABELS.get(chunk.role)
-    prefix = f"[{ts}] {label} " if label else f"[{ts}] "
-    with transcript_path.open("a", encoding="utf-8") as f:
-        f.write(f"{prefix}{text}\n\n")
+    store.append(meeting_id, _line(chunk.started_at, chunk.role, text), _started_iso(meeting_id))
 
 
 _FAILED_NAME = re.compile(r"^chunk-(\d+)-(me|them)\.wav$")
@@ -143,11 +152,11 @@ def retry_failed_chunks() -> int:
         return 0
     log.info("retrying %d parked chunk(s) from earlier failed transcriptions", len(chunks))
     recovered = 0
-    session: Path | None = None
+    session: str | None = None
     last_end = 0.0
     for chunk in chunks:
         if session is None or (chunk.started_at - last_end) > SESSION_GAP_SECONDS:
-            session = _session_path(chunk.started_at)
+            session = _session_id(chunk.started_at)
         try:
             text = transcribe(chunk.path, role=chunk.role)
         except Exception as exc:
@@ -166,19 +175,12 @@ def retry_failed_chunks() -> int:
     return recovered
 
 
-def _append_text(transcript_path: Path, role: str, text: str, started_at: float | None = None) -> None:
+def _append_text(meeting_id: str, role: str, text: str, started_at: float | None = None) -> None:
     """Append a role-labeled line to a transcript (live path; no Chunk object)."""
     text = text.strip()
     if not text:
         return
-    if not transcript_path.exists():
-        header = f"# Meeting transcript {transcript_path.stem}\n\n"
-        transcript_path.write_text(header, encoding="utf-8")
-    ts = dt.datetime.fromtimestamp(started_at or time.time()).strftime("%H:%M:%S")
-    label = ROLE_LABELS.get(role)
-    prefix = f"[{ts}] {label} " if label else f"[{ts}] "
-    with transcript_path.open("a", encoding="utf-8") as f:
-        f.write(f"{prefix}{text}\n\n")
+    store.append(meeting_id, _line(started_at or time.time(), role, text), _started_iso(meeting_id))
 
 
 class FailureBackoff:
@@ -280,7 +282,7 @@ def run() -> None:
     else:
         log.info("mic capture (own voice): disabled via MEETING_CAPTURE_MIC (system audio only)")
 
-    current_session: Path | None = None
+    current_session: str | None = None
     last_chunk_end: float = 0.0
     last_devices = default_devices_snapshot()
     log.info(
@@ -368,11 +370,11 @@ def run() -> None:
 
             if live_mode_enabled() and not linein:
                 # Live path: stream to Gemini in real time; finals land in the
-                # same .md and in the copilot feed. One session file per meeting.
+                # same transcript row and in the copilot feed. One row per meeting.
                 started = time.time()
                 if current_session is None or (started - last_chunk_end) > SESSION_GAP_SECONDS:
-                    current_session = _session_path(started)
-                    log.info("new session: %s", current_session.name)
+                    current_session = _session_id(started)
+                    log.info("new session: %s", current_session)
                 sess = current_session
                 session_chunks = 0
 
@@ -382,7 +384,7 @@ def run() -> None:
                     _append_text(_sess, role, text)
 
                 try:
-                    run_live_session(_should_record, sess.stem, _live_append)
+                    run_live_session(_should_record, sess, _live_append)
                 except Exception as exc:
                     log.exception("live session failed: %s", exc)
                 last_chunk_end = time.time()
@@ -397,8 +399,8 @@ def run() -> None:
                 session_chunks += 1
                 chunk_end = chunk.started_at + chunk.duration_seconds
                 if current_session is None or (chunk.started_at - last_chunk_end) > SESSION_GAP_SECONDS:
-                    current_session = _session_path(chunk.started_at)
-                    log.info("new session: %s", current_session.name)
+                    current_session = _session_id(chunk.started_at)
+                    log.info("new session: %s", current_session)
 
                 try:
                     text = transcribe(chunk.path, role=chunk.role)
@@ -422,7 +424,7 @@ def run() -> None:
                     "chunk %.1fs [%s] -> %s (%d chars)",
                     chunk.duration_seconds,
                     chunk.role,
-                    current_session.name if current_session else "?",
+                    current_session or "?",
                     len(text),
                 )
 
