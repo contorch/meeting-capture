@@ -1,12 +1,12 @@
 # meeting-capture
 
-Always-on meeting transcription daemon for macOS. Detects when another app is using your microphone (any video/audio call), captures **both sides of the meeting** — system audio output (the other participants) and your own microphone — via ScreenCaptureKit, transcribes each side via Google's hosted Gemini audio models, and writes timestamped, speaker-attributed (`**Me:**` / `**Them:**`) Markdown transcripts to `~/transcripts/`.
+Always-on meeting transcription daemon for macOS. Detects when another app is using your microphone (any video/audio call), captures **both sides of the meeting** — system audio output (the other participants) and your own microphone — via ScreenCaptureKit, transcribes each side via Google's hosted Gemini audio models, and stores timestamped, speaker-attributed (`**Me:**` / `**Them:**`) transcripts in the contorch database (`~/.context-orchestrator/context.db`, table `transcripts`) — no transcript files.
 
 No driver, no kernel extension, no `sudo`, no reboot. Two user-grantable permissions: Screen Recording (system audio) and Microphone (your voice; macOS 15+, optional — without it you get system audio only).
 
 > **Note:** transcription is hosted (Gemini), so each audio chunk is sent to Google's API and a Google API key is required. A previous local mlx-whisper backend was removed — it ran on the GPU and its unbounded MLX Metal buffer cache leaked tens of GB in a long-lived daemon.
 
-Pairs with [context-orchestrator](https://github.com/contorch/context-orchestrator), which auto-indexes the transcripts into a searchable vector store. The two are coupled only via the `~/transcripts/` directory; either runs independently.
+Pairs with [context-orchestrator](https://github.com/contorch/context-orchestrator), which indexes each meeting into a searchable vector store and serves the full text (`get_transcript`). The two are coupled only via that SQLite table (the same `CREATE TABLE` on both sides; `CO_DB_PATH` overrides the location); either runs independently.
 
 ## Requirements
 
@@ -70,21 +70,21 @@ mic activates                                     mic deactivates
 │  - while active: spawns sysaudio subprocess                      │
 │  - two channels: system audio = "them", microphone = "me"        │
 │  - each channel splits on silence (≥3s gap, ≥8s min, ≤600s max)  │
-│  - sends each chunk to Gemini, appends labeled text to .md file  │
+│  - sends each chunk to Gemini, appends labeled text to the DB    │
 │  - on mic-off: flushes in-flight buffers, terminates sysaudio    │
 └──────────────────────────────────────────────────────────────────┘
             │                                          │
             ▼                                          ▼
    ┌────────────────────┐                  ┌────────────────────────┐
-   │ sysaudio (Swift)   │                  │ ~/transcripts/         │
-   │ ScreenCaptureKit   │                  │   meeting-{ISO}.md     │
+   │ sysaudio (Swift)   │                  │ context.db transcripts │
+   │ ScreenCaptureKit   │                  │   row meeting-{ISO}    │
    │ system out + mic   │                  │ [ts] **Them:** ...     │
    │ → framed int16 LE  │                  │ [ts] **Me:** ...       │
    │   PCM on stdout    │                  │ (appended live)        │
    └────────────────────┘                  └────────────────────────┘
 ```
 
-A new transcript file is started whenever the gap between chunks exceeds 15 minutes. Mid-meeting mic mutes do not fragment the file. Raw audio chunks are deleted from disk after transcription.
+A new transcript (row) is started whenever the gap between chunks exceeds 15 minutes. Mid-meeting mic mutes do not fragment it. If the database can't be written (locked, disk full), lines queue in `~/.meeting-capture/unsaved-lines.jsonl` and are written ahead of the next line. Raw audio chunks are deleted from disk after transcription.
 
 ### Two-channel (me/them) capture
 
@@ -96,7 +96,7 @@ Note on echo: without headphones, your mic also picks up the other side from the
 
 ## Files
 
-- `~/transcripts/meeting-*.md` — final transcripts
+- `~/.context-orchestrator/context.db` — transcripts (`meeting-capture last` prints the latest; contorch's `get_transcript` / `contorch-transcripts show` any)
 - `~/.meeting-capture/daemon.log` — daemon log (rotated by macOS)
 - `~/.meeting-capture/paused` — pause sentinel
 - `~/.meeting-capture/audio/` — temporary chunk WAVs (deleted post-transcription)
@@ -109,7 +109,7 @@ Transcription is hosted on Google's Gemini. Default model: `gemini-3.5-transcrib
 
 ### Live mode & the in-meeting copilot
 
-By default the daemon runs in **batch** mode: it chunks audio and transcribes after each pause (cheapest, most robust). Run `meeting-capture mode live` once and the launchd daemon streams to `gemini-3.5-transcribe-live` instead — ~1-second interim hypotheses and finalized utterances — which is what the in-meeting copilot needs. Finals still land in `~/transcripts/*.md` exactly as in batch mode; live *additionally* writes a per-session feed under `~/.meeting-capture/live/`.
+By default the daemon runs in **batch** mode: it chunks audio and transcribes after each pause (cheapest, most robust). Run `meeting-capture mode live` once and the launchd daemon streams to `gemini-3.5-transcribe-live` instead — ~1-second interim hypotheses and finalized utterances — which is what the in-meeting copilot needs. Finals still land in the meeting's transcript row exactly as in batch mode; live *additionally* writes a per-session feed under `~/.meeting-capture/live/`.
 
 Switch once, then one pane during a meeting:
 

@@ -18,8 +18,8 @@ Run it in a terminal pane during a meeting:
 Design choices:
   * Triggers on FINAL "them" utterances only (the other person addressing you
     is the moment help matters), debounced so it never spams.
-  * Retrieval is over ~/transcripts/*.md — your meeting memory, plain files,
-    zero extra deps. Pluggable via a retriever hook so a contorch semantic
+  * Retrieval is over past meetings in the contorch database (store.py) —
+    keyword matching, zero extra deps. Pluggable via a retriever hook so a contorch semantic
     search can drop in later (Phase 3.1).
   * The LLM is instructed to output NONE when it has nothing useful, so silence
     is the default and whispers are rare and worth reading.
@@ -35,7 +35,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from .paths import LIVE_DIR, TRANSCRIPTS_DIR
+from . import store
+from .paths import LIVE_DIR
 
 log = logging.getLogger("meeting-capture.copilot")
 
@@ -93,35 +94,35 @@ class Snippet:
 
 
 def retrieve_transcripts(query: str, exclude_stem: str = "", limit: int = MAX_SNIPPETS,
-                         transcripts_dir: Path = TRANSCRIPTS_DIR) -> list[Snippet]:
+                         db_path: Optional[Path] = None, max_meetings: int = 200) -> list[Snippet]:
     """Keyword search over past meeting transcripts. Zero-dependency retriever.
 
     Scores each transcript line by how many query keywords it contains; returns
-    the best lines across files, newest files first on ties.
+    the best lines across meetings, most recent meetings first on ties.
     """
     terms = keywords(query)
-    if not terms or not transcripts_dir.exists():
+    if not terms:
+        return []
+    try:
+        meetings = store.recent(max_meetings, path=db_path)
+    except Exception as exc:  # a locked/unreadable DB must not break the copilot
+        log.warning("could not read past meetings: %s", exc)
         return []
     scored: list[tuple[int, float, str, str]] = []
-    files = sorted(transcripts_dir.glob("meeting-*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for f in files:
-        if exclude_stem and f.stem == exclude_stem:
+    for m in meetings:
+        if exclude_stem and m["meeting_id"] == exclude_stem:
             continue
-        mtime = f.stat().st_mtime
-        try:
-            # Content lines only (drop the header + blank lines). A meeting is
-            # Q-then-A across adjacent lines, so a matched line is returned with
-            # the next couple of lines — otherwise the *answer* (which rarely
-            # shares the question's keywords) never comes along.
-            lines = [ln.strip() for ln in f.read_text(encoding="utf-8", errors="replace").splitlines()
-                     if ln.strip() and not ln.startswith("#")]
-        except OSError:
-            continue
+        # Content lines only (drop the header + blank lines). A meeting is
+        # Q-then-A across adjacent lines, so a matched line is returned with
+        # the next couple of lines — otherwise the *answer* (which rarely
+        # shares the question's keywords) never comes along.
+        lines = [ln.strip() for ln in m["body"].splitlines()
+                 if ln.strip() and not ln.startswith("#")]
         for i, line in enumerate(lines):
             score = sum(1 for term in terms if term in line.lower())
             if score >= 1:  # any keyword match; the LLM filters precision via NONE
                 window = " ".join(lines[i:i + 3])[:SNIPPET_CHARS]
-                scored.append((score, mtime, f.stem, window))
+                scored.append((score, m["updated_at"], m["meeting_id"], window))
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
     out: list[Snippet] = []
     seen: set[str] = set()

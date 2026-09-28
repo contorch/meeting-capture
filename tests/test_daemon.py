@@ -1,45 +1,60 @@
 from pathlib import Path
 
-from meeting_capture import daemon
+from meeting_capture import daemon, store
 from meeting_capture.recorder import Chunk
 
 
-def test_session_path_contains_timestamp(tmp_path, monkeypatch):
-    monkeypatch.setattr(daemon, "TRANSCRIPTS_DIR", tmp_path)
-    started = 1714003200.0
-    p = daemon._session_path(started)
-    assert p.parent == tmp_path
-    assert p.name.startswith("meeting-")
-    assert p.suffix == ".md"
+def _body(meeting_id):
+    row = store.get(meeting_id)
+    return row["body"] if row else None
+
+
+def test_session_id_contains_timestamp():
+    sid = daemon._session_id(1714003200.0)
+    assert sid.startswith("meeting-") and "T" in sid and not sid.endswith(".md")
+    assert daemon._started_iso(sid).startswith(sid[len("meeting-"):len("meeting-") + 10])
 
 
 def test_append_creates_header_then_appends(tmp_path):
-    transcript = tmp_path / "meeting-x.md"
     chunk = Chunk(path=Path("/tmp/x.wav"), started_at=1714003200.0, duration_seconds=5.0)
-    daemon._append(transcript, chunk, "first line")
-    daemon._append(transcript, chunk, "second line")
-    text = transcript.read_text()
+    daemon._append("meeting-x", chunk, "first line")
+    daemon._append("meeting-x", chunk, "second line")
+    text = _body("meeting-x")
     assert text.count("# Meeting transcript") == 1
     assert "first line" in text
     assert "second line" in text
+    assert not (tmp_path / "transcripts").exists(), "no transcript files"
 
 
-def test_append_skips_empty(tmp_path):
-    transcript = tmp_path / "meeting-y.md"
+def test_append_skips_empty():
     chunk = Chunk(path=Path("/tmp/x.wav"), started_at=1714003200.0, duration_seconds=5.0)
-    daemon._append(transcript, chunk, "")
-    assert not transcript.exists()
+    daemon._append("meeting-y", chunk, "")
+    assert _body("meeting-y") is None
 
 
-def test_append_labels_roles(tmp_path):
-    transcript = tmp_path / "meeting-z.md"
+def test_append_labels_roles():
     them = Chunk(path=Path("/tmp/a.wav"), started_at=1714003200.0, duration_seconds=5.0, role="them")
     me = Chunk(path=Path("/tmp/b.wav"), started_at=1714003210.0, duration_seconds=5.0, role="me")
-    daemon._append(transcript, them, "how was the launch?")
-    daemon._append(transcript, me, "shipped last night")
-    text = transcript.read_text()
+    daemon._append("meeting-z", them, "how was the launch?")
+    daemon._append("meeting-z", me, "shipped last night")
+    text = _body("meeting-z")
     assert "**Them:** how was the launch?" in text
     assert "**Me:** shipped last night" in text
+
+
+def test_locked_db_queues_the_line_and_flushes_it_later(tmp_path, monkeypatch):
+    import sqlite3
+    real = store._write
+    def locked(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(store, "_write", locked)
+    daemon._append_text("meeting-q", "them", "said while the db was locked", started_at=1714003200.0)
+    assert store.PENDING_FILE.exists()
+    monkeypatch.setattr(store, "_write", real)
+    daemon._append_text("meeting-q", "me", "and then this", started_at=1714003201.0)
+    text = _body("meeting-q")
+    assert text.index("while the db was locked") < text.index("and then this")
+    assert not store.PENDING_FILE.exists()
 
 
 def test_backoff_escalates_on_fast_failures_and_resets():
@@ -89,8 +104,6 @@ def test_park_failed_keeps_audio(tmp_path, monkeypatch):
 def test_retry_recovers_parked_chunks_into_sessions(tmp_path, monkeypatch):
     failed = tmp_path / "failed"; failed.mkdir()
     monkeypatch.setattr(daemon, "FAILED_AUDIO_DIR", failed)
-    monkeypatch.setattr(daemon, "TRANSCRIPTS_DIR", tmp_path / "transcripts")
-    (tmp_path / "transcripts").mkdir()
     _wav(failed / "chunk-1714003200-them.wav", 2.0)
     _wav(failed / "chunk-1714003203-me.wav", 2.0)
     _wav(failed / "chunk-1714010000-them.wav", 2.0)   # > SESSION_GAP later → new session
@@ -99,16 +112,15 @@ def test_retry_recovers_parked_chunks_into_sessions(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon, "transcribe", lambda path, role: said[role])
     assert daemon.retry_failed_chunks() == 3
     assert sorted(p.name for p in failed.iterdir()) == ["not-a-chunk.wav"]
-    sessions = sorted((tmp_path / "transcripts").glob("meeting-*.md"))
+    sessions = sorted(r["meeting_id"] for r in store.recent())
     assert len(sessions) == 2
-    first = sessions[0].read_text()
+    first = _body(sessions[0])
     assert "**Them:** how was the launch?" in first and "**Me:** shipped last night" in first
 
 
 def test_retry_stops_at_first_failure_and_keeps_the_rest(tmp_path, monkeypatch):
     failed = tmp_path / "failed"; failed.mkdir()
     monkeypatch.setattr(daemon, "FAILED_AUDIO_DIR", failed)
-    monkeypatch.setattr(daemon, "TRANSCRIPTS_DIR", tmp_path)
     _wav(failed / "chunk-1714003200-them.wav"); _wav(failed / "chunk-1714003205-me.wav")
     def boom(path, role): raise RuntimeError("still no key")
     monkeypatch.setattr(daemon, "transcribe", boom)

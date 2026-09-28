@@ -2,7 +2,6 @@ from pathlib import Path
 
 HOME = Path.home()
 STATE_DIR = HOME / ".meeting-capture"
-TRANSCRIPTS_DIR = HOME / "transcripts"
 AUDIO_DIR = STATE_DIR / "audio"
 # Chunks whose transcription failed (no key, quota, outage) wait here for a retry
 # instead of being deleted — a recording made before the key was configured
@@ -18,7 +17,6 @@ LAUNCHD_PLIST = HOME / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 
 def ensure_dirs() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     FAILED_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     LIVE_DIR.mkdir(parents=True, exist_ok=True)

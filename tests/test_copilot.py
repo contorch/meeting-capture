@@ -29,35 +29,33 @@ class TestKeywords:
 
 
 class TestRetrieval:
-    def _write(self, d: Path, stem: str, *lines: str):
-        (d / f"{stem}.md").write_text("\n".join(lines), encoding="utf-8")
+    def _write(self, _d: Path, stem: str, *lines: str):
+        from meeting_capture import store
+        store.append(stem, "\n".join(lines) + "\n")
 
     def test_scores_by_matching_terms(self, tmp_path):
         self._write(tmp_path, "meeting-2026-07-08T10-00-00",
                     "[14:31] **Me:** pricing is usage-based, annual discount parked until Q4")
         self._write(tmp_path, "meeting-2026-06-01T09-00-00",
                     "[09:10] **Them:** the weather was nice")
-        snips = c.retrieve_transcripts("what did we decide about pricing and the discount",
-                                       transcripts_dir=tmp_path)
+        snips = c.retrieve_transcripts("what did we decide about pricing and the discount")
         assert snips and "usage-based" in snips[0].text
         assert snips[0].source.startswith("meeting-2026-07-08")
 
     def test_excludes_current_session(self, tmp_path):
         self._write(tmp_path, "meeting-current",
                     "[10:00] **Them:** pricing pricing discount discount")
-        assert c.retrieve_transcripts("pricing discount", exclude_stem="meeting-current",
-                                      transcripts_dir=tmp_path) == []
+        assert c.retrieve_transcripts("pricing discount", exclude_stem="meeting-current") == []
 
     def test_ranks_more_matches_first(self, tmp_path):
         self._write(tmp_path, "meeting-a", "[10:00] **Me:** pricing discount decided today")
         self._write(tmp_path, "meeting-b", "[10:00] **Me:** pricing was mentioned once")
-        snips = c.retrieve_transcripts("what did we decide about pricing and the discount",
-                                       transcripts_dir=tmp_path)
+        snips = c.retrieve_transcripts("what did we decide about pricing and the discount")
         assert snips[0].source == "meeting-a"  # 3 matches ranks above 1 match
 
     def test_no_match_is_empty(self, tmp_path):
         self._write(tmp_path, "m", "[10:00] **Me:** entirely unrelated content")
-        assert c.retrieve_transcripts("pricing discount", transcripts_dir=tmp_path) == []
+        assert c.retrieve_transcripts("pricing discount") == []
 
     def test_window_carries_the_answer(self, tmp_path):
         # The answer follows the question on the next line and shares none of
@@ -66,7 +64,7 @@ class TestRetrieval:
                     "# header",
                     "[14:34] **Them:** and the API rate limit for the Acme integration?",
                     "[14:34] **Me:** hard cap is 50 requests per second, do not exceed it")
-        snips = c.retrieve_transcripts("what is the rate limit on the Acme API", transcripts_dir=tmp_path)
+        snips = c.retrieve_transcripts("what is the rate limit on the Acme API")
         assert snips and "50 requests per second" in snips[0].text
 
 

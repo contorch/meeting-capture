@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__
+from . import __version__, store
 from .mic import active_mic_name, is_mic_active, mic_name
 from .paths import (
     AUDIO_DIR,
@@ -19,7 +19,6 @@ from .paths import (
     LOG_FILE,
     PAUSE_FILE,
     PID_FILE,
-    TRANSCRIPTS_DIR,
     ensure_dirs,
 )
 
@@ -51,11 +50,12 @@ def _format_age(seconds: float) -> str:
     return f"{int(seconds // 86400)}d ago"
 
 
-def _last_transcript() -> Path | None:
-    if not TRANSCRIPTS_DIR.exists():
+def _last_transcript() -> dict | None:
+    try:
+        rows = store.recent(1)
+    except Exception:
         return None
-    files = sorted(TRANSCRIPTS_DIR.glob("meeting-*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return files[0] if files else None
+    return rows[0] if rows else None
 
 
 def _last_chunk_log_line() -> str | None:
@@ -97,10 +97,9 @@ def cmd_status(_args) -> int:
 
     last = _last_transcript()
     if last is not None:
-        st = last.stat()
-        size_kb = st.st_size / 1024
-        age = time.time() - st.st_mtime
-        print(f"  last transcript:  {last.name} ({size_kb:.1f} KB, {_format_age(age)})")
+        size_kb = len(last["body"].encode("utf-8")) / 1024
+        age = time.time() - last["updated_at"]
+        print(f"  last transcript:  {last['meeting_id']} ({size_kb:.1f} KB, {_format_age(age)})")
     else:
         print(f"  last transcript:  (none yet)")
 
@@ -108,7 +107,7 @@ def cmd_status(_args) -> int:
     if last_log is not None:
         print(f"  last chunk log:   {last_log}")
 
-    print(f"  transcripts dir:  {TRANSCRIPTS_DIR}")
+    print(f"  transcripts db:   {store.db_path()}")
     print(f"  log file:         {LOG_FILE}")
     print(f"  launchd:          {'installed' if LAUNCHD_PLIST.exists() else 'not installed'}")
     print(f"  mode:             {_plist_mode()} ({'launchd plist' if LAUNCHD_PLIST.exists() else 'default'})")
@@ -128,7 +127,7 @@ def cmd_last(_args) -> int:
     if last is None:
         print("(no transcripts yet)", file=sys.stderr)
         return 1
-    print(last)
+    sys.stdout.write(last["body"])
     return 0
 
 
@@ -238,11 +237,10 @@ def cmd_doctor(_args) -> int:
         _fail("launchd plist not installed", "meeting-capture install")
 
     print("\nPaths & data:")
-    if TRANSCRIPTS_DIR.exists():
-        n = len(list(TRANSCRIPTS_DIR.glob("meeting-*.md")))
-        _ok(f"transcripts dir", f"{TRANSCRIPTS_DIR} ({n} files)")
-    else:
-        _fail("transcripts dir missing", f"mkdir -p {TRANSCRIPTS_DIR}")
+    try:
+        _ok("transcripts database", f"{store.db_path()} ({store.count()} meetings)")
+    except Exception as exc:
+        _fail(f"transcripts database unreadable: {exc}", f"check {store.db_path()}")
     if LOG_FILE.exists():
         size_kb = LOG_FILE.stat().st_size / 1024
         _ok(f"daemon log", f"{LOG_FILE} ({size_kb:.1f} KB)")
@@ -683,7 +681,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("uninstall", help="remove launchd agent").set_defaults(func=cmd_uninstall)
     sub.add_parser("check", help="verify audiotee is built and prompt audio-capture permission").set_defaults(func=cmd_check)
     sub.add_parser("mic", help="show current mic-activity state (the gate that triggers recording)").set_defaults(func=cmd_mic)
-    sub.add_parser("last", help="print the path of the most recent transcript").set_defaults(func=cmd_last)
+    sub.add_parser("last", help="print the most recent transcript").set_defaults(func=cmd_last)
     sub.add_parser("tail", help="follow the daemon log").set_defaults(func=cmd_tail)
     sub.add_parser("doctor", help="full health check (binaries, permissions, daemon)").set_defaults(func=cmd_doctor)
     vocab = sub.add_parser("vocab", help="show or edit the transcription vocabulary (proper nouns)")

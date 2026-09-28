@@ -8,7 +8,7 @@ hypotheses plus finalized utterances — the latency the in-meeting copilot need
 Two independent live sessions run per meeting: the microphone ("me") and system
 audio ("them"), fed from the same framed sysaudio stream the batch path uses.
 Each finalized utterance is:
-  * appended to the same ~/transcripts/meeting-*.md file (memory works
+  * appended to the same transcript row in the contorch database (memory works
     identically to batch mode), and
   * written to a per-session JSONL feed under ~/.meeting-capture/live/ that the
     `meeting-capture live` tail and the copilot consume.
@@ -231,7 +231,7 @@ async def _run(should_record: Callable[[], bool], session_stem: str, append: Cal
             return
         feed.write(role, kind, text)
         if kind == "final":
-            append(role, text)  # into the .md, same as batch mode
+            append(role, text)  # into the transcript row, same as batch mode
 
     async def _gate() -> None:
         while should_record():

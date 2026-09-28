@@ -24,21 +24,18 @@ def test_format_age_days():
     assert cli._format_age(86400 * 3) == "3d ago"
 
 
-def test_last_transcript_returns_none_when_dir_empty(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "TRANSCRIPTS_DIR", tmp_path)
+def test_last_transcript_returns_none_when_db_empty():
     assert cli._last_transcript() is None
 
 
-def test_last_transcript_returns_most_recent(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "TRANSCRIPTS_DIR", tmp_path)
-    older = tmp_path / "meeting-2026-01-01T00-00-00.md"
-    newer = tmp_path / "meeting-2026-04-26T14-00-00.md"
-    older.write_text("old")
-    newer.write_text("new")
-    import os
-    past = time.time() - 3600
-    os.utime(older, (past, past))
-    assert cli._last_transcript() == newer
+def test_last_transcript_returns_most_recent():
+    from meeting_capture import store
+    store.append("meeting-2026-01-01T00-00-00", "[00:00:01] old\n\n")
+    time.sleep(0.01)
+    store.append("meeting-2026-04-26T14-00-00", "[14:00:01] new\n\n")
+    last = cli._last_transcript()
+    assert last["meeting_id"] == "meeting-2026-04-26T14-00-00"
+    assert "new" in last["body"]
 
 
 def test_last_chunk_log_line_returns_none_when_no_log(tmp_path, monkeypatch):
