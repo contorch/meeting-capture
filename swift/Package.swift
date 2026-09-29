@@ -22,11 +22,5 @@ let package = Package(
                 ])
             ]
         ),
-        // Menu bar item: status, pause/resume, "Recording settings…".
-        // AppKit only; started at login by launchd (`meeting-capture install`).
-        .executableTarget(
-            name: "meeting-capture-menubar",
-            path: "Sources/menubar"
-        ),
     ]
 )
