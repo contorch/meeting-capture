@@ -10,6 +10,9 @@ FAILED_AUDIO_DIR = AUDIO_DIR / "failed"
 LOG_FILE = STATE_DIR / "daemon.log"
 PID_FILE = STATE_DIR / "daemon.pid"
 PAUSE_FILE = STATE_DIR / "paused"
+# PID of a running `meeting-capture ui` — its level meters open the input,
+# and the mic-activity gate ignores that process.
+UI_PID_FILE = STATE_DIR / "ui.pid"
 
 LAUNCHD_LABEL = "com.contorch.meeting-capture"
 LAUNCHD_PLIST = HOME / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"

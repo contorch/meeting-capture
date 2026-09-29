@@ -70,3 +70,20 @@ def test_falls_back_to_device_check_without_process_objects(monkeypatch):
     monkeypatch.setattr(mic, "_has_input_streams", lambda d: True)
     monkeypatch.setattr(mic, "_is_device_running", lambda d: True)
     assert mic.is_mic_active() is True
+
+
+def test_settings_page_metering_does_not_trip_gate(monkeypatch, tmp_path):
+    """`meeting-capture ui` opens the input for its level meters; that must
+    not look like a call starting."""
+    from meeting_capture import paths
+    pid_file = tmp_path / "ui.pid"
+    pid_file.write_text("4242")
+    monkeypatch.setattr(paths, "UI_PID_FILE", pid_file)
+    _patch_processes(monkeypatch, {10: (True, None)})
+    monkeypatch.setattr(mic, "_process_pid", lambda o: 4242)
+    assert mic.is_mic_active() is False
+    monkeypatch.setattr(mic, "_process_pid", lambda o: 999)   # a real app alongside
+    assert mic.is_mic_active() is True
+    pid_file.unlink()                                          # page closed
+    monkeypatch.setattr(mic, "_process_pid", lambda o: 4242)
+    assert mic.is_mic_active() is True

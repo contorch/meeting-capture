@@ -52,6 +52,7 @@ _K_DEVICE_PROPERTY_STREAM_CONFIGURATION = _fourcc("slay")
 _K_OBJECT_PROPERTY_NAME = _fourcc("lnam")
 _K_PROCESS_PROPERTY_BUNDLE_ID = _fourcc("pbid")
 _K_PROCESS_PROPERTY_IS_RUNNING_INPUT = _fourcc("piri")
+_K_PROCESS_PROPERTY_PID = _fourcc("ppid")
 _K_SCOPE_GLOBAL = _fourcc("glob")
 _K_SCOPE_INPUT = _fourcc("inpt")
 
@@ -243,6 +244,35 @@ def _process_bundle_id(process_obj: int) -> str | None:
     return _cf_string_prop(process_obj, _K_PROCESS_PROPERTY_BUNDLE_ID)
 
 
+def _process_pid(process_obj: int) -> int | None:
+    if _CA is None:
+        return None
+    addr = _AudioObjectPropertyAddress(
+        _K_PROCESS_PROPERTY_PID,
+        _K_SCOPE_GLOBAL,
+        _K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    )
+    val = ctypes.c_int32(0)
+    size = ctypes.c_uint32(ctypes.sizeof(val))
+    if _CA.AudioObjectGetPropertyData(
+        process_obj, ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(val)
+    ) != 0:
+        return None
+    return val.value
+
+
+def _excluded_pids() -> set[int]:
+    """Our own processes that open an input without being a call: the
+    settings page (`meeting-capture ui`) meters the interface, and must not
+    make the daemon think a meeting started."""
+    from .paths import UI_PID_FILE
+
+    try:
+        return {int(UI_PID_FILE.read_text().strip())}
+    except (OSError, ValueError):
+        return set()
+
+
 def is_mic_active() -> bool:
     """True if a non-excluded process is currently running audio input.
 
@@ -252,10 +282,13 @@ def is_mic_active() -> bool:
     """
     procs = _process_object_ids()
     if procs:
+        ours = _excluded_pids()
         for obj in procs:
             if not _process_is_running_input(obj):
                 continue
             if _process_bundle_id(obj) in _EXCLUDED_INPUT_BUNDLES:
+                continue
+            if ours and _process_pid(obj) in ours:
                 continue
             return True
         return False
