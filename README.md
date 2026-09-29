@@ -123,6 +123,10 @@ Keep using the launchd daemon for live mode rather than `MEETING_CAPTURE_MODE=li
 
 `meeting-capture copilot` watches the live feed and, when the other side asks something you'd want help answering, retrieves from your **past meetings** and whispers the fact, decision, or number — with the meeting it came from — or stays silent when it has nothing useful. Inside Claude Code there's a richer surface: install the `skills/meeting` skill and type `/meeting` mid-call — Claude reads the same feed but searches your *entire* contorch memory (notes, tasks, repo knowledge, every meeting), not just transcripts. `/loop 15s /meeting` watches continuously. `meeting-capture live [--interim]` tails the raw transcript feed. Costs are higher in live mode (~$0.009/min per channel streaming, plus a cheap LLM call per copilot whisper), so it's opt-in.
 
+### Settings page
+
+`meeting-capture ui` opens a settings page in the browser (served from this Mac on 127.0.0.1 only; nothing to install). Choose where audio comes from — this Mac's call audio, or a USB interface such as a Behringer UMC202HD/UMC404HD — pick the device and which input is the host ("Me") and which the guests ("Them"), and watch live level meters for every input while you set the interface's gain knobs (aim for peaks between −18 and −6 dBFS; a CLIP flag means turn down or press PAD). Save restarts the recorder with the new settings — the same thing `meeting-capture source linein --device … --me … --them …` does. The page also pauses/resumes recording and shows the latest transcript lines as they arrive. Metering from the page never counts as "a call started".
+
 ### Vocabulary
 
 Proper nouns are where transcription goes wrong. Put yours — names, products, jargon — in `~/.meeting-capture/vocab.txt` (one per line, up to 1,000; `meeting-capture vocab edit`) and the transcribe model spells them deterministically. Without it, "contorch" came back as "Concourse" in our tests; with it, never.
