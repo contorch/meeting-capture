@@ -20,7 +20,7 @@ from .paths import (
     PID_FILE,
     ensure_dirs,
 )
-from . import store
+from . import status, store
 from .recorder import (
     Chunk,
     find_sysaudio,
@@ -293,6 +293,9 @@ def run() -> None:
     last_footprint_check = 0.0
     backoff = FailureBackoff()
 
+    report = status.Reporter("linein" if linein else "sck")
+    report("paused" if _is_paused() else "idle")
+
     # Anything parked by an earlier run (e.g. recorded before the key existed).
     retry_failed_chunks()
 
@@ -361,8 +364,10 @@ def run() -> None:
         while True:
             # Outer loop: idle until the mic is in use by another app (= we're in a call).
             while not _should_record():
+                report("paused" if _is_paused() else "idle")
                 _watchdog_tick()
                 time.sleep(MIC_POLL_INTERVAL)
+            report("listening" if linein else "recording", current_session)
 
             log.info("line-in: listening on the interface" if linein
                      else "mic active — starting recording session")
@@ -375,6 +380,7 @@ def run() -> None:
                 if current_session is None or (started - last_chunk_end) > SESSION_GAP_SECONDS:
                     current_session = _session_id(started)
                     log.info("new session: %s", current_session)
+                report("recording", current_session)
                 sess = current_session
                 session_chunks = 0
 
@@ -401,6 +407,7 @@ def run() -> None:
                 if current_session is None or (chunk.started_at - last_chunk_end) > SESSION_GAP_SECONDS:
                     current_session = _session_id(chunk.started_at)
                     log.info("new session: %s", current_session)
+                    report("listening" if linein else "recording", current_session)
 
                 try:
                     text = transcribe(chunk.path, role=chunk.role)
@@ -437,6 +444,7 @@ def run() -> None:
     except KeyboardInterrupt:
         log.info("interrupted")
     finally:
+        status.write("stopped", "linein" if linein else "sck")
         _clear_pid()
 
 

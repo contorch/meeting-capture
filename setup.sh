@@ -100,6 +100,14 @@ codesign --force --sign - "$SYSAUDIO_BIN" 2>/dev/null || true
 chmod +x "$SYSAUDIO_BIN"
 echo "sysaudio binary: $SYSAUDIO_BIN"
 
+# Menu bar item (status, pause/resume, recording settings) — same swift build.
+MENUBAR_BUILT="$SYSAUDIO_BUILT_DIR/meeting-capture-menubar"
+if [ -x "$MENUBAR_BUILT" ]; then
+    cp "$MENUBAR_BUILT" "$SCRIPT_DIR/bin/meeting-capture-menubar"
+    codesign --force --sign - "$SCRIPT_DIR/bin/meeting-capture-menubar" 2>/dev/null || true
+    echo "menu bar item: $SCRIPT_DIR/bin/meeting-capture-menubar"
+fi
+
 # ---------------------------------------------------------------------------
 # 3. venv + Python install
 # ---------------------------------------------------------------------------

@@ -251,14 +251,24 @@ def make_handler(token: str, meter: Meter, apply_source=None):
 
 def serve(port: int = 0, open_browser: bool = True) -> None:
     import os
-    from .paths import UI_PID_FILE, ensure_dirs
+    from .mic import _excluded_pids
+    from .paths import UI_PID_FILE, UI_URL_FILE, ensure_dirs
 
     ensure_dirs()
+    # Already open (e.g. the menu bar item clicked twice): show that page.
+    if _excluded_pids() and UI_URL_FILE.exists():
+        existing = UI_URL_FILE.read_text().strip()
+        print(f"meeting-capture settings: {existing} (already running)", flush=True)
+        if open_browser:
+            subprocess.run(["open", existing], check=False)
+        return
     UI_PID_FILE.write_text(str(os.getpid()))
     token = secrets.token_urlsafe(18)
     meter = Meter()
     httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(token, meter))
     url = f"http://127.0.0.1:{httpd.server_address[1]}/?t={token}"
+    UI_URL_FILE.write_text(url)
+    UI_URL_FILE.chmod(0o600)
 
     def reaper():
         while True:
@@ -291,6 +301,7 @@ def serve(port: int = 0, open_browser: bool = True) -> None:
         try:
             if UI_PID_FILE.read_text().strip() == str(os.getpid()):
                 UI_PID_FILE.unlink()
+                UI_URL_FILE.unlink(missing_ok=True)
         except OSError:
             pass
 
