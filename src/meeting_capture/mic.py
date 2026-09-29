@@ -261,14 +261,27 @@ def _process_pid(process_obj: int) -> int | None:
     return val.value
 
 
+UI_PID_FRESH_S = 10.0
+
+
 def _excluded_pids() -> set[int]:
     """Our own processes that open an input without being a call: the
     settings page (`meeting-capture ui`) meters the interface, and must not
     make the daemon think a meeting started."""
+    import os
+    import time
+
     from .paths import UI_PID_FILE
 
     try:
-        return {int(UI_PID_FILE.read_text().strip())}
+        # The page re-touches the file every couple of seconds. A stale one
+        # (page killed -9, crashed) must not keep excluding a PID macOS may
+        # hand to Zoom next.
+        if time.time() - UI_PID_FILE.stat().st_mtime > UI_PID_FRESH_S:
+            return set()
+        pid = int(UI_PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return {pid}
     except (OSError, ValueError):
         return set()
 

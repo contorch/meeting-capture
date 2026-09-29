@@ -264,7 +264,18 @@ def serve(port: int = 0, open_browser: bool = True) -> None:
         while True:
             time.sleep(2)
             meter.close_if_idle()
+            try:
+                UI_PID_FILE.touch()   # keeps the mic-gate exclusion fresh
+            except OSError:
+                pass
     threading.Thread(target=reaper, daemon=True).start()
+
+    import signal
+
+    def _stop(_sig, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGHUP, _stop)
 
     print(f"meeting-capture settings: {url}", flush=True)
     print("Ctrl-C to stop.", flush=True)
