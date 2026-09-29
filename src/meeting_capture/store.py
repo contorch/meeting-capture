@@ -10,6 +10,8 @@ minute, and serves the full text via its get_transcript tool.
 The DDL below is a shared contract with
 context-orchestrator/src/context_orchestrator/db.py — keep them identical.
 Both sides run CREATE ... IF NOT EXISTS, so whichever starts first creates it.
+context-orchestrator also adds full-text-search triggers on this table; they
+update its FTS index on every append here, with nothing to do on this side.
 
 If a write fails (the database is locked for longer than the timeout, the
 disk is full) the line is queued in PENDING_FILE and written ahead of the
@@ -39,7 +41,8 @@ CREATE TABLE IF NOT EXISTS transcripts (
     content_sha TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
-    indexed_at REAL
+    indexed_at REAL,
+    indexed_with TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_transcripts_updated ON transcripts(updated_at);
 """
