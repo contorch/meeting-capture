@@ -57,10 +57,17 @@ jobs:
             rm -rf .build/apple 2>/dev/null || true
             sleep 5
           done
-          BIN=$(find .build -path '*apple/Products/Release/sysaudio' | head -1)
-          [ -n "$BIN" ] || BIN=".build/release/sysaudio"
-          lipo -info "$BIN"
-          cp "$BIN" ../sysaudio
+          # Universal products land in .build/apple/Products/Release (older
+          # toolchains) or .build/out/Products/Release (Swift 6.x). Never fall
+          # back to a single-arch build: fail if either arch is missing.
+          for name in sysaudio meeting-capture-menubar; do
+            BIN=$(find .build -path "*/Products/Release/$name" -type f | head -1)
+            [ -n "$BIN" ] || { echo "no universal $name in .build"; exit 1; }
+            lipo -info "$BIN"
+            lipo -archs "$BIN" | grep -q arm64 && lipo -archs "$BIN" | grep -q x86_64 \
+              || { echo "FATAL: $name is not universal"; exit 1; }
+            cp "$BIN" "../$name"
+          done
 
       - name: Sign with Developer ID (hardened runtime + timestamp)
         run: |
@@ -73,6 +80,9 @@ jobs:
           codesign --sign "$IDENTITY" --force --timestamp --options runtime \
             --entitlements swift/sysaudio.entitlements sysaudio
           codesign --verify --strict --verbose=2 sysaudio
+          # Menu bar item: no entitlements needed (no audio, no capture).
+          codesign --sign "$IDENTITY" --force --timestamp --options runtime meeting-capture-menubar
+          codesign --verify --strict --verbose=2 meeting-capture-menubar
           codesign -dv sysaudio 2>&1 | grep -E "Identifier|TeamIdentifier|Authority" || true
           echo "== entitlements ==" && codesign -d --entitlements - --xml sysaudio 2>/dev/null | grep -q "audio-input" \
             && echo "audio-input entitlement present" \
@@ -81,7 +91,7 @@ jobs:
       - name: Package
         run: |
           set -euo pipefail
-          tar -czf sysaudio-universal-macos.tar.gz sysaudio
+          tar -czf sysaudio-universal-macos.tar.gz sysaudio meeting-capture-menubar
           shasum -a 256 sysaudio-universal-macos.tar.gz | tee sysaudio-universal-macos.tar.gz.sha256
 
       - name: Upload artifact (manual runs)

@@ -552,6 +552,21 @@ def cmd_source(args) -> int:
     return 0
 
 
+def cmd_menubar(args) -> int:
+    from . import menubar
+
+    if args.action == "install":
+        return 0 if menubar.install() else 1
+    if args.action == "uninstall":
+        if not menubar.uninstall():
+            print("menu bar item not installed")
+        return 0
+    print(f"menu bar item: {menubar.status()}")
+    found = menubar.find_menubar()
+    print(f"  binary: {found or 'not found'}")
+    return 0
+
+
 def cmd_ui(args) -> int:
     from .ui import cmd_ui as run_ui
 
@@ -657,10 +672,15 @@ def cmd_install(_args) -> int:
         print(f"sysaudio pinned to {recorded} — grant Screen Recording to that path, once.")
     else:
         print("warning: no sysaudio binary found to pin; run `meeting-capture doctor`.", file=sys.stderr)
+    if os.environ.get("MEETING_CAPTURE_MENUBAR", "1") != "0":
+        from . import menubar
+        menubar.install(quiet=True)
     return 0
 
 
 def cmd_uninstall(_args) -> int:
+    from . import menubar
+    menubar.uninstall()
     if not LAUNCHD_PLIST.exists():
         print("launchd agent not installed")
         return 0
@@ -730,6 +750,9 @@ def main(argv: list[str] | None = None) -> int:
     ui.add_argument("--port", type=int, default=0, help="port on 127.0.0.1 (default: any free port)")
     ui.add_argument("--no-open", action="store_true", help="print the URL instead of opening the browser")
     ui.set_defaults(func=cmd_ui)
+    mb = sub.add_parser("menubar", help="menu bar item (status, pause/resume, settings): install, uninstall, status")
+    mb.add_argument("action", nargs="?", choices=["install", "uninstall", "status"], default="status")
+    mb.set_defaults(func=cmd_menubar)
     live = sub.add_parser("live", help="tail the live in-meeting transcript feed (`meeting-capture mode live`)")
     live.add_argument("--interim", action="store_true", help="also show low-latency partial hypotheses")
     live.set_defaults(func=cmd_live)

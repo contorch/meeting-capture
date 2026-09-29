@@ -123,3 +123,18 @@ def test_state_shape_with_real_helpers(monkeypatch, tmp_path):
     assert [d["name"] for d in st["devices"]] == ["MacBook Pro Microphone", "UMC404HD 192k"]
     assert st["transcript"]["meeting_id"] == "meeting-2026-09-29T10-00-00"
     assert st["transcript"]["lines"] == ["[10:00:01] **Them:** hello from the guest"]
+
+
+def test_second_ui_reopens_the_running_page(tmp_path, monkeypatch, capsys):
+    from meeting_capture import mic, paths
+    import meeting_capture.ui as u
+    url_file = tmp_path / "ui.url"
+    url_file.write_text("http://127.0.0.1:5555/?t=abc")
+    monkeypatch.setattr(paths, "UI_URL_FILE", url_file)
+    monkeypatch.setattr(paths, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(mic, "_excluded_pids", lambda: {1234})     # a live, fresh page
+    opened = []
+    monkeypatch.setattr(u.subprocess, "run", lambda cmd, check=False: opened.append(cmd))
+    u.serve(open_browser=True)                                     # returns instead of serving
+    assert opened == [["open", "http://127.0.0.1:5555/?t=abc"]]
+    assert "already running" in capsys.readouterr().out

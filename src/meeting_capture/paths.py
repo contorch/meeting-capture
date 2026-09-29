@@ -10,9 +10,12 @@ FAILED_AUDIO_DIR = AUDIO_DIR / "failed"
 LOG_FILE = STATE_DIR / "daemon.log"
 PID_FILE = STATE_DIR / "daemon.pid"
 PAUSE_FILE = STATE_DIR / "paused"
+# What the recorder is doing now (status.py) — read by the menu bar item.
+STATE_FILE = STATE_DIR / "state.json"
 # PID of a running `meeting-capture ui` — its level meters open the input,
 # and the mic-activity gate ignores that process.
 UI_PID_FILE = STATE_DIR / "ui.pid"
+UI_URL_FILE = STATE_DIR / "ui.url"   # the running page's URL (0600: carries its token)
 
 LAUNCHD_LABEL = "com.contorch.meeting-capture"
 LAUNCHD_PLIST = HOME / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
