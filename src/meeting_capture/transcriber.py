@@ -212,16 +212,34 @@ def _transcribe_interactions(audio_path: Path, model: str, role: str) -> str:
         "data": base64.b64encode(audio_path.read_bytes()).decode("ascii"),
         "mime_type": "audio/wav",
     }
-    interaction = client.interactions.create(
+    interactions = _no_retries(client.interactions)
+    interaction = interactions.create(
         model=model,
         input=[audio],
         generation_config={"transcription_config": cfg},
+        timeout=REQUEST_TIMEOUT_MS / 1000,
     )
     if "diarization_mode" in cfg["mode"]:
         diarized = format_diarized(_collect_annotations(interaction))
         if diarized:
             return diarized
     return (getattr(interaction, "output_text", None) or "").strip()
+
+
+def _no_retries(interactions):
+    """The Interactions resource ignores the client's http retry options and
+    retries 408/409/429/5xx up to 4 times with backoff, honouring
+    Retry-After. With gemini-3.5-transcribe's 10-requests/minute limit the
+    daemon's recording thread slept inside that loop while live line-in
+    audio piled up unread (2026-09-30). One attempt only: a failure falls back
+    to the general model, and failing that the audio is parked for a later
+    retry — nothing is lost."""
+    try:
+        from google.genai._gaos import utils as _gaos_utils
+        interactions.sdk_configuration.retry_config = _gaos_utils.RetryConfig("none", None, False)
+    except Exception:   # older/newer SDK layout: keep its defaults
+        log.debug("could not disable Interactions retries", exc_info=True)
+    return interactions
 
 
 def _collect_annotations(interaction) -> list[dict]:

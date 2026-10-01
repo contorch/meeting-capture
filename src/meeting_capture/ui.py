@@ -60,8 +60,9 @@ class Meter:
             self.error = ""
             self.levels = [{"peak": SILENCE_DB, "rms": SILENCE_DB, "clip": 0.0} for _ in range(channels)]
             try:
-                from .linein import _import_sounddevice, resolve_device
+                from .linein import _import_sounddevice, refresh_devices, resolve_device
                 sd = _import_sounddevice()
+                refresh_devices()   # stream just closed: safe to re-scan
                 dev = resolve_device(device) if device else None
                 info = sd.query_devices(dev, "input") if dev is not None else sd.query_devices(kind="input")
                 sr = int(info.get("default_samplerate") or 48000)
@@ -93,6 +94,10 @@ class Meter:
             return {"error": self.error, "channels": [
                 {"peak": round(l["peak"], 1), "rms": round(l["rms"], 1),
                  "clipped": now - l["clip"] < 2.0} for l in self.levels]}
+
+    def idle(self) -> bool:
+        with self._lock:
+            return self._stream is None
 
     def close_if_idle(self, idle_s: float = 5.0) -> None:
         with self._lock:
@@ -142,9 +147,14 @@ def _latest_transcript(lines: int = 12) -> dict:
             "age_s": round(time.time() - r["updated_at"])}
 
 
-def state() -> dict:
+def state(meter: "Meter | None" = None) -> dict:
     from .cli import current_source
-    from .linein import list_input_devices
+    from .linein import list_input_devices, refresh_devices
+
+    # Re-scan so an interface plugged in after the page opened shows up —
+    # but never under an open meter stream (it re-scans when it reopens).
+    if meter is None or meter.idle():
+        refresh_devices()
 
     daemon = _daemon_state()
     return {
@@ -205,7 +215,7 @@ def make_handler(token: str, meter: Meter, apply_source=None):
                 self.wfile.write(data)
             elif path == "/api/state":
                 if self._authed():
-                    self._json(state())
+                    self._json(state(meter))
             elif path == "/api/levels":
                 if not self._authed():
                     return

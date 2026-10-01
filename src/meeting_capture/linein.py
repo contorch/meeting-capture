@@ -81,6 +81,24 @@ def _import_sounddevice():
     return sd
 
 
+def refresh_devices() -> bool:
+    """Re-scan audio devices. PortAudio reads the device list once, when it
+    starts, so an interface plugged in (or re-plugged) after that is
+    invisible to a long-running process — the daemon's 30 s retry and the
+    settings page would never find it. Only call while this process has no
+    stream open."""
+    try:
+        sd = _import_sounddevice()
+    except RuntimeError:
+        return False
+    try:
+        sd._terminate()
+        sd._initialize()
+        return True
+    except Exception:
+        return False
+
+
 def list_input_devices() -> list[dict]:
     """Input-capable devices, for `doctor` / setup to show. Empty if PortAudio is absent."""
     try:
@@ -110,6 +128,8 @@ def resolve_device(spec: str | None = None):
     if spec.isdigit():
         return int(spec)
     matches = [d for d in list_input_devices() if spec.lower() in d["name"].lower()]
+    if not matches and refresh_devices():   # plugged in after this process started?
+        matches = [d for d in list_input_devices() if spec.lower() in d["name"].lower()]
     if not matches:
         names = ", ".join(d["name"] for d in list_input_devices()) or "(none found)"
         raise RuntimeError(f"no input device matching {spec!r}. Available: {names}")
@@ -210,6 +230,7 @@ def stream_chunks_linein(
     them_channel() as "them".
     """
     sd = _import_sounddevice()
+    refresh_devices()   # no stream is open here; pick up a re-plugged interface
     dev = device if device is not None else resolve_device()
     me_ch, them_ch = me_channel(), them_channel()
     if me_ch == them_ch:

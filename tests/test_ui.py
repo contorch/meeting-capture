@@ -51,7 +51,7 @@ def server(monkeypatch, tmp_path):
             raise RuntimeError("me and them are both channel 0")
         return "source: line-in from 'UMC404HD 192k' — me = input 1, them = input 2"
 
-    monkeypatch.setattr(ui, "state", lambda: {"version": "x", "daemon": {"installed": True}})
+    monkeypatch.setattr(ui, "state", lambda meter=None: {"version": "x", "daemon": {"installed": True}})
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), ui.make_handler("tok", ui.Meter(), apply_source=fake_apply))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{httpd.server_address[1]}"
