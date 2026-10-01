@@ -131,3 +131,24 @@ def test_retry_stops_at_first_failure_and_keeps_the_rest(tmp_path, monkeypatch):
 def test_retry_noop_without_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon, "FAILED_AUDIO_DIR", tmp_path / "missing")
     assert daemon.retry_failed_chunks() == 0
+
+
+def test_backlog_retry_runs_in_background_one_at_a_time(monkeypatch):
+    import threading, time
+    gate = threading.Event()
+    calls = []
+
+    def slow_retry():
+        calls.append(1)
+        gate.wait(5)
+        return 0
+
+    monkeypatch.setattr(daemon, "retry_failed_chunks", slow_retry)
+    t0 = time.time()
+    t = daemon.retry_failed_chunks_in_background()
+    assert t is not None and time.time() - t0 < 1.0          # returns at once: recording isn't held up
+    assert daemon.retry_failed_chunks_in_background() is None  # a second one doesn't pile on
+    gate.set(); t.join(5)
+    assert calls == [1]
+    t2 = daemon.retry_failed_chunks_in_background()             # free again afterwards
+    assert t2 is not None; t2.join(5)

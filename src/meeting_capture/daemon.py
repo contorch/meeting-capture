@@ -7,6 +7,7 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
 import wave
 from pathlib import Path
@@ -175,6 +176,30 @@ def retry_failed_chunks() -> int:
     return recovered
 
 
+_retry_lock = threading.Lock()
+
+
+def retry_failed_chunks_in_background() -> threading.Thread | None:
+    """Run retry_failed_chunks() on a worker thread, one at a time. At
+    startup with a large backlog (e.g. after a bad key was replaced) the
+    synchronous retry held off recording for many minutes. Returns None if a
+    retry is already running."""
+    if not _retry_lock.acquire(blocking=False):
+        return None
+
+    def _work() -> None:
+        try:
+            retry_failed_chunks()
+        except Exception:
+            log.exception("background retry of parked chunks failed")
+        finally:
+            _retry_lock.release()
+
+    t = threading.Thread(target=_work, name="retry-parked", daemon=True)
+    t.start()
+    return t
+
+
 def _append_text(meeting_id: str, role: str, text: str, started_at: float | None = None) -> None:
     """Append a role-labeled line to a transcript (live path; no Chunk object)."""
     text = text.strip()
@@ -293,8 +318,9 @@ def run() -> None:
     last_footprint_check = 0.0
     backoff = FailureBackoff()
 
-    # Anything parked by an earlier run (e.g. recorded before the key existed).
-    retry_failed_chunks()
+    # Anything parked by an earlier run (e.g. recorded before the key existed)
+    # is retried in the background: a long backlog must not delay recording.
+    retry_failed_chunks_in_background()
 
     def _watchdog_tick() -> None:
         # Throttle the footprint check to ~once a minute regardless of caller.
@@ -437,7 +463,7 @@ def run() -> None:
 
             log.info("mic inactive — session ended")
             _after_session(session_started, session_chunks)
-            retry_failed_chunks()
+            retry_failed_chunks_in_background()
     except KeyboardInterrupt:
         log.info("interrupted")
     finally:

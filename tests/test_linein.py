@@ -148,3 +148,22 @@ def test_resolve_device_explains_misses_and_ambiguity(fake_sd):
 
 def test_list_input_devices_skips_output_only(fake_sd):
     assert [d["name"] for d in linein.list_input_devices()] == ["MacBook Pro Microphone", "UMC202HD 192k"]
+
+
+def test_interface_plugged_in_after_startup_is_found(monkeypatch):
+    """PortAudio caches the device list; resolve_device re-scans on a miss."""
+    from meeting_capture import linein
+
+    class SD:
+        def __init__(self):
+            self.devs = [{"name": "MacBook Pro Microphone", "max_input_channels": 1}]
+        def query_devices(self, *a, **k):
+            return self.devs
+        def _terminate(self):
+            pass
+        def _initialize(self):   # the UMC was plugged in meanwhile
+            self.devs = self.devs + [{"name": "UMC404HD 192k", "max_input_channels": 4}]
+
+    sd = SD()
+    monkeypatch.setattr(linein, "_import_sounddevice", lambda: sd)
+    assert linein.resolve_device("UMC404HD") == 1

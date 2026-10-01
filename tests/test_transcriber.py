@@ -154,3 +154,31 @@ class TestHttpOptions:
         # One attempt: a daily-quota 429 must raise now, not sit in the SDK's
         # Retry-After loop for hours (that wedged the daemon for two days).
         assert opts.retry_options.attempts == 1
+
+
+def test_interactions_calls_make_one_attempt_with_a_timeout(monkeypatch, tmp_path):
+    """The Interactions resource retries 429s with backoff on its own; the
+    recording thread must never sleep in there (2026-09-30)."""
+    from meeting_capture import transcriber as tr
+
+    seen = {}
+
+    class Cfg:
+        retry_config = "UNSET"
+
+    class Interactions:
+        sdk_configuration = Cfg()
+
+        def create(self, **kw):
+            seen["timeout"] = kw.get("timeout")
+            seen["retry"] = self.sdk_configuration.retry_config
+            return type("I", (), {"output_text": "hello there"})()
+
+    class Client:
+        interactions = Interactions()
+
+    monkeypatch.setattr(tr, "_client", lambda: (Client(), None))
+    wav = tmp_path / "c.wav"; wav.write_bytes(b"RIFF0000WAVE")
+    assert tr._transcribe_interactions(wav, "gemini-3.5-transcribe", "them") == "hello there"
+    assert seen["timeout"] == tr.REQUEST_TIMEOUT_MS / 1000
+    assert getattr(seen["retry"], "strategy", None) == "none"
