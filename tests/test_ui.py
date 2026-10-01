@@ -138,3 +138,40 @@ def test_second_ui_reopens_the_running_page(tmp_path, monkeypatch, capsys):
     u.serve(open_browser=True)                                     # returns instead of serving
     assert opened == [["open", "http://127.0.0.1:5555/?t=abc"]]
     assert "already running" in capsys.readouterr().out
+
+
+def test_meter_retries_once_after_a_device_rescan(monkeypatch):
+    """A re-plugged interface can make the first open fail (-9986)."""
+    from meeting_capture import linein
+    calls = {"open": 0, "refresh": 0}
+
+    class SD(FakeSD):
+        def InputStream(self, callback, channels, **kw):
+            calls["open"] += 1
+            if calls["open"] == 1:
+                raise RuntimeError("Error opening InputStream: Internal PortAudio error [PaErrorCode -9986]")
+            return FakeStream(callback, channels, **kw)
+
+    monkeypatch.setattr(linein, "_import_sounddevice", lambda: SD())
+    monkeypatch.setattr(linein, "refresh_devices", lambda: calls.__setitem__("refresh", calls["refresh"] + 1) or True)
+    m = ui.Meter()
+    m.ensure("UMC404HD 192k", 4)
+    snap = m.snapshot()
+    assert snap["error"] == "" and len(snap["channels"]) == 4
+    assert calls["open"] == 2 and calls["refresh"] >= 2      # before the first try and between tries
+
+
+def test_server_exits_when_no_page_is_open(monkeypatch, tmp_path):
+    import threading
+    from meeting_capture import paths
+    monkeypatch.setattr(paths, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(paths, "UI_PID_FILE", tmp_path / "ui.pid")
+    monkeypatch.setattr(paths, "UI_URL_FILE", tmp_path / "ui.url")
+    from meeting_capture import mic
+    monkeypatch.setattr(mic, "_excluded_pids", lambda: set())
+    monkeypatch.setattr(ui, "REAPER_INTERVAL_S", 0.05)
+    t = threading.Thread(target=ui.serve, kwargs={"open_browser": False, "idle_exit_s": 0.2}, daemon=True)
+    t.start()
+    t.join(5)
+    assert not t.is_alive(), "server should shut itself down when idle"
+    assert not (tmp_path / "ui.pid").exists() and not (tmp_path / "ui.url").exists()

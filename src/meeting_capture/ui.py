@@ -31,6 +31,11 @@ from . import __version__, store
 from .paths import PAUSE_FILE
 
 SILENCE_DB = -90.0
+# The server exits when no page has called it for this long (the page polls
+# every few seconds while open). Before, closing the tab left it running for
+# days on old code, holding a stale view of the audio devices.
+IDLE_EXIT_S = 10 * 60
+REAPER_INTERVAL_S = 2.0
 
 
 def _db(x: float) -> float:
@@ -63,29 +68,44 @@ class Meter:
                 from .linein import _import_sounddevice, refresh_devices, resolve_device
                 sd = _import_sounddevice()
                 refresh_devices()   # stream just closed: safe to re-scan
-                dev = resolve_device(device) if device else None
-                info = sd.query_devices(dev, "input") if dev is not None else sd.query_devices(kind="input")
-                sr = int(info.get("default_samplerate") or 48000)
-                n = min(channels, int(info["max_input_channels"]))
-                self.levels = self.levels[:n]
-
-                def cb(indata, _frames, _time, _status):
-                    now = time.time()
-                    for ch in range(n):
-                        col = indata[:, ch]
-                        peak = float(abs(col).max()) if len(col) else 0.0
-                        rms = float((col.astype("float64") ** 2).mean() ** 0.5) if len(col) else 0.0
-                        lv = self.levels[ch]
-                        lv["peak"], lv["rms"] = _db(peak), _db(rms)
-                        if peak >= 0.99:
-                            lv["clip"] = now
-
-                self._stream = sd.InputStream(device=dev, channels=n, samplerate=sr, dtype="float32",
-                                              blocksize=max(256, sr // 30), callback=cb)
-                self._stream.start()
-            except Exception as exc:  # unplugged, no PortAudio, wrong name
-                self._stream = None
+            except Exception as exc:
                 self.error = str(exc)
+                return
+            # Two tries: a device that was unplugged and re-plugged can leave
+            # PortAudio's view stale ("Internal PortAudio error -9986");
+            # a fresh scan before the second try clears it.
+            for attempt in (1, 2):
+                try:
+                    self._open_locked(sd, resolve_device, device, channels)
+                    self.error = ""
+                    return
+                except Exception as exc:  # unplugged, no PortAudio, wrong name
+                    self._stream = None
+                    self.error = str(exc)
+                    if attempt == 1:
+                        refresh_devices()
+
+    def _open_locked(self, sd, resolve_device, device: str | None, channels: int) -> None:
+        dev = resolve_device(device) if device else None
+        info = sd.query_devices(dev, "input") if dev is not None else sd.query_devices(kind="input")
+        sr = int(info.get("default_samplerate") or 48000)
+        n = min(channels, int(info["max_input_channels"]))
+        self.levels = [{"peak": SILENCE_DB, "rms": SILENCE_DB, "clip": 0.0} for _ in range(n)]
+
+        def cb(indata, _frames, _time, _status):
+            now = time.time()
+            for ch in range(n):
+                col = indata[:, ch]
+                peak = float(abs(col).max()) if len(col) else 0.0
+                rms = float((col.astype("float64") ** 2).mean() ** 0.5) if len(col) else 0.0
+                lv = self.levels[ch]
+                lv["peak"], lv["rms"] = _db(peak), _db(rms)
+                if peak >= 0.99:
+                    lv["clip"] = now
+
+        self._stream = sd.InputStream(device=dev, channels=n, samplerate=sr, dtype="float32",
+                                      blocksize=max(256, sr // 30), callback=cb)
+        self._stream.start()
 
     def snapshot(self) -> dict:
         now = time.time()
@@ -167,7 +187,19 @@ def state(meter: "Meter | None" = None) -> dict:
     }
 
 
-def make_handler(token: str, meter: Meter, apply_source=None):
+class Activity:
+    """When a page last talked to the server."""
+    def __init__(self) -> None:
+        self.last = time.time()
+
+    def touch(self) -> None:
+        self.last = time.time()
+
+    def idle_for(self) -> float:
+        return time.time() - self.last
+
+
+def make_handler(token: str, meter: Meter, apply_source=None, activity: "Activity | None" = None):
     def _apply_source(**kw):
         from .cli import apply_source as real
         return (apply_source or real)(**kw)
@@ -182,6 +214,8 @@ def make_handler(token: str, meter: Meter, apply_source=None):
             q = parse_qs(urlparse(self.path).query)
             got = self.headers.get("X-Token") or (q.get("t") or [""])[0]
             if secrets.compare_digest(got, token):
+                if activity is not None:
+                    activity.touch()
                 return True
             self._json({"error": "forbidden"}, HTTPStatus.FORBIDDEN)
             return False
@@ -259,7 +293,7 @@ def make_handler(token: str, meter: Meter, apply_source=None):
     return Handler
 
 
-def serve(port: int = 0, open_browser: bool = True) -> None:
+def serve(port: int = 0, open_browser: bool = True, idle_exit_s: float = IDLE_EXIT_S) -> None:
     import os
     from .mic import _excluded_pids
     from .paths import UI_PID_FILE, UI_URL_FILE, ensure_dirs
@@ -275,15 +309,20 @@ def serve(port: int = 0, open_browser: bool = True) -> None:
     UI_PID_FILE.write_text(str(os.getpid()))
     token = secrets.token_urlsafe(18)
     meter = Meter()
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(token, meter))
+    activity = Activity()
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(token, meter, activity=activity))
     url = f"http://127.0.0.1:{httpd.server_address[1]}/?t={token}"
     UI_URL_FILE.write_text(url)
     UI_URL_FILE.chmod(0o600)
 
     def reaper():
         while True:
-            time.sleep(2)
+            time.sleep(REAPER_INTERVAL_S)
             meter.close_if_idle()
+            if activity.idle_for() > idle_exit_s:
+                print("no page open for a while — settings server exiting", flush=True)
+                httpd.shutdown()   # serve_forever returns; cleanup runs below
+                return
             try:
                 UI_PID_FILE.touch()   # keeps the mic-gate exclusion fresh
             except OSError:
@@ -294,8 +333,9 @@ def serve(port: int = 0, open_browser: bool = True) -> None:
 
     def _stop(_sig, _frame):
         raise KeyboardInterrupt
-    signal.signal(signal.SIGTERM, _stop)
-    signal.signal(signal.SIGHUP, _stop)
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _stop)
+        signal.signal(signal.SIGHUP, _stop)
 
     print(f"meeting-capture settings: {url}", flush=True)
     print("Ctrl-C to stop.", flush=True)
