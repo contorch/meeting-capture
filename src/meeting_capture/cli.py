@@ -363,11 +363,24 @@ def cmd_pause(_args) -> int:
 
 
 def cmd_resume(_args) -> int:
+    from .meetings import request_new_meeting
+
     try:
         PAUSE_FILE.unlink()
-        print("resumed")
     except FileNotFoundError:
         print("not paused")
+        return 0
+    request_new_meeting()   # whatever is recorded next is a new meeting
+    print("resumed — the next speech starts a new transcript")
+    return 0
+
+
+def cmd_new(_args) -> int:
+    from .meetings import request_new_meeting
+
+    ensure_dirs()
+    request_new_meeting()
+    print("new meeting: speech from now on goes into a new transcript")
     return 0
 
 
@@ -704,7 +717,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("start", help="start the daemon").set_defaults(func=cmd_start)
     sub.add_parser("stop", help="stop the daemon").set_defaults(func=cmd_stop)
     sub.add_parser("pause", help="pause capture (creates pause file)").set_defaults(func=cmd_pause)
-    sub.add_parser("resume", help="resume capture").set_defaults(func=cmd_resume)
+    sub.add_parser("resume", help="resume capture (starts a new transcript)").set_defaults(func=cmd_resume)
+    sub.add_parser("new", help="start a new meeting: speech from now on goes into a new transcript").set_defaults(func=cmd_new)
     sub.add_parser("run", help="run daemon in foreground").set_defaults(func=cmd_run)
     sub.add_parser("install", help="install launchd auto-start agent").set_defaults(func=cmd_install)
     sub.add_parser("uninstall", help="remove launchd agent").set_defaults(func=cmd_uninstall)

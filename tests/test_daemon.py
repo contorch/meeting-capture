@@ -1,3 +1,4 @@
+import pytest
 from pathlib import Path
 
 from meeting_capture import daemon, store
@@ -152,3 +153,50 @@ def test_backlog_retry_runs_in_background_one_at_a_time(monkeypatch):
     assert calls == [1]
     t2 = daemon.retry_failed_chunks_in_background()             # free again afterwards
     assert t2 is not None; t2.join(5)
+
+
+# ---- start a new meeting on request ----------------------------------------
+
+@pytest.fixture
+def new_meeting_file(tmp_path, monkeypatch):
+    from meeting_capture import meetings
+    f = tmp_path / "new-meeting"
+    monkeypatch.setattr(meetings, "NEW_MEETING_FILE", f)
+    return f
+
+
+def test_chunks_stay_in_the_meeting_without_a_request(new_meeting_file):
+    s1 = daemon._next_session(None, 1000.0, 0.0)
+    assert daemon._next_session(s1, 1060.0, 1050.0) == s1          # 10 s gap: same meeting
+    assert daemon._next_session(s1, 1050.0 + 16 * 60, 1050.0) != s1  # 16 min gap: new one
+
+
+def test_new_meeting_request_splits_at_the_click(new_meeting_file):
+    from meeting_capture import meetings
+    s1 = daemon._next_session(None, 1000.0, 0.0)
+    meetings.request_new_meeting(at=1100.0)
+    # A chunk that started before the click still belongs to the old meeting…
+    assert daemon._next_session(s1, 1090.0, 1085.0) == s1
+    assert new_meeting_file.exists()
+    # …the first one starting after it opens the new meeting, once.
+    s2 = daemon._next_session(s1, 1101.0, 1095.0)
+    assert s2 != s1 and not new_meeting_file.exists()
+    assert daemon._next_session(s2, 1120.0, 1110.0) == s2
+
+
+def test_back_to_back_meetings_in_the_same_second_get_distinct_ids(new_meeting_file):
+    from meeting_capture import meetings
+    s1 = daemon._next_session(None, 1000.0, 0.0)
+    meetings.request_new_meeting(at=1000.0)
+    assert daemon._next_session(s1, 1000.2, 1000.1) != s1
+
+
+def test_resume_and_new_commands_request_a_new_meeting(new_meeting_file, tmp_path, monkeypatch, capsys):
+    from meeting_capture import cli
+    monkeypatch.setattr(cli, "PAUSE_FILE", tmp_path / "paused")
+    (tmp_path / "paused").touch()
+    assert cli.main(["resume"]) == 0
+    assert new_meeting_file.exists() and "new transcript" in capsys.readouterr().out
+    new_meeting_file.unlink()
+    assert cli.main(["resume"]) == 0 and not new_meeting_file.exists()   # wasn't paused: no-op
+    assert cli.main(["new"]) == 0 and new_meeting_file.exists()

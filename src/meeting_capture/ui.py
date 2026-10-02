@@ -280,8 +280,15 @@ def make_handler(token: str, meter: Meter, apply_source=None, activity: "Activit
                         PAUSE_FILE.touch()
                         msg = "Paused"
                     else:
-                        PAUSE_FILE.unlink(missing_ok=True)
-                        msg = "Recording resumed"
+                        from .meetings import request_new_meeting
+                        if PAUSE_FILE.exists():
+                            PAUSE_FILE.unlink(missing_ok=True)
+                            request_new_meeting()
+                        msg = "Recording resumed — the next speech starts a new transcript"
+                elif path == "/api/new-meeting":
+                    from .meetings import request_new_meeting
+                    request_new_meeting()
+                    msg = "New meeting — speech from now on goes into a new transcript"
                 else:
                     self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
                     return
@@ -454,6 +461,7 @@ pre{margin:0;font-family:var(--mono);font-size:.82rem;white-space:pre-wrap;line-
   <div class="row" style="justify-content:space-between">
     <div class="msg" id="msg" role="status" aria-live="polite"></div>
     <div class="row">
+      <button id="newmeeting" title="Speech from now on goes into a new transcript">Start new meeting</button>
       <button id="pause">Pause recording</button>
       <button class="primary" id="save">Save and restart recorder</button>
     </div>
@@ -501,6 +509,7 @@ function render(first){
     : d.in_call ? "Recording a call" : "Waiting for a call";
   $("pause").textContent = d.paused ? "Resume recording" : "Pause recording";
   $("pause").disabled = !d.installed;
+  $("newmeeting").disabled = !d.installed || d.paused;
   $("ver").textContent = "meeting-capture " + S.version + (d.installed ? " · " + d.mode + " mode" : "");
   if (first || !dirty) {
     $("src-"+S.source.source).checked = true;
@@ -586,6 +595,10 @@ $("save").addEventListener("click", async () => {
   try { const r = await api("/api/source", body); dirty = false; say(r.message.replace(/^source: /, "Saved — "), "ok"); await refresh(true); }
   catch(e){ say(e.message, "err"); }
   finally { $("save").disabled = false; }
+});
+$("newmeeting").addEventListener("click", async () => {
+  try { const r = await api("/api/new-meeting", {}); say(r.message, "ok"); await refresh(false); }
+  catch(e){ say(e.message, "err"); }
 });
 $("pause").addEventListener("click", async () => {
   try { const r = await api("/api/pause", {paused: !S.daemon.paused}); say(r.message, "ok"); await refresh(false); }
