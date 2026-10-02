@@ -21,7 +21,7 @@ from .paths import (
     PID_FILE,
     ensure_dirs,
 )
-from . import store
+from . import meetings, store
 from .recorder import (
     Chunk,
     find_sysaudio,
@@ -72,6 +72,23 @@ def _session_id(started_at: float) -> str:
     """One transcript row per meeting, e.g. meeting-2026-09-28T14-00-00."""
     stamp = dt.datetime.fromtimestamp(started_at).strftime("%Y-%m-%dT%H-%M-%S")
     return f"meeting-{stamp}"
+
+
+def _next_session(current: str | None, started_at: float, last_chunk_end: float) -> str:
+    """The meeting a chunk starting at `started_at` belongs to: the current
+    one, unless there is none yet, the gap since the last chunk exceeds
+    SESSION_GAP_SECONDS, or a "start new meeting" request was made at or
+    before `started_at` (meetings.py) — then a new one."""
+    cut = meetings.starts_new_meeting(started_at)
+    if current is None or cut is not None or (started_at - last_chunk_end) > SESSION_GAP_SECONDS:
+        new = _session_id(started_at)
+        if new == current:   # same second as the previous meeting's start
+            new = _session_id(started_at + 1)
+        log.info("new session: %s", new)
+        if cut is not None:
+            meetings.clear_cut(cut)
+        return new
+    return current
 
 
 def _started_iso(meeting_id: str) -> str:
@@ -398,21 +415,23 @@ def run() -> None:
                 # Live path: stream to Gemini in real time; finals land in the
                 # same transcript row and in the copilot feed. One row per meeting.
                 started = time.time()
-                if current_session is None or (started - last_chunk_end) > SESSION_GAP_SECONDS:
-                    current_session = _session_id(started)
-                    log.info("new session: %s", current_session)
+                current_session = _next_session(current_session, started, last_chunk_end)
                 sess = current_session
                 session_chunks = 0
+                live_session = {"id": sess}
 
-                def _live_append(role: str, text: str, _sess=sess) -> None:
+                def _live_append(role: str, text: str, _h=live_session) -> None:
                     nonlocal session_chunks
                     session_chunks += 1
-                    _append_text(_sess, role, text)
+                    # "Start new meeting" mid-call: a gap never happens here.
+                    _h["id"] = _next_session(_h["id"], time.time(), time.time())
+                    _append_text(_h["id"], role, text)
 
                 try:
                     run_live_session(_should_record, sess, _live_append)
                 except Exception as exc:
                     log.exception("live session failed: %s", exc)
+                current_session = live_session["id"]
                 last_chunk_end = time.time()
                 log.info("mic inactive — session ended")
                 _after_session(started, session_chunks)
@@ -424,9 +443,7 @@ def run() -> None:
             for chunk in chunk_source:
                 session_chunks += 1
                 chunk_end = chunk.started_at + chunk.duration_seconds
-                if current_session is None or (chunk.started_at - last_chunk_end) > SESSION_GAP_SECONDS:
-                    current_session = _session_id(chunk.started_at)
-                    log.info("new session: %s", current_session)
+                current_session = _next_session(current_session, chunk.started_at, last_chunk_end)
         
                 try:
                     text = transcribe(chunk.path, role=chunk.role)

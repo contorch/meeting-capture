@@ -175,3 +175,12 @@ def test_server_exits_when_no_page_is_open(monkeypatch, tmp_path):
     t.join(5)
     assert not t.is_alive(), "server should shut itself down when idle"
     assert not (tmp_path / "ui.pid").exists() and not (tmp_path / "ui.url").exists()
+
+
+def test_new_meeting_button_requests_a_new_meeting(server, monkeypatch):
+    from meeting_capture import meetings
+    base, _, tmp = server
+    monkeypatch.setattr(meetings, "NEW_MEETING_FILE", tmp / "new-meeting")
+    status, body = call(base + "/api/new-meeting", {})
+    assert status == 200 and "new transcript" in json.loads(body)["message"]
+    assert (tmp / "new-meeting").exists()

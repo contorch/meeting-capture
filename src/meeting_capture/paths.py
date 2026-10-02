@@ -10,6 +10,8 @@ FAILED_AUDIO_DIR = AUDIO_DIR / "failed"
 LOG_FILE = STATE_DIR / "daemon.log"
 PID_FILE = STATE_DIR / "daemon.pid"
 PAUSE_FILE = STATE_DIR / "paused"
+# "Start a new meeting from now" request (meetings.py) — holds a timestamp.
+NEW_MEETING_FILE = STATE_DIR / "new-meeting"
 # PID of a running `meeting-capture ui` — its level meters open the input,
 # and the mic-activity gate ignores that process.
 UI_PID_FILE = STATE_DIR / "ui.pid"
