@@ -45,11 +45,24 @@ jobs:
           set -euo pipefail
           sudo xcode-select -s "$XCODE_APP"
           xcrun --sdk macosx --show-sdk-version
+      # Pure logic only (no Speech calls, no capture). Retried like the build
+      # script's `swift build`, which can SIGABRT (exit 134) on this runner.
+      - name: Swift unit tests (swift test)
+        working-directory: swift
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            swift test && exit 0
+            echo "swift test attempt $attempt failed, retrying"
+            sleep 5
+          done
+          exit 1
       - name: Build universal sysaudio (the release build script)
         run: .github/scripts/build-sysaudio.sh
       - name: Sign ad-hoc with the release's hardened runtime + entitlements
         run: codesign --force --sign - --options runtime --entitlements swift/sysaudio.entitlements sysaudio
-      # Never captures. --try-install downloads the en-US model when the
-      # runner lacks it, so the real transcription path runs too (best effort).
+      # Never captures. --try-install downloads and/or reserves the en-US model
+      # when this binary can't use it yet, so the real transcription path runs
+      # too (best effort).
       - name: Smoke-test (capture CLI parsing, transcribe exit-code contract)
         run: .github/scripts/sysaudio-smoke.sh ./sysaudio --try-install

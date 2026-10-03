@@ -8,12 +8,17 @@
 //
 //   sysaudio transcribe --probe [--locale L]
 //     stdout: {"available","reason","os","arch","locale","installed",
-//              "supported":[...],"installed_locales":[...]}
+//              "supported":[...],"installed_locales":[...],"reserved_locales":[...]}
 //     exit 0 usable now | 69 unusable (macOS < 26, Intel, locale unsupported)
-//          | 75 supported, but the model is not installed
+//          | 75 supported, but the model is not installed for this app
+//     "installed" is true only when the model is on this Mac AND reserved by
+//     this app (see ModelReadiness). "installed_locales" lists every model on
+//     this Mac, including ones macOS or other apps hold; "reserved_locales"
+//     lists this app's reservations.
 //
 //   sysaudio transcribe --install [--locale L]
 //     stdout: {"installed","locale","seconds"} (plus "reason" when it fails).
+//     Reserves the locale for this app, then downloads the model if needed.
 //     Download progress goes to stderr.
 //     exit 0 ok | 69 unsupported | 1 other error
 //
@@ -22,6 +27,9 @@
 //     exit 0 ok (no speech gives text "") | 69 unavailable (OS/arch/locale)
 //          | 75 model missing or released | 70 FILE unreadable or undecodable
 //          | 1 any other error. Nothing goes to stdout on failure.
+//     A model that is on this Mac but not reserved by this app is reserved
+//     once FILE opens (never releasing another reservation), so the analyzer
+//     never runs on an unallocated locale.
 //
 // The default locale is en-US. Diagnostics go to stderr only. Usage errors
 // exit 1 and never print "unknown arg": Python reads that phrase as "this
@@ -75,6 +83,71 @@ enum TranscribeMode {
     case file(String)
 }
 
+/// Whether this app may use a locale's on-device model right now.
+///
+/// SpeechTranscriber.installedLocales lists every model on this Mac, including
+/// ones macOS or another app holds (the en-* models usually are). SpeechAnalyzer
+/// still runs such a model for a caller that has not reserved the locale, but
+/// Speech logs "Cannot use modules with unallocated locales ... This will be an
+/// error in a future release!" and AssetInventory.status() answers .supported,
+/// not .installed. So a model is usable only when it is on disk AND this app
+/// holds a reservation for it (AssetInventory.reservedLocales). Reserving a
+/// model that is already on disk downloads nothing and takes ~0.1 s.
+///
+/// Pure (BCP-47 identifiers in, verdict out) so it is unit-tested on any
+/// toolchain; the Speech calls that gather the lists live in OnDeviceTranscriber.
+enum ModelReadiness: Equatable {
+    /// On disk and reserved by this app.
+    case ready
+    /// On disk, but this app holds no reservation for it: reserve it first.
+    case unreserved
+    /// Not on disk (a reservation alone is not enough): download it.
+    case missing
+
+    static func of(_ locale: String, installed: [String], reserved: [String]) -> ModelReadiness {
+        guard installed.contains(locale) else { return .missing }
+        return reserved.contains(locale) ? .ready : .unreserved
+    }
+
+    /// The probe's exit code for a supported locale.
+    var probeExitCode: Int32 { self == .ready ? TRANSCRIBE_EX_OK : TRANSCRIBE_EX_NO_MODEL }
+
+    /// What a FILE run does before it analyzes the audio.
+    enum FileAction: Equatable {
+        /// Transcribe.
+        case proceed
+        /// Reserve the locale (no eviction) once the file opens, then transcribe.
+        case reserveThenProceed
+        /// Exit 75 without reading the file.
+        case noModel
+    }
+
+    /// `skipCheck` (SYSAUDIO_TRANSCRIBE_SKIP_INSTALLED_CHECK=1, diagnostics
+    /// only) skips every pre-flight step, so the analyzer reports the model's
+    /// state itself.
+    func fileAction(skipCheck: Bool) -> FileAction {
+        if skipCheck { return .proceed }
+        switch self {
+        case .ready: return .proceed
+        case .unreserved: return .reserveThenProceed
+        case .missing: return .noModel
+        }
+    }
+
+    func reason(_ locale: String) -> String {
+        switch self {
+        case .ready:
+            return "the on-device model for \(locale) is installed and reserved for this app"
+        case .unreserved:
+            return "the on-device model for \(locale) is on this Mac but not reserved for this app yet "
+                + "(reserve it, with no download, with: meeting-capture language \(locale))"
+        case .missing:
+            return "the on-device model for \(locale) is not installed yet "
+                + "(download it with: meeting-capture language \(locale))"
+        }
+    }
+}
+
 enum TranscribeCommand {
     static let usage = """
     Usage: sysaudio transcribe [--locale L] FILE       transcribe an audio file on this Mac
@@ -83,8 +156,8 @@ enum TranscribeCommand {
       --locale L   BCP-47 locale such as en-US, en-IN, hi-IN or de-DE (default en-US)
     On-device speech-to-text (SpeechAnalyzer, macOS 26+ on Apple silicon); no network
     is used except to download a language model. Prints one JSON line on stdout.
-    Exit codes: 0 ok, 69 unavailable on this Mac or locale, 75 model not installed,
-                70 audio file unreadable, 1 other error.
+    Exit codes: 0 ok, 69 unavailable on this Mac or locale, 75 model not installed
+                (or not reserved) for this app, 70 audio file unreadable, 1 other error.
     """
 
     static func run(_ argv: [String]) async -> Int32 {
@@ -157,7 +230,8 @@ enum TranscribeCommand {
         switch mode {
         case .probe:
             transcribeEmit(probeJSON(available: false, reason: reason, locale: locale,
-                                     installed: false, supported: [], installedLocales: []))
+                                     installed: false, supported: [], installedLocales: [],
+                                     reservedLocales: []))
         case .install:
             transcribeEmit(["installed": false, "locale": locale, "seconds": jsonNumber(0, places: 2), "reason": reason])
         case .file:
@@ -167,7 +241,8 @@ enum TranscribeCommand {
     }
 
     static func probeJSON(available: Bool, reason: String, locale: String, installed: Bool,
-                          supported: [String], installedLocales: [String]) -> [String: Any] {
+                          supported: [String], installedLocales: [String],
+                          reservedLocales: [String]) -> [String: Any] {
         [
             "available": available,
             "reason": reason,
@@ -177,6 +252,7 @@ enum TranscribeCommand {
             "installed": installed,
             "supported": supported,
             "installed_locales": installedLocales,
+            "reserved_locales": reservedLocales,
         ]
     }
 
@@ -262,9 +338,12 @@ enum OnDeviceTranscriber {
         var reason: String
         var locale: Locale?
         var localeID: String
-        var installed: Bool
+        var readiness: ModelReadiness
         var supported: [String]
         var installedLocales: [String]
+        var reservedLocales: [String]
+        /// Usable by this app now: on disk and reserved by it.
+        var installed: Bool { available && readiness == .ready }
     }
 
     static func run(_ mode: TranscribeMode, requested: String) async -> Int32 {
@@ -289,13 +368,12 @@ enum OnDeviceTranscriber {
         )
     }
 
-    /// Whether the requested locale can be transcribed here and now.
-    /// "Installed" means SpeechTranscriber.installedLocales lists it.
-    /// AssetInventory.status() is not used: it says .supported for a model
-    /// that is on disk but not reserved by this process.
+    /// Whether the requested locale can be transcribed here and now. The
+    /// model must be on disk (SpeechTranscriber.installedLocales) and reserved
+    /// by this app (AssetInventory.reservedLocales); see ModelReadiness.
     static func resolve(_ requested: String) async -> Resolution {
         var r = Resolution(available: false, reason: "", locale: nil, localeID: requested,
-                           installed: false, supported: [], installedLocales: [])
+                           readiness: .missing, supported: [], installedLocales: [], reservedLocales: [])
         guard SpeechTranscriber.isAvailable else {
             r.reason = TranscribeCommand.runningUnderRosetta()
                 ? "on-device transcription is unavailable under Rosetta (run the arm64 sysaudio)"
@@ -304,6 +382,7 @@ enum OnDeviceTranscriber {
         }
         r.supported = await SpeechTranscriber.supportedLocales.map(bcp47).sorted()
         r.installedLocales = await SpeechTranscriber.installedLocales.map(bcp47).sorted()
+        r.reservedLocales = await AssetInventory.reservedLocales.map(bcp47).sorted()
         guard !requested.isEmpty,
               let loc = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: requested))
         else {
@@ -313,23 +392,22 @@ enum OnDeviceTranscriber {
         r.available = true
         r.locale = loc
         r.localeID = bcp47(loc)
-        r.installed = r.installedLocales.contains(r.localeID)
-        r.reason = r.installed
-            ? "the on-device model for \(r.localeID) is installed"
-            : "the on-device model for \(r.localeID) is not installed yet "
-                + "(download it with: meeting-capture language \(r.localeID))"
+        r.readiness = ModelReadiness.of(r.localeID, installed: r.installedLocales, reserved: r.reservedLocales)
+        r.reason = r.readiness.reason(r.localeID)
         return r
     }
 
     // MARK: --probe
 
+    /// Read-only: never reserves, releases or downloads anything.
     static func probe(_ requested: String) async -> Int32 {
         let r = await resolve(requested)
         transcribeEmit(TranscribeCommand.probeJSON(
             available: r.available, reason: r.reason, locale: r.localeID, installed: r.installed,
-            supported: r.supported, installedLocales: r.installedLocales))
+            supported: r.supported, installedLocales: r.installedLocales,
+            reservedLocales: r.reservedLocales))
         if !r.available { return TRANSCRIBE_EX_UNAVAILABLE }
-        return r.installed ? TRANSCRIBE_EX_OK : TRANSCRIBE_EX_NO_MODEL
+        return r.readiness.probeExitCode
     }
 
     // MARK: --install
@@ -386,15 +464,24 @@ enum OnDeviceTranscriber {
             return code == TRANSCRIBE_EX_UNAVAILABLE ? TRANSCRIBE_EX_UNAVAILABLE : TRANSCRIBE_EX_FAILURE
         }
 
-        let nowInstalled = await SpeechTranscriber.installedLocales.map(bcp47).contains(r.localeID)
-        guard nowInstalled else {
-            let why = "the \(r.localeID) model install finished, but macOS does not list it as installed"
-            transcribeLog(why)
-            transcribeEmit(result(false, why))
-            return TRANSCRIBE_EX_FAILURE
+        // Success means what a probe exit 0 means: on disk AND reserved by
+        // this app. Otherwise the caller would see install 0, probe 75, and
+        // install again forever.
+        let installedNow = await SpeechTranscriber.installedLocales.map(bcp47)
+        let reservedNow = await AssetInventory.reservedLocales.map(bcp47)
+        let why: String
+        switch ModelReadiness.of(r.localeID, installed: installedNow, reserved: reservedNow) {
+        case .ready:
+            transcribeEmit(result(true))
+            return TRANSCRIBE_EX_OK
+        case .unreserved:
+            why = "the \(r.localeID) model is on this Mac, but it could not be reserved for this app"
+        case .missing:
+            why = "the \(r.localeID) model install finished, but macOS does not list it as installed"
         }
-        transcribeEmit(result(true))
-        return TRANSCRIBE_EX_OK
+        transcribeLog(why)
+        transcribeEmit(result(false, why))
+        return TRANSCRIBE_EX_FAILURE
     }
 
     /// Reserves `loc` for this app (bundle id com.contorch.meeting-capture.sysaudio).
@@ -428,6 +515,23 @@ enum OnDeviceTranscriber {
         }
     }
 
+    /// FILE path: reserves a model that is on this Mac but not yet reserved by
+    /// this app (say, a system-held en-* model), so the analyzer never runs on
+    /// an unallocated locale. It never releases another reservation: making
+    /// room is --install's job. If the reservation fails, transcription goes
+    /// ahead and the analyzer decides. macOS 26/27 still run it (logging a
+    /// warning); a later macOS that refuses it reports SFSpeechErrorDomain
+    /// 10 or 4, which exits 75, and the caller's --install then reserves.
+    static func reserveForUse(_ loc: Locale) async {
+        let target = bcp47(loc)
+        do {
+            _ = try await AssetInventory.reserve(locale: loc)
+            transcribeLog("reserved the \(target) model for this app (it was on this Mac but not reserved)")
+        } catch {
+            transcribeLog("could not reserve \(target) for this app (\(describe(error))); transcribing anyway")
+        }
+    }
+
     // MARK: FILE
 
     static func transcribe(path: String, requested: String) async -> Int32 {
@@ -437,10 +541,12 @@ enum OnDeviceTranscriber {
             transcribeLog(r.reason)
             return TRANSCRIBE_EX_UNAVAILABLE
         }
-        // Diagnostics only: skip the installedLocales pre-check so the analyzer
-        // itself reports the missing model (SFSpeechErrorDomain code 4 -> 75).
+        // Diagnostics only: skip the pre-flight (the installed check and the
+        // reservation below) so the analyzer itself reports the model's state
+        // (a missing model is SFSpeechErrorDomain code 4 -> 75).
         let skipCheck = ProcessInfo.processInfo.environment["SYSAUDIO_TRANSCRIBE_SKIP_INSTALLED_CHECK"] == "1"
-        if !r.installed && !skipCheck {
+        let action = r.readiness.fileAction(skipCheck: skipCheck)
+        if action == .noModel {
             transcribeLog(r.reason)
             return TRANSCRIBE_EX_NO_MODEL
         }
@@ -457,6 +563,10 @@ enum OnDeviceTranscriber {
         } catch {
             transcribeLog("cannot read audio from \(path): \(describe(error))")
             return TRANSCRIBE_EX_BAD_AUDIO
+        }
+        // Only once the file opens, so a FILE run that fails changes nothing.
+        if action == .reserveThenProceed {
+            await reserveForUse(loc)
         }
 
         let transcriber = makeTranscriber(loc)
