@@ -177,6 +177,74 @@ def test_server_exits_when_no_page_is_open(monkeypatch, tmp_path):
     assert not (tmp_path / "ui.pid").exists() and not (tmp_path / "ui.url").exists()
 
 
+@pytest.fixture
+def stt_server(monkeypatch, tmp_path):
+    applied = []
+
+    def fake_apply(**kw):
+        applied.append(kw)
+        if kw.get("locale") == "xx-YY":
+            raise RuntimeError("unsupported language 'xx-YY' — choose one of: en-US, hi-IN")
+        return "transcription: On this Mac (stt=apple), language hi-IN — now On this Mac — nothing is uploaded; daemon restarted"
+
+    monkeypatch.setattr(ui, "state", lambda meter=None: {"version": "x", "daemon": {"installed": True}})
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), ui.make_handler("tok", ui.Meter(), apply_transcription=fake_apply))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{httpd.server_address[1]}", applied
+    httpd.shutdown()
+
+
+def test_transcription_endpoint_needs_the_token(stt_server):
+    base, applied = stt_server
+    with pytest.raises(urllib.error.HTTPError) as e:
+        call(base + "/api/transcription", {"stt": "apple"}, token="nope")
+    assert e.value.code == 403 and applied == []
+
+
+def test_transcription_endpoint_applies_engine_and_language(stt_server):
+    base, applied = stt_server
+    status, body = call(base + "/api/transcription", {"stt": "apple", "locale": "hi-IN"})
+    assert status == 200 and "daemon restarted" in json.loads(body)["message"]
+    assert applied[-1] == {"stt": "apple", "locale": "hi-IN"}
+    call(base + "/api/transcription", {"stt": "gemini"})              # language unchanged: not sent
+    assert applied[-1] == {"stt": "gemini", "locale": None}
+
+
+def test_transcription_endpoint_reports_errors(stt_server):
+    base, _ = stt_server
+    with pytest.raises(urllib.error.HTTPError) as e:
+        call(base + "/api/transcription", {"stt": "apple", "locale": "xx-YY"})
+    assert e.value.code == 400 and "hi-IN" in json.loads(e.value.read())["error"]
+
+
+def test_state_carries_the_transcription_settings(fake_helper, monkeypatch, tmp_path):
+    from meeting_capture import cli, linein
+    monkeypatch.setattr(linein, "_import_sounddevice", lambda: FakeSD())
+    monkeypatch.setattr(cli, "LAUNCHD_PLIST", tmp_path / "none.plist")
+    t = ui.state()["transcription"]
+    assert (t["engine"], t["choice"], t["locale"], t["ready"]) == ("apple", "auto", "en-US", True)
+    assert "hi-IN" in t["apple"]["supported"] and "en-US" in t["apple"]["installed_locales"]
+    assert t["gemini_key"] is False and t["uploads"] is False
+    assert t["notice"] is None and t["locale_why"] == "default"
+
+
+def test_state_carries_the_upgrade_note(fake_helper, gemini_key, monkeypatch, tmp_path):
+    from meeting_capture import cli, linein
+    monkeypatch.setattr(linein, "_import_sounddevice", lambda: FakeSD())
+    monkeypatch.setattr(cli, "LAUNCHD_PLIST", tmp_path / "none.plist")
+    t = ui.state()["transcription"]
+    assert t["engine"] == "apple" and "instead of Gemini" in t["notice"]
+
+
+def test_page_has_the_transcription_section(server):
+    base, *_ = server
+    _, body = call(base + "/?t=tok", token="")
+    for needle in (b"Transcription", b'value="apple"', b'value="gemini"', b'value="auto"',
+                   b"On this Mac", b"Automatic", b'id="locale"', b"/api/transcription", b"romanized",
+                   b'id="sttnotice"', b"t.notice"):
+        assert needle in body
+
+
 def test_new_meeting_button_requests_a_new_meeting(server, monkeypatch):
     from meeting_capture import meetings
     base, _, tmp = server
@@ -184,3 +252,16 @@ def test_new_meeting_button_requests_a_new_meeting(server, monkeypatch):
     status, body = call(base + "/api/new-meeting", {})
     assert status == 200 and "new transcript" in json.loads(body)["message"]
     assert (tmp / "new-meeting").exists()
+
+
+def test_state_says_when_live_mode_is_requested_but_runs_batch(fake_helper, key_file, monkeypatch, tmp_path):
+    import plistlib
+    from meeting_capture import cli
+    plist = tmp_path / "agent.plist"
+    monkeypatch.setattr(cli, "LAUNCHD_PLIST", plist)
+    plist.write_bytes(plistlib.dumps({"EnvironmentVariables": {"MEETING_CAPTURE_MODE": "live"}}))
+    d = ui._daemon_state()
+    assert d["mode"] == "live" and d["live_blocked"] == ""          # auto + key: live streams
+    plist.write_bytes(plistlib.dumps({"EnvironmentVariables": {"MEETING_CAPTURE_MODE": "live",
+                                                               "MEETING_CAPTURE_STT": "apple"}}))
+    assert "never uploads" in ui._daemon_state()["live_blocked"]

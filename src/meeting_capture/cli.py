@@ -1,7 +1,9 @@
-"""CLI: meeting-capture {start,stop,pause,resume,status,install,uninstall,run,mic,last,tail,doctor,mode,live,copilot}."""
+"""CLI: meeting-capture {start,stop,pause,resume,new,status,install,uninstall,run,mic,last,tail,doctor,
+mode,source,stt,language,vocab,devices,ui,live,copilot}."""
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import plistlib
 import signal
@@ -110,8 +112,33 @@ def cmd_status(_args) -> int:
     print(f"  transcripts db:   {store.db_path()}")
     print(f"  log file:         {LOG_FILE}")
     print(f"  launchd:          {'installed' if LAUNCHD_PLIST.exists() else 'not installed'}")
-    print(f"  mode:             {_plist_mode()} ({'launchd plist' if LAUNCHD_PLIST.exists() else 'default'})")
+    s = transcription_summary()
+    print(f"  mode:             {_mode_line(s['live'])} "
+          f"({'launchd plist' if LAUNCHD_PLIST.exists() else 'default'})")
+    print(f"  transcription:    {_engine_line(s)}")
+    print(f"  language:         {s['locale']} ({s['locale_why']})")
+    if s.get("notice"):
+        print(f"  note:             {_notice(s)}")
+    key_needed = s["engine"] == "gemini" or s["live"]["requested"]
+    print(f"  gemini key:       {'set' if s['gemini_key'] else 'not set'}"
+          f"{'' if key_needed else ' (optional)'}")
+    parked = _parked_line()
+    if parked:
+        print(f"  waiting audio:    {parked}")
     return 0
+
+
+def _parked_line() -> str:
+    from .daemon import parked_counts
+    c = parked_counts()
+    bits = []
+    if c["queued"]:
+        bits.append(f"{c['queued']} chunk(s) in the transcription queue")
+    if c["parked"]:
+        bits.append(f"{c['parked']} chunk(s) waiting to be transcribed")
+    if c["quarantined"]:
+        bits.append(f"{c['quarantined']} given up on (audio/failed/quarantine)")
+    return "; ".join(bits)
 
 
 def cmd_mic(_args) -> int:
@@ -247,27 +274,63 @@ def cmd_doctor(_args) -> int:
     else:
         print(f"  · no log file yet ({LOG_FILE}) — daemon hasn't run")
 
-    print("\nTranscription (hosted Gemini):")
+    print("\nTranscription:")
     from .transcriber import (
-        ENV_GEMINI_MODEL, _resolve_gemini_api_key, diarization_enabled,
-        is_transcribe_model, load_vocabulary, resolve_model,
+        ENV_GEMINI_MODEL, diarization_enabled, is_transcribe_model, load_vocabulary, resolve_model,
     )
     from .paths import VOCAB_FILE
-    model = resolve_model()
-    backend = "Interactions API (speech-to-text)" if is_transcribe_model(model) else "generate_content (prompted)"
-    _ok("model", model + (f" (via {ENV_GEMINI_MODEL})" if ENV_GEMINI_MODEL in os.environ else "") + f" — {backend}")
-    vocab = load_vocabulary()
-    if vocab:
-        _ok("custom vocabulary", f"{len(vocab)} terms from {VOCAB_FILE}")
+    s = transcription_summary()
+    apple = s["apple"]
+    if s["ready"]:
+        _ok("engine", _engine_line(s))
     else:
-        print(f"  · no custom vocabulary yet — `meeting-capture vocab edit` (proper nouns, product names)")
-    if diarization_enabled():
-        print("  · diarization ON for the 'them' channel (vocabulary disabled there per API)")
-    if _resolve_gemini_api_key():
-        _ok("Google API key", "found")
+        _fail(f"no transcription engine can run ({s['reason']})",
+              "on macOS 26+ / Apple silicon: `meeting-capture language en-US` installs the on-device "
+              "model; otherwise add a Gemini key (~/.config/google/key). Audio is kept until then.")
+    print(f"  · setting: {s['choice']} (`meeting-capture stt`), language: {s['locale']} "
+          f"({s['locale_why']}; `meeting-capture language`)")
+    if s.get("notice"):
+        print(f"  ! {_notice(s)}")
+    if apple["usable"]:
+        _ok("on-device model", f"{apple['locale']} installed")
+    elif apple["installable"]:
+        print(f"  · on-device model for {s['locale']} not installed yet — `meeting-capture language {s['locale']}`")
     else:
+        print(f"  · on this Mac: unavailable — {apple['reason']}")
+    gemini_needed = s["engine"] == "gemini" or s["choice"] == "gemini"
+    if s["gemini_key"]:
+        _ok("Google API key", "found" + ("" if gemini_needed else " (optional; used for Gemini and live mode)"))
+    elif gemini_needed:
         _fail("Google API key missing",
-              "set GOOGLE_API_KEY / GEMINI_API_KEY or write ~/.config/google/key (mode 600)")
+              "write it to ~/.config/google/key (mode 600) — the recorder runs under launchd and "
+              "never sees GOOGLE_API_KEY / GEMINI_API_KEY from your shell")
+    else:
+        print("  · Google API key: not set (optional — only for Gemini transcription or live mode)")
+    if gemini_needed:
+        model = resolve_model()
+        backend = "Interactions API (speech-to-text)" if is_transcribe_model(model) else "generate_content (prompted)"
+        _ok("Gemini model", model + (f" (via {ENV_GEMINI_MODEL})" if ENV_GEMINI_MODEL in os.environ else "")
+            + f" — {backend}")
+        vocab = load_vocabulary()
+        if vocab:
+            _ok("custom vocabulary", f"{len(vocab)} terms from {VOCAB_FILE} (Gemini only)")
+        else:
+            print(f"  · no custom vocabulary yet — `meeting-capture vocab edit` (proper nouns, product names; Gemini only)")
+        if diarization_enabled():
+            print("  · diarization ON for the 'them' channel (vocabulary disabled there per API)")
+    parked = _parked_line()
+    if parked:
+        print(f"  · {parked}")
+    if s["live"]["requested"]:
+        why = s["live"]["blocker"]
+        if why:
+            _fail(f"live mode requested, but the recorder runs batch: {why}",
+                  f"{_live_fix(why)}; or `meeting-capture mode batch`")
+        else:
+            _ok("capture mode", "live — calls stream to Gemini (in-meeting copilot); "
+                "the engine above only transcribes parked audio")
+    else:
+        print("  · capture mode: batch (`meeting-capture mode live` streams calls to Gemini for the copilot)")
 
     print("\nManual gates (cannot be checked from code):")
     print("  ?  Screen Recording TCC granted to the sysaudio binary itself (bin/sysaudio)")
@@ -343,7 +406,8 @@ def cmd_vocab(args) -> int:
             VOCAB_FILE.write_text(
                 "# One term per line: names, products, jargon the transcriber should\n"
                 "# spell correctly (e.g. Priya, Chroma, JWT). '#' starts a comment.\n"
-                f"# Up to {MAX_VOCAB_TERMS} terms. Takes effect on the next chunk.\n",
+                f"# Up to {MAX_VOCAB_TERMS} terms. Takes effect on the next chunk.\n"
+                "# Used by Gemini transcription only (on-device transcription ignores it).\n",
                 encoding="utf-8",
             )
         editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nano"
@@ -352,6 +416,13 @@ def cmd_vocab(args) -> int:
     print(f"{len(terms)} term(s) in {VOCAB_FILE}")
     for t in terms:
         print(f"  {t}")
+    note = "note: the vocabulary applies to Gemini transcription only"
+    try:
+        if transcription_summary()["engine"] == "apple":
+            note += " — transcription currently runs on this Mac, which ignores it"
+    except Exception:
+        pass
+    print(note)
     return 0
 
 
@@ -463,9 +534,39 @@ def _plist_env() -> dict:
 
 
 def _plist_mode() -> str:
-    """Capture mode the launchd daemon runs in ("batch" unless the plist says live)."""
+    """Capture mode the launchd daemon is asked to run in ("batch" unless the
+    plist says live). Whether live can actually run: live_mode_blocker()."""
     v = _plist_env().get(MODE_ENV_VAR, "batch").strip().lower()
     return v if v in MODES else "batch"
+
+
+LINEIN_IS_BATCH = "the audio source is line-in, which always records in batch"
+
+
+def live_mode_blocker() -> str | None:
+    """Why the daemon, asked for live mode, runs batch instead (None: live can
+    run) — live.live_blocker() for the daemon's configuration, plus line-in."""
+    from .live import live_blocker
+    if current_source()["source"] == "linein":
+        return LINEIN_IS_BATCH
+    return live_blocker(_daemon_env())
+
+
+def _live_fix(why: str) -> str:
+    from .live import LIVE_FIXES
+    if why == LINEIN_IS_BATCH:
+        return "`meeting-capture source sck` (this Mac's own call audio) allows live mode"
+    return LIVE_FIXES.get(why, "see `meeting-capture doctor`")
+
+
+def _mode_line(live: dict) -> str:
+    """The capture mode as it really runs (transcription_summary()["live"]),
+    for status: says so when live mode is asked for but the recorder runs batch."""
+    if not live["requested"]:
+        return "batch"
+    if live["blocker"]:
+        return f"live requested — running batch: {live['blocker']}"
+    return "live — calls stream to Gemini"
 
 
 def _set_plist_mode(mode: str) -> None:
@@ -592,11 +693,22 @@ def _relaunch() -> None:
 
 def cmd_mode(args) -> int:
     if args.mode is None:
-        print(_plist_mode())
+        print(_plist_mode(), flush=True)   # stdout stays one word (scripts compare it)
+        if _plist_mode() == "live":
+            why = live_mode_blocker()
+            if why:
+                print(f"note: live mode is requested, but the recorder runs batch: {why}", file=sys.stderr)
         return 0
     if not LAUNCHD_PLIST.exists():
         print("no launchd agent installed — run `meeting-capture install` first", file=sys.stderr)
         return 1
+    if args.mode == "live":
+        from .live import live_blocker
+        why = live_blocker(_daemon_env())
+        if why:
+            print(f"can't switch to live mode: {why}.\n{_live_fix(why)}, then `meeting-capture mode live`.",
+                  file=sys.stderr)
+            return 1
     current = _plist_mode()
     if args.mode == current:
         print(f"already in {current} mode")
@@ -605,7 +717,253 @@ def cmd_mode(args) -> int:
     _relaunch()
     print(f"switched to {args.mode} mode; daemon restarted via launchd")
     if args.mode == "live":
+        print("calls now stream to Gemini (uploaded), whatever `meeting-capture stt` picks for batch")
+        if current_source()["source"] == "linein":
+            print(f"note: {LINEIN_IS_BATCH}; live applies once the source is sck again")
         print("tail the feed with `meeting-capture live`, or `meeting-capture copilot` for whispers")
+    return 0
+
+
+# --- transcription engine + language (launchd plist env, like mode/source) ---------------
+
+def _daemon_env() -> dict:
+    """The configuration the launchd daemon runs with: its plist's environment
+    (meeting-capture's config store), or this shell's when no agent is installed."""
+    return _plist_env() if LAUNCHD_PLIST.exists() else dict(os.environ)
+
+
+# `meeting-capture stt --json` prints transcription_summary() as one JSON
+# object. pipeline-monitor (menu bar, `contorch setup|status|doctor`) reads it
+# instead of re-implementing transcriber.py's rules — README "Contract" lists
+# the fields. Bump the schema when a field is removed or changes meaning (adding
+# one doesn't), and change pipeline-monitor's transcription.py with it.
+STT_JSON_SCHEMA = 1
+
+
+def transcription_summary() -> dict:
+    """How the daemon's configuration transcribes: transcriber.engine_summary()
+    for its launchd plist env, plus live mode and whether the agent is
+    installed. The one source for `stt` (its text and --json), status, doctor,
+    the settings page and, through `stt --json`, pipeline-monitor."""
+    from .transcriber import engine_summary
+    s = engine_summary(_daemon_env())
+    requested = _plist_mode() == "live"
+    blocker = live_mode_blocker() if requested else None
+    return {
+        "schema": STT_JSON_SCHEMA,
+        "version": __version__,
+        "agent_installed": LAUNCHD_PLIST.exists(),
+        **s,
+        # Live mode streams every call to Gemini as it happens, whatever the
+        # batch engine above is: active means audio leaves the Mac.
+        "live": {"requested": requested, "active": requested and blocker is None, "blocker": blocker},
+    }
+
+
+ENGINE_DESCRIPTIONS = {
+    "apple": "On this Mac — nothing is uploaded",
+    "gemini": "Gemini — each chunk is uploaded to Google",
+    "none": "none — audio is kept until an engine can run",
+}
+
+
+def _notice(s: dict) -> str:
+    from .transcriber import NOTICE_CLI_HINT
+    return f"{s['notice']}. {NOTICE_CLI_HINT[0].upper()}{NOTICE_CLI_HINT[1:]}."
+
+
+def _engine_line(s: dict) -> str:
+    if s["engine"] == "apple" and s["ready"]:
+        head = f"on this Mac ({s['locale']})"
+    elif s["engine"] == "gemini" and s["ready"]:
+        head = "Gemini (hosted)"
+    elif s["engine"] == "none":
+        head = "none"
+    else:
+        head = f"{s['engine_label']} (not ready)"
+    return f"{head} [stt={s['choice']}] — {s['reason']}"
+
+
+def _is_indic(locale: str) -> bool:
+    return locale.endswith("-IN") and not locale.startswith("en-")
+
+
+HINGLISH_NOTE = ("Indian languages come out romanized (Latin script): mixed Hindi and English "
+                 "(\"Hinglish\") lands in one transcript.")
+
+
+def apply_transcription(stt: str | None = None, locale: str | None = None, progress=None) -> str:
+    """Set the transcription engine (auto|apple|gemini) and/or the on-device
+    language in the launchd plist, then restart the daemon. A language, or
+    switching to on-device, first installs that language's model through the
+    helper (`sysaudio transcribe --install`). Everything is validated before
+    the plist is touched; raises RuntimeError with a user-facing message.
+    Shared by `stt`, `language` and the settings page."""
+    from .transcriber import (
+        CHOICE_LABELS, ENV_LEGACY_TRANSCRIBER, ENV_LOCALE, ENV_STT,
+        STT_CHOICES, AppleError, TranscriptionUnavailable, apple_status, install_apple_model,
+        match_locale, stt_choice, stt_locale,
+    )
+
+    say = progress or (lambda _msg: None)
+    if not LAUNCHD_PLIST.exists():
+        raise RuntimeError("no launchd agent installed — run `meeting-capture install` first")
+    env = _plist_env()
+    new_stt = stt_choice(env) if stt is None else str(stt).strip().lower()
+    if new_stt not in STT_CHOICES:
+        raise RuntimeError(f"unknown engine {stt!r} — choose auto, apple or gemini")
+    new_locale = stt_locale(env)
+    notes: list[str] = []
+
+    if locale is not None:
+        st = apple_status(new_locale, refresh=True)      # its supported list
+        if not st.supported and not st.available:
+            raise RuntimeError(f"on-device transcription isn't available on this Mac ({st.reason}); "
+                               "the language setting only applies to it — Gemini detects the language itself")
+        picked = match_locale(str(locale), st.supported)
+        if picked is None:
+            raise RuntimeError(f"unsupported language {locale!r} — choose one of: {', '.join(st.supported)}")
+        new_locale = picked
+
+    required = locale is not None or new_stt == "apple"
+    if required or (stt is not None and new_stt == "auto"):
+        st = apple_status(new_locale, refresh=True)
+        if not st.available:
+            if required:
+                raise RuntimeError(f"on-device transcription isn't available: {st.reason}")
+            notes.append(f"on this Mac isn't available ({st.reason})")
+        elif locale is not None or not st.usable:
+            if not st.usable:
+                say(f"Downloading the on-device speech model for {new_locale} from Apple (one time)…")
+            try:
+                install_apple_model(new_locale, progress=progress)
+            except (TranscriptionUnavailable, AppleError) as exc:
+                if required:
+                    raise RuntimeError(str(exc)) from exc
+                notes.append(f"couldn't install the on-device model ({exc})")
+
+    # Always written, auto included: an unset MEETING_CAPTURE_STT means nobody
+    # has picked an engine yet (transcriber.upgrade_notice). A language is
+    # written only when one is chosen — unset, it follows the Mac's language.
+    sets: dict = {ENV_STT: new_stt}
+    if locale is not None:
+        sets[ENV_LOCALE] = new_locale
+    _update_plist_env(sets, remove=(ENV_LEGACY_TRANSCRIBER,))
+    _relaunch()
+
+    s = transcription_summary()
+    lines = [f"transcription: {CHOICE_LABELS[new_stt]} (stt={new_stt}), language {new_locale} — "
+             f"now {ENGINE_DESCRIPTIONS[s['engine']]}; daemon restarted"]
+    lines += notes
+    if new_stt == "gemini" and not s["gemini_key"]:
+        lines.append("no Google API key the recorder can see — write it to ~/.config/google/key "
+                     "(a GOOGLE_API_KEY in your shell doesn't reach it); audio is kept until then")
+    elif not s["ready"]:
+        lines.append(f"not ready yet: {s['reason']}")
+    if s["live"]["requested"]:
+        why = s["live"]["blocker"]
+        lines.append(f"live mode is on, but {why}, so the recorder runs batch" if why else
+                     "live mode is on: calls stream to Gemini; this engine only transcribes "
+                     "parked audio")
+    if _is_indic(new_locale) and s["engine"] != "gemini":
+        lines.append(HINGLISH_NOTE)
+    return "\n".join(lines)
+
+
+def stt_lines(s: dict) -> list[str]:
+    """`meeting-capture stt` as text: transcription_summary(), the same dict
+    `stt --json` prints."""
+    live = s["live"]
+    key_needed = s["engine"] == "gemini" or s["choice"] == "gemini" or live["requested"]
+    lines = [
+        f"engine:    {ENGINE_DESCRIPTIONS[s['engine']]}{'' if s['ready'] else ' (not ready)'}",
+        f"why:       {s['reason']}",
+        f"setting:   {s['choice']}   (meeting-capture stt auto|apple|gemini)",
+        f"language:  {s['locale']}   ({s['locale_why']}; meeting-capture language LOCALE; on this Mac only)",
+    ]
+    if s["needs_model"]:
+        lines.append(f"model:     the on-device model for {s['locale']} isn't set up for meeting-capture yet — "
+                     f"`{s['install_hint']}` does it now (the running recorder also tries, at most once "
+                     "an hour)")
+    lines.append(f"gemini:    API key {'set' if s['gemini_key'] else 'not set'}"
+                 f"{'' if key_needed else ' (optional)'}"
+                 + (" — Gemini takes over if on-device transcription stops working "
+                    "(`meeting-capture stt apple` never uploads)" if s["gemini_fallback"] else ""))
+    if live["requested"]:
+        lines.append(f"live mode: requested, but {live['blocker']} — running batch" if live["blocker"] else
+                     "live mode: on — calls stream to Gemini (uploaded); the engine above only "
+                     "transcribes parked audio")
+    if s.get("notice"):
+        lines.append(f"note:      {_notice(s)}")
+    return lines
+
+
+def cmd_stt(args) -> int:
+    """Which engine transcribes: auto (on this Mac when it can, else Gemini if
+    a key is set), apple (on this Mac only, never uploads) or gemini.
+
+    Shown as text, or with --json as one JSON object on stdout (nothing else
+    goes there; README "Contract"). Setting it is safe for another program to
+    run: no prompts, progress as lines on stdout (flushed as they happen),
+    errors on stderr; exit 0 = applied (the daemon restarted; the result may
+    still not be ready — ask `stt --json`), 1 = refused or failed with the
+    plist untouched, 2 = usage error."""
+    if args.json:
+        if args.engine is not None or args.language is not None:
+            print("--json only shows the current state; set it without --json", file=sys.stderr)
+            return 2
+        try:
+            s = transcription_summary()
+        except Exception as exc:   # a bug, not a state: no half-written JSON on stdout
+            print(f"can't work out the transcription state: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(s, sort_keys=True))
+        return 0
+    if args.engine is None and args.language is None:
+        print("\n".join(stt_lines(transcription_summary())))
+        return 0
+    if not LAUNCHD_PLIST.exists():
+        print("no launchd agent installed — run `meeting-capture install` first", file=sys.stderr)
+        return 1
+    try:
+        msg = apply_transcription(stt=args.engine, locale=args.language,
+                                  progress=lambda m: print(m, flush=True))
+    except RuntimeError as exc:
+        print(f"can't switch transcription: {exc}", file=sys.stderr)
+        return 1
+    print(msg)
+    return 0
+
+
+def cmd_language(args) -> int:
+    """The on-device transcription language (installs its model first)."""
+    if args.locale is None:
+        s = transcription_summary()
+        apple = s["apple"]
+        if apple["usable"]:
+            state = "installed on this Mac"
+        elif apple["installable"]:
+            state = f"model not installed yet — `meeting-capture language {s['locale']}`"
+        else:
+            state = f"on-device transcription unavailable: {apple['reason']}"
+        print(f"language:  {s['locale']} ({state})")
+        print(f"from:      {s['locale_why']}")
+        if apple["supported"]:
+            print(f"supported: {', '.join(apple['supported'])}")
+        if apple["installed_locales"]:
+            print(f"installed: {', '.join(apple['installed_locales'])}")
+        if _is_indic(s["locale"]):
+            print(HINGLISH_NOTE)
+        return 0
+    if not LAUNCHD_PLIST.exists():
+        print("no launchd agent installed — run `meeting-capture install` first", file=sys.stderr)
+        return 1
+    try:
+        msg = apply_transcription(locale=args.locale, progress=lambda m: print(m, flush=True))
+    except RuntimeError as exc:
+        print(f"can't use that language: {exc}", file=sys.stderr)
+        return 1
+    print(msg)
     return 0
 
 
@@ -727,7 +1085,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("last", help="print the most recent transcript").set_defaults(func=cmd_last)
     sub.add_parser("tail", help="follow the daemon log").set_defaults(func=cmd_tail)
     sub.add_parser("doctor", help="full health check (binaries, permissions, daemon)").set_defaults(func=cmd_doctor)
-    vocab = sub.add_parser("vocab", help="show or edit the transcription vocabulary (proper nouns)")
+    vocab = sub.add_parser("vocab", help="show or edit the transcription vocabulary (proper nouns; Gemini only)")
     vocab.add_argument("action", nargs="?", choices=["show", "edit"], default="show")
     vocab.set_defaults(func=cmd_vocab)
     mode = sub.add_parser("mode", help="show or switch the launchd daemon between batch and live capture")
@@ -739,6 +1097,19 @@ def main(argv: list[str] | None = None) -> int:
     source.add_argument("--me", type=int, help="0-based channel carrying your voice (default 0 = input 1)")
     source.add_argument("--them", type=int, help="0-based channel carrying the other side (default 1 = input 2)")
     source.set_defaults(func=cmd_source)
+    stt = sub.add_parser("stt", help="show or switch the transcription engine: auto, apple (on this Mac, "
+                                     "never uploads) or gemini")
+    stt.add_argument("engine", nargs="?", choices=["auto", "apple", "gemini"],
+                     help="omit to show the engine in use and why")
+    stt.add_argument("--language", metavar="LOCALE",
+                     help="also set the on-device language (like `meeting-capture language`), in one restart")
+    stt.add_argument("--json", action="store_true",
+                     help="print the current state as one JSON object (for other programs; README: Contract)")
+    stt.set_defaults(func=cmd_stt)
+    language = sub.add_parser("language", help="show or set the on-device transcription language "
+                                               "(e.g. en-US, en-IN, hi-IN); installs its model")
+    language.add_argument("locale", nargs="?", help="omit to show the current language and the supported ones")
+    language.set_defaults(func=cmd_language)
     sub.add_parser("devices", help="list audio input devices (for line-in)").set_defaults(func=cmd_devices)
     ui = sub.add_parser("ui", help="open the recording settings page (source, interface inputs, levels) in the browser")
     ui.add_argument("--port", type=int, default=0, help="port on 127.0.0.1 (default: any free port)")

@@ -10,6 +10,21 @@ def _body(meeting_id):
     return row["body"] if row else None
 
 
+def _ready(engine="apple", choice="auto", ready=True):
+    from meeting_capture.transcriber import Backend
+    return Backend(engine, choice, "test", "en-US", ready)
+
+
+def _wait(cond, timeout=5.0):
+    import time
+    end = time.time() + timeout
+    while time.time() < end:
+        if cond():
+            return
+        time.sleep(0.01)
+    raise AssertionError("timed out waiting")
+
+
 def test_session_id_contains_timestamp():
     sid = daemon._session_id(1714003200.0)
     assert sid.startswith("meeting-") and "T" in sid and not sid.endswith(".md")
@@ -134,25 +149,40 @@ def test_retry_noop_without_dir(tmp_path, monkeypatch):
     assert daemon.retry_failed_chunks() == 0
 
 
-def test_backlog_retry_runs_in_background_one_at_a_time(monkeypatch):
+def test_backlog_retry_never_holds_up_recording_and_new_chunks_go_first(tmp_path, monkeypatch):
+    """A long backlog retry (e.g. after a bad key was replaced) runs on the
+    transcription worker, one parked chunk at a time; new chunks jump ahead."""
     import threading, time
-    gate = threading.Event()
-    calls = []
+    failed = tmp_path / "failed"; failed.mkdir()
+    monkeypatch.setattr(daemon, "FAILED_AUDIO_DIR", failed)
+    monkeypatch.setattr(daemon, "AUDIO_DIR", tmp_path / "audio")
+    monkeypatch.setattr(daemon, "WORKER_IDLE_POLL_S", 0.01)
+    for i in range(3):
+        _wav(failed / f"chunk-{1714003200 + i * 10}-them.wav")
+    gate, order = threading.Event(), []
 
-    def slow_retry():
-        calls.append(1)
-        gate.wait(5)
-        return 0
+    def slow(path, role):
+        order.append(path.name)
+        if len(order) == 1:
+            gate.wait(5)            # the first backlog chunk is slow
+        return "text " + path.name
 
-    monkeypatch.setattr(daemon, "retry_failed_chunks", slow_retry)
+    monkeypatch.setattr(daemon, "transcribe", slow)
+    monkeypatch.setattr(daemon, "resolve_backend", lambda: _ready())
+    w = daemon.TranscriptionWorker()
+    w._next_check = float("inf")
+    w.request_retry()
+    w.start()
+    _wait(lambda: order)
+    src = tmp_path / "chunk-1714009999-me.wav"; _wav(src)
     t0 = time.time()
-    t = daemon.retry_failed_chunks_in_background()
-    assert t is not None and time.time() - t0 < 1.0          # returns at once: recording isn't held up
-    assert daemon.retry_failed_chunks_in_background() is None  # a second one doesn't pile on
-    gate.set(); t.join(5)
-    assert calls == [1]
-    t2 = daemon.retry_failed_chunks_in_background()             # free again afterwards
-    assert t2 is not None; t2.join(5)
+    assert w.submit(Chunk(path=src, started_at=1714009999.0, duration_seconds=1.0, role="me"), "meeting-new")
+    assert time.time() - t0 < 0.5             # capture side never waits
+    gate.set()
+    _wait(lambda: len(order) == 4)
+    w.stop()
+    assert order[1] == "chunk-1714009999-me.wav"   # the new chunk went before the rest of the backlog
+    assert not list(failed.glob("chunk-*.wav"))
 
 
 # ---- start a new meeting on request ----------------------------------------
@@ -200,3 +230,738 @@ def test_resume_and_new_commands_request_a_new_meeting(new_meeting_file, tmp_pat
     new_meeting_file.unlink()
     assert cli.main(["resume"]) == 0 and not new_meeting_file.exists()   # wasn't paused: no-op
     assert cli.main(["new"]) == 0 and new_meeting_file.exists()
+
+
+# ---- capture → queue → one transcription worker ------------------------------
+
+# pipeline-monitor's status._CHUNK_RE, verbatim: the menu bar's ● REC depends on it.
+PIPELINE_MONITOR_CHUNK_RE = r"\bINFO chunk \d+(?:\.\d+)?s (?:\[\w+\] )?-> (\S+?) \(\d+ chars\)"
+
+
+@pytest.fixture
+def dirs(tmp_path, monkeypatch):
+    audio = tmp_path / "audio"
+    audio.mkdir()
+    failed = audio / "failed"
+    monkeypatch.setattr(daemon, "AUDIO_DIR", audio)
+    monkeypatch.setattr(daemon, "FAILED_AUDIO_DIR", failed)
+    monkeypatch.setattr(daemon, "WORKER_IDLE_POLL_S", 0.01)
+    return audio, failed
+
+
+def _chunk(audio, ts, role="them", seconds=1.0):
+    p = audio / f"chunk-{ts}-{role}.wav"
+    _wav(p, seconds)
+    return Chunk(path=p, started_at=float(ts), duration_seconds=seconds, role=role)
+
+
+def _lines(caplog):
+    return [f"{r.levelname} {r.getMessage()}" for r in caplog.records]
+
+
+def test_worker_appends_in_capture_order_and_keeps_the_log_contract(dirs, monkeypatch, caplog):
+    import random, re, time
+    audio, _ = dirs
+
+    def fake(path, role):
+        time.sleep(random.random() * 0.02)
+        return f"said in {path.name}"
+
+    monkeypatch.setattr(daemon, "transcribe", fake)
+    monkeypatch.setattr(daemon, "last_backend", lambda: "apple")
+    chunks = [_chunk(audio, 1714003200 + i * 10, "them" if i % 2 else "me") for i in range(6)]
+    w = daemon.TranscriptionWorker()
+    w._next_check = float("inf")
+    w.start()
+    with caplog.at_level("INFO", logger="meeting-capture"):
+        w.begin_session()
+        for c in chunks[:4]:
+            w.submit(c, "meeting-a")
+        for c in chunks[4:]:
+            w.submit(c, "meeting-b")
+        w.end_session()
+        _wait(lambda: any("session ended" in l for l in _lines(caplog)))
+    w.stop()
+    a, b = _body("meeting-a"), _body("meeting-b")
+    positions = [a.index(c.path.name) for c in chunks[:4]]
+    assert positions == sorted(positions)
+    assert all(c.path.name in b for c in chunks[4:])
+    lines = _lines(caplog)
+    chunk_lines = [l for l in lines if re.search(PIPELINE_MONITOR_CHUNK_RE, l)]
+    assert len(chunk_lines) == 6
+    assert re.search(PIPELINE_MONITOR_CHUNK_RE, chunk_lines[0]).group(1) == "meeting-a"
+    assert chunk_lines[0].startswith("INFO chunk 1.0s [me] -> meeting-a (")
+    assert chunk_lines[0].endswith(" chars) via apple")
+    # "session ended" comes after the session's last chunk line (REC state).
+    assert lines.index(next(l for l in lines if "mic inactive — session ended" in l)) > lines.index(chunk_lines[-1])
+    assert not list(audio.glob("chunk-*.wav"))
+
+
+def test_session_end_is_not_logged_when_a_new_session_already_started(dirs, monkeypatch, caplog):
+    import threading
+    audio, _ = dirs
+    gate = threading.Event()
+    monkeypatch.setattr(daemon, "transcribe", lambda path, role: gate.wait(5) and "x")
+    w = daemon.TranscriptionWorker()
+    w._next_check = float("inf")
+    w.start()
+    with caplog.at_level("INFO", logger="meeting-capture"):
+        w.begin_session()
+        w.submit(_chunk(audio, 1714003200), "meeting-a")
+        w.end_session()
+        w.begin_session()                    # the next call started while the worker was busy
+        w.submit(_chunk(audio, 1714003260), "meeting-a")
+        gate.set()
+        _wait(lambda: w.idle() and len([l for l in _lines(caplog) if "INFO chunk" in l]) == 2)
+    w.stop()
+    assert not any("session ended" in l for l in _lines(caplog))
+
+
+def test_capture_never_blocks_and_a_full_queue_parks_the_chunk(dirs, monkeypatch):
+    import threading, time
+    audio, failed = dirs
+    gate = threading.Event()
+    monkeypatch.setattr(daemon, "transcribe", lambda path, role: gate.wait(5) and "x")
+    w = daemon.TranscriptionWorker(maxsize=2)
+    w._next_check = float("inf")
+    w.start()
+    chunks = [_chunk(audio, 1714003200 + i * 10) for i in range(5)]
+    t0 = time.time()
+    results = [w.submit(c, "meeting-a") for c in chunks]
+    assert time.time() - t0 < 0.5            # transcription is stuck; capture is not
+    assert results[-1] is False
+    parked = sorted(failed.glob("chunk-*.wav"))
+    assert parked and daemon._read_meta(parked[0])["meeting_id"] == "meeting-a"
+    gate.set()
+    # The overflow is retried once the worker is idle, into the right meeting.
+    _wait(lambda: _body("meeting-a") and _body("meeting-a").count("**Them:** x") == 5)
+    w.stop()
+    assert not list(failed.glob("chunk-*.wav"))
+
+
+def test_a_bad_file_is_quarantined_after_three_attempts_and_never_blocks_the_rest(dirs, monkeypatch):
+    from meeting_capture.transcriber import AppleChunkFailed
+    _, failed = dirs
+    failed.mkdir()
+    bad = failed / "chunk-1714003200-them.wav"
+    _wav(bad)
+
+    def fake(path, role):
+        if path.name == bad.name:
+            raise AppleChunkFailed("couldn't read it")
+        return "fine"
+
+    monkeypatch.setattr(daemon, "transcribe", fake)
+    for attempt in (1, 2):
+        _wav(failed / f"chunk-{1714003300 + attempt}-me.wav")
+        assert daemon.retry_failed_chunks() == 1          # the good one behind it still goes through
+        assert daemon._read_meta(bad)["attempts"] == attempt
+    assert daemon.retry_failed_chunks() == 0
+    quarantined = failed / "quarantine" / bad.name
+    assert quarantined.exists() and not bad.exists()
+    assert daemon._read_meta(quarantined)["attempts"] == 3
+    assert daemon.parked_chunks() == []
+    assert daemon.parked_counts() == {"queued": 0, "parked": 0, "quarantined": 1}
+
+
+def test_an_unclassified_error_on_one_file_cannot_hold_up_the_rest(dirs, monkeypatch):
+    """E.g. Gemini rejects one corrupt file with a 400: the next chunk is tried;
+    it works, so the first failure counts toward that file's quarantine."""
+    _, failed = dirs
+    failed.mkdir()
+    bad = failed / "chunk-1714003200-them.wav"
+    _wav(bad)
+
+    def fake(path, role):
+        if path.name == bad.name:
+            raise ValueError("400 INVALID_ARGUMENT: audio could not be decoded")
+        return "fine"
+
+    monkeypatch.setattr(daemon, "transcribe", fake)
+    for attempt in (1, 2, 3):
+        _wav(failed / f"chunk-{1714003300 + attempt}-me.wav")
+        assert daemon.retry_failed_chunks() == 1
+    assert (failed / "quarantine" / bad.name).exists()
+
+
+def test_a_systemic_error_stops_the_pass_after_one_extra_try(dirs, monkeypatch):
+    _, failed = dirs
+    failed.mkdir()
+    for i in range(4):
+        _wav(failed / f"chunk-{1714003200 + i}-them.wav")
+    calls = []
+
+    def offline(path, role):
+        calls.append(path.name)
+        raise ConnectionError("network is unreachable")
+
+    monkeypatch.setattr(daemon, "transcribe", offline)
+    assert daemon.retry_failed_chunks() == 0
+    assert len(calls) == 2                                   # not one request per parked chunk
+    assert not any(daemon._read_meta(p).get("attempts") for p in failed.glob("chunk-*.wav"))
+    assert len(list(failed.glob("chunk-*.wav"))) == 4
+
+
+def test_a_malformed_wav_is_still_retried_and_quarantined(dirs, monkeypatch, fake_helper):
+    """wave raises a bare RuntimeError on some malformed RIFF headers (found
+    against the real engine); it must neither crash the retry pass nor be
+    skipped for ever."""
+    _, failed = dirs
+    failed.mkdir()
+    bad = failed / "chunk-1714003200-them.wav"
+    bad.write_bytes(b"RIFF\x24\x00\x00\x00WAVEgarbage-not-audio")
+    fake_helper.configure(transcribe_rc={bad.name: 70})
+    assert [c.path.name for c in daemon.parked_chunks()] == [bad.name]
+    for _ in range(3):
+        daemon.retry_failed_chunks()
+    assert (failed / "quarantine" / bad.name).exists()
+
+
+def test_a_new_chunk_that_fails_on_its_own_is_counted_not_blocking(dirs, monkeypatch):
+    from meeting_capture.transcriber import AppleError
+    audio, failed = dirs
+    calls = []
+
+    def fake(path, role):
+        calls.append(path.name)
+        if len(calls) == 1:
+            raise AppleError("helper exit 1")
+        return "ok"
+
+    monkeypatch.setattr(daemon, "transcribe", fake)
+    w = daemon.TranscriptionWorker()
+    w._next_check = float("inf")
+    w.start()
+    first, second = _chunk(audio, 1714003200), _chunk(audio, 1714003210)
+    w.submit(first, "meeting-a")
+    w.submit(second, "meeting-a")
+    _wait(lambda: len(calls) >= 2)
+    w.stop()
+    assert w.blocked is None
+    assert daemon._read_meta(failed / first.path.name)["attempts"] == 1
+    assert "**Them:** ok" in _body("meeting-a")
+
+
+def test_unavailable_engine_parks_audio_and_waits_until_it_is_back(dirs, monkeypatch):
+    import time
+    from meeting_capture.transcriber import AppleUnavailable
+    audio, failed = dirs
+    monkeypatch.setattr(daemon, "ENGINE_RECHECK_S", 0.05)
+    up, calls = {"ok": False}, []
+
+    def fake(path, role):
+        calls.append(path.name)
+        if not up["ok"]:
+            raise AppleUnavailable("the on-device model for en-US isn't installed yet")
+        return "back again"
+
+    monkeypatch.setattr(daemon, "transcribe", fake)
+    monkeypatch.setattr(daemon, "resolve_backend", lambda: _ready(ready=up["ok"]))
+    monkeypatch.setattr(daemon.TranscriptionWorker, "_maybe_install_model", lambda self: None)
+    w = daemon.TranscriptionWorker().start()
+    w.submit(_chunk(audio, 1714003200), "meeting-a")
+    w.submit(_chunk(audio, 1714003210), "meeting-a")
+    _wait(lambda: len(list(failed.glob("chunk-*.wav"))) == 2)
+    assert w.blocked and "isn't installed" in w.blocked
+    w.request_retry()
+    n = len(calls)
+    time.sleep(0.3)
+    assert len(calls) == n                   # nothing is retried while unavailable
+    assert all(daemon._read_meta(p).get("attempts") == 0 for p in failed.glob("chunk-*.wav"))
+    up["ok"] = True
+    _wait(lambda: not list(failed.glob("chunk-*.wav")))
+    w.stop()
+    assert w.blocked is None
+    assert _body("meeting-a").count("back again") == 2
+
+
+def test_retry_puts_a_chunk_back_into_the_meeting_it_was_recorded_in(dirs, monkeypatch):
+    audio, failed = dirs
+    c = _chunk(audio, 1714003500)
+    daemon._park_failed(c, RuntimeError("network down"), "meeting-2024-04-25T00-00-00")
+    monkeypatch.setattr(daemon, "transcribe", lambda path, role: "recovered words")
+    assert daemon.retry_failed_chunks() == 1
+    assert "recovered words" in _body("meeting-2024-04-25T00-00-00")
+    assert list(failed.iterdir()) == []      # the audio and its note are both gone
+
+
+def test_stopping_parks_what_is_still_queued(dirs):
+    audio, failed = dirs
+    w = daemon.TranscriptionWorker()         # never started: everything stays queued
+    c = _chunk(audio, 1714003600)
+    w.submit(c, "meeting-a")
+    w.stop(timeout=0.1)
+    assert (failed / c.path.name).exists() and not c.path.exists()
+    assert daemon._read_meta(failed / c.path.name)["meeting_id"] == "meeting-a"
+
+
+def test_chunks_left_behind_by_a_killed_daemon_are_adopted(dirs):
+    import os, time
+    audio, failed = dirs
+    old = _chunk(audio, 1714003700).path
+    fresh = _chunk(audio, 1714003800).path
+    os.utime(old, (time.time() - 3600,) * 2)
+    assert daemon.adopt_orphans() == 1
+    assert (failed / old.name).exists() and fresh.exists()
+    assert daemon.adopt_orphans(exclude={fresh}, min_age_s=0) == 0     # queued right now: not an orphan
+
+
+def test_live_mode_survives_the_upgrade_to_on_device_transcription(fake_helper, gemini_key, monkeypatch):
+    """An existing live-mode user (key set, no MEETING_CAPTURE_STT) on a Mac
+    whose English model is installed: auto resolves batch to on this Mac,
+    but live mode — their explicit choice to stream to Gemini — keeps working."""
+    from meeting_capture import transcriber
+    monkeypatch.setattr(daemon, "_live_refusal_logged", None)
+    assert transcriber.resolve_backend().engine == "apple"
+    assert daemon.live_permitted() is True
+    # …and it doesn't flip once the daemon downloads a missing model either.
+    fake_helper.configure(installed=[])
+    assert transcriber.resolve_backend().engine == "gemini" and daemon.live_permitted() is True
+    fake_helper.configure(installed=["en-US"])
+    assert transcriber.resolve_backend().engine == "apple" and daemon.live_permitted() is True
+
+
+def test_live_mode_is_refused_only_for_on_device_only_or_without_a_key(fake_helper, gemini_key, monkeypatch,
+                                                                    caplog):
+    monkeypatch.setattr(daemon, "_live_refusal_logged", None)
+    monkeypatch.setenv("MEETING_CAPTURE_STT", "apple")
+    with caplog.at_level("WARNING", logger="meeting-capture"):
+        assert daemon.live_permitted() is False
+        assert daemon.live_permitted() is False             # logged once, not per session
+    assert "never upload" in caplog.text and caplog.text.count("MODE: live requested") == 1
+    monkeypatch.setenv("MEETING_CAPTURE_STT", "gemini")
+    assert daemon.live_permitted() is True
+    monkeypatch.delenv("GOOGLE_API_KEY")
+    for stt in ("auto", "gemini"):                         # live could not connect: batch keeps the audio
+        monkeypatch.setenv("MEETING_CAPTURE_STT", stt)
+        with caplog.at_level("WARNING", logger="meeting-capture"):
+            assert daemon.live_permitted() is False
+    assert "no Google API key" in caplog.text
+
+
+# ---- a systemic failure is not the files' fault -----------------------------------------
+
+def _drain(w):
+    """Run the worker's retry of parked audio to the end, synchronously."""
+    w.request_retry()
+    for _ in range(100):
+        w._idle()
+        if w._pass is None and not w._retry_wanted:
+            return
+    raise AssertionError("retry pass never ended")
+
+
+SYSTEMIC = {
+    "exit 1": dict(default_rc=1),
+    "no transcript": dict(no_json=True),
+    "hang": dict(sleep=3),
+    "crash": dict(signal=9),
+}
+
+
+@pytest.mark.parametrize("failure", list(SYSTEMIC))
+def test_a_systemic_on_device_failure_never_quarantines_audio(dirs, fake_helper, monkeypatch, failure):
+    """Apple's speech service broken (after an OS update), wedged or crashing
+    while its probe still says usable: every chunk fails. Across a session,
+    several session ends and restarts nothing may be counted against the
+    files — and once the service is back, everything is transcribed."""
+    from meeting_capture import transcriber
+    audio, failed = dirs
+    monkeypatch.setenv("MEETING_CAPTURE_STT", "apple")
+    monkeypatch.setattr(transcriber, "APPLE_MIN_TIMEOUT_S", 0.2)
+    fake_helper.configure(**SYSTEMIC[failure])
+    w = daemon.TranscriptionWorker()
+    w._next_check = float("inf")
+    for i in range(4):                                    # one session
+        w._new_chunk(_chunk(audio, 1714003200 + i * 20), "meeting-a")
+    for n in range(3):                                    # session ends, daemon restarts
+        _drain(w)
+        daemon.retry_failed_chunks()
+        daemon.TranscriptionWorker()._new_chunk(_chunk(audio, 1714003300 + n * 20), "meeting-a")
+    parked = sorted(failed.glob("chunk-*.wav"))
+    assert len(parked) == 7
+    assert not list((failed / "quarantine").glob("*.wav"))
+    assert [daemon._read_meta(p)["attempts"] for p in parked] == [0] * 7
+    assert w.blocked is None                              # the probe still says usable
+    fake_helper.configure(default_rc=0, no_json=False, sleep=0, signal=None)
+    _drain(w)
+    assert not list(failed.glob("chunk-*.wav"))
+    assert _body("meeting-a").count("hello from this mac") == 7
+
+
+def test_a_failure_streak_rechecks_the_engine(dirs, fake_helper, monkeypatch, caplog):
+    """After REPROBE_AFTER_FAILURES unclassified failures in a row the cached
+    probe is dropped: if the helper now reports on-device unusable, the audio
+    is parked as unavailable (no helper run per chunk, nothing counted)."""
+    audio, failed = dirs
+    monkeypatch.setenv("MEETING_CAPTURE_STT", "apple")
+    fake_helper.configure(default_rc=1)
+    w = daemon.TranscriptionWorker()
+    w._next_check = float("inf")
+    w._new_chunk(_chunk(audio, 1714003200), "meeting-a")
+    w._new_chunk(_chunk(audio, 1714003210), "meeting-a")
+    fake_helper.configure(clear_cache=False, probe_rc=75)      # e.g. the model was released
+    with caplog.at_level("WARNING", logger="meeting-capture"):
+        w._new_chunk(_chunk(audio, 1714003220), "meeting-a")   # third in a row: re-probe next time
+    assert "3 transcriptions in a row failed" in caplog.text
+    n = len(fake_helper.transcribe_calls())
+    w._new_chunk(_chunk(audio, 1714003230), "meeting-a")
+    assert len(fake_helper.transcribe_calls()) == n            # the probe said no: helper not run
+    assert w.blocked and "isn't installed" in w.blocked
+    parked = list(failed.glob("chunk-*.wav"))
+    assert len(parked) == 4 and all(daemon._read_meta(p)["attempts"] == 0 for p in parked)
+
+
+def test_a_file_that_fails_on_its_own_still_reaches_quarantine(dirs, fake_helper, monkeypatch):
+    """The judge counts an unclassified failure once the next chunk shows the
+    engine working — also when the bad file is the only one parked."""
+    audio, failed = dirs
+    monkeypatch.setenv("MEETING_CAPTURE_STT", "apple")
+    bad = _chunk(audio, 1714003200)
+    fake_helper.configure(transcribe_rc={bad.path.name: 1})
+    w = daemon.TranscriptionWorker()
+    w._next_check = float("inf")
+    w._new_chunk(bad, "meeting-a")
+    for i in range(3):
+        w._new_chunk(_chunk(audio, 1714003300 + i * 20), "meeting-a")   # works: the bad one counts
+        if i < 2:
+            assert daemon._read_meta(failed / bad.path.name)["attempts"] == i + 1
+            _drain(w)                                    # session end: it fails again (held)
+    assert (failed / "quarantine" / bad.path.name).exists()
+    assert daemon._read_meta(failed / "quarantine" / bad.path.name)["attempts"] == 3
+    assert _body("meeting-a").count("hello from this mac") == 3
+
+
+def test_the_same_file_failing_twice_is_not_read_as_a_broken_engine(dirs, fake_helper, monkeypatch):
+    """The session's last chunk fails, then fails again when it is retried at
+    the session's end: that says nothing about the engine, so it is still
+    counted once the next session's first chunk works."""
+    audio, failed = dirs
+    monkeypatch.setenv("MEETING_CAPTURE_STT", "apple")
+    bad = _chunk(audio, 1714003300)
+    fake_helper.configure(transcribe_rc={bad.path.name: 1})
+    w = daemon.TranscriptionWorker()
+    w._next_check = float("inf")
+    w._new_chunk(_chunk(audio, 1714003200), "meeting-a")
+    w._new_chunk(bad, "meeting-a")
+    _drain(w)
+    assert len([c for c in fake_helper.transcribe_calls() if c[-1].endswith(bad.path.name)]) == 2
+    assert daemon._read_meta(failed / bad.path.name)["attempts"] == 0
+    w._new_chunk(_chunk(audio, 1714009000), "meeting-b")
+    assert daemon._read_meta(failed / bad.path.name)["attempts"] == 1
+
+
+def test_two_unclassified_failures_in_a_row_count_against_neither_file(dirs, monkeypatch):
+    """Judge rule: two unclassified failures in a row (new or parked) are the
+    engine — neither is counted, whatever works afterwards."""
+    audio, failed = dirs
+    results = iter([RuntimeError("a"), RuntimeError("b"), "fine"])
+
+    def fake(path, role):
+        r = next(results)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    monkeypatch.setattr(daemon, "transcribe", fake)
+    j = daemon._Judge()
+    chunks = [_chunk(audio, 1714003200 + i * 20) for i in range(3)]
+    for c in chunks:
+        j.record(c, *daemon._attempt(c, "meeting-a"))
+    assert [daemon._read_meta(failed / c.path.name)["attempts"] for c in chunks[:2]] == [0, 0]
+
+
+def test_worker_downloads_a_missing_on_device_model_once(fake_helper, monkeypatch):
+    from meeting_capture import transcriber
+    fake_helper.configure(installed=[])      # supported, nothing installed: probe exits 75
+    assert transcriber.resolve_backend().engine == "none"
+    w = daemon.TranscriptionWorker()
+    w._maybe_install_model()
+    _wait(lambda: any("--install" in c for c in fake_helper.calls()) and not w._installing)
+    w._maybe_install_model()                  # not again within the hour
+    assert sum("--install" in c for c in fake_helper.calls()) == 1
+    assert transcriber.resolve_backend().engine == "apple"
+
+
+def test_worker_downloads_the_model_when_on_device_only_is_chosen(fake_helper, monkeypatch):
+    fake_helper.configure(installed=[])
+    monkeypatch.setenv("MEETING_CAPTURE_STT", "apple")
+    w = daemon.TranscriptionWorker()
+    w._maybe_install_model()
+    _wait(lambda: any("--install" in c for c in fake_helper.calls()) and not w._installing)
+
+
+def test_a_working_new_chunk_unblocks_the_worker(dirs, monkeypatch):
+    from meeting_capture.transcriber import TranscriptionUnavailable
+    audio, failed = dirs
+    calls = []
+
+    def fake(path, role):
+        calls.append(path.name)
+        if len(calls) == 1:
+            raise TranscriptionUnavailable("no Gemini API key")
+        return "now with a key"
+
+    monkeypatch.setattr(daemon, "transcribe", fake)
+    w = daemon.TranscriptionWorker()
+    w._next_check = float("inf")
+    w.start()
+    w.submit(_chunk(audio, 1714003200), "meeting-a")
+    _wait(lambda: w.blocked)
+    w.submit(_chunk(audio, 1714003210), "meeting-a")
+    _wait(lambda: not list(failed.glob("chunk-*.wav")))     # unblocked, and the parked one retried
+    w.stop()
+    assert w.blocked is None and _body("meeting-a").count("now with a key") == 2
+
+
+def test_worker_never_downloads_a_model_when_gemini_is_chosen(fake_helper, monkeypatch):
+    fake_helper.configure(installed=[])
+    monkeypatch.setenv("MEETING_CAPTURE_STT", "gemini")
+    daemon.TranscriptionWorker()._maybe_install_model()
+    assert not any("--install" in c for c in fake_helper.calls())
+
+
+# ---- a restart mid-chunk (launchd SIGTERM: stt, language, mode, settings, upgrade) -------
+
+def test_every_queued_chunk_carries_a_note_naming_its_meeting(dirs):
+    audio, _ = dirs
+    w = daemon.TranscriptionWorker()         # never started: stays queued
+    c = _chunk(audio, 1714003200)
+    w.submit(c, "meeting-a")
+    assert daemon._read_meta(c.path) == {"meeting_id": "meeting-a", "attempts": 0}
+
+
+def test_the_chunk_in_hand_at_stop_goes_back_into_its_own_meeting(dirs, monkeypatch):
+    """SIGTERM while a chunk is being transcribed: it can't finish in time.
+    It used to be left without a note and came back as a one-chunk meeting of
+    its own; now it keeps its meeting, and status counts it meanwhile."""
+    import threading
+    audio, failed = dirs
+    in_hand, release = threading.Event(), threading.Event()
+    first, mid, last = (_chunk(audio, 1714003200 + i * 20) for i in range(3))
+
+    def dying(path, role):
+        if path.name == mid.path.name:
+            in_hand.set()
+            release.wait(10)            # the process would be gone by now
+            raise RuntimeError("the old process's last gasp")
+        return "FIRST"
+
+    monkeypatch.setattr(daemon, "transcribe", dying)
+    w = daemon.TranscriptionWorker()
+    w._next_check = float("inf")
+    w.start()
+    for c in (first, mid, last):
+        w.submit(c, "meeting-a")
+    assert in_hand.wait(5)
+    w.stop(timeout=0.2)
+    assert mid.path.exists() and daemon._read_meta(mid.path)["meeting_id"] == "meeting-a"
+    assert daemon._read_meta(failed / last.path.name)["meeting_id"] == "meeting-a"
+    assert daemon.parked_counts() == {"queued": 1, "parked": 1, "quarantined": 0}
+
+    # The next start: nothing is in flight in a fresh process.
+    texts = {mid.path.name: "SECOND", last.path.name: "THIRD"}
+    monkeypatch.setattr(daemon, "transcribe", lambda path, role: texts[path.name])
+    assert daemon.adopt_at_start(other_daemon=False) == 1
+    assert not list(audio.glob("chunk-*"))                        # the note moved with the audio
+    assert daemon.retry_failed_chunks() == 2
+    body = _body("meeting-a")
+    assert body.index("FIRST") < body.index("SECOND") < body.index("THIRD")
+    assert [r["meeting_id"] for r in store.recent(10)] == ["meeting-a"]   # no phantom meeting
+    assert list(failed.iterdir()) == []
+    release.set()
+    w._thread.join(5)
+
+
+def test_stop_lets_the_chunk_in_hand_finish(dirs, monkeypatch):
+    import inspect, threading, time
+    audio, _ = dirs
+    started = threading.Event()
+
+    def slow(path, role):
+        started.set()
+        time.sleep(0.3)
+        return "finished"
+
+    monkeypatch.setattr(daemon, "transcribe", slow)
+    w = daemon.TranscriptionWorker()
+    w._next_check = float("inf")
+    w.start()
+    c = _chunk(audio, 1714003200)
+    w.submit(c, "meeting-a")
+    assert started.wait(5)
+    w.stop()
+    assert "finished" in _body("meeting-a")
+    assert not list(audio.glob("chunk-*"))
+    # The default leaves launchd's 20 s ExitTimeOut room for sysaudio's own 5 s.
+    assert inspect.signature(daemon.TranscriptionWorker.stop).parameters["timeout"].default is None
+    assert 5.0 <= daemon.STOP_GRACE_S <= 12.0
+
+
+def test_adopt_at_start_takes_even_fresh_orphans_unless_another_daemon_runs(dirs):
+    audio, failed = dirs
+    c = _chunk(audio, 1714003200)                                # written a moment ago
+    daemon._write_meta(c.path, {"meeting_id": "meeting-a", "attempts": 0})
+    assert daemon.adopt_at_start(other_daemon=True) == 0          # may be the other one's queue
+    assert c.path.exists()
+    assert daemon.adopt_at_start(other_daemon=False) == 1
+    assert daemon._read_meta(failed / c.path.name)["meeting_id"] == "meeting-a"
+    assert not list(audio.glob("chunk-*"))
+
+
+def test_a_note_without_its_audio_is_cleaned_up(dirs):
+    import os, time
+    audio, _ = dirs
+    note = audio / "chunk-1714003200-them.json"
+    note.write_text('{"meeting_id": "meeting-a"}')
+    os.utime(note, (time.time() - 3600,) * 2)
+    daemon.adopt_orphans()
+    assert not note.exists()
+
+
+def test_another_daemon_running(tmp_path, monkeypatch):
+    import os, subprocess, sys
+    pid_file = tmp_path / "daemon.pid"
+    monkeypatch.setattr(daemon, "PID_FILE", pid_file)
+    assert daemon._another_daemon_running() is False             # no pid file
+    pid_file.write_text(str(os.getpid()))
+    assert daemon._another_daemon_running() is False             # ourselves
+    pid_file.write_text("garbage")
+    assert daemon._another_daemon_running() is False
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    pid_file.write_text(str(dead.pid))
+    assert daemon._another_daemon_running() is False
+    pid_file.write_text(str(os.getppid()))
+    assert daemon._another_daemon_running() is True
+    daemon._clear_pid()                                          # not ours: left alone
+    assert pid_file.read_text() == str(os.getppid())
+    pid_file.write_text(str(os.getpid()))
+    daemon._clear_pid()
+    assert not pid_file.exists()
+
+
+DAEMON_RUN = r'''
+import sys, time, wave
+from meeting_capture import daemon
+from meeting_capture.recorder import Chunk
+
+starts = [int(x) for x in sys.argv[1].split(",") if x]
+daemon.STOP_GRACE_S = float(sys.argv[2])
+
+def fake_stream(out_dir, should_record):
+    for ts in starts:
+        p = out_dir / f"chunk-{ts}-them.wav"
+        with wave.open(str(p), "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+            w.writeframes(b"\x00\x00" * 16000)
+        yield Chunk(path=p, started_at=float(ts), duration_seconds=1.0, role="them")
+    while True:                     # the call goes on
+        time.sleep(0.05)
+
+# No capture of any kind: chunks come from fake_stream; the mic gate is faked.
+daemon.stream_chunks = fake_stream
+daemon.is_mic_active = lambda: True
+daemon.default_devices_snapshot = lambda: {}
+daemon.mic_name = lambda: "test mic"
+daemon.mic_capture_enabled = lambda: False
+daemon.check_and_maybe_exit = lambda: None
+daemon.run()
+'''
+
+
+def test_sigterm_mid_chunk_then_restart_keeps_every_chunk_in_its_meeting(tmp_path, fake_helper):
+    """The real daemon.run(), the real SIGTERM path, the contract-following
+    fake helper: chunk 2 is being transcribed (slowly) and chunk 3 is queued
+    when launchd stops the daemon; the next run puts both into meeting 1."""
+    import json, os, signal, subprocess, sys, time
+    home = tmp_path / "home"
+    home.mkdir()
+    script = tmp_path / "run_daemon.py"
+    script.write_text(DAEMON_RUN)
+    t0 = 1714003200
+    names = [f"chunk-{t0 + i * 15}-them.wav" for i in range(3)]
+    fake_helper.configure(texts=dict(zip(names, ["FIRST", "SECOND-inflight", "THIRD-queued"])),
+                          sleeps={names[1]: 6})
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MEETING_CAPTURE_")}
+    env.update(HOME=str(home), CO_DB_PATH=str(tmp_path / "context.db"),
+               MEETING_CAPTURE_TRANSCRIBE_BIN=str(fake_helper.path), MEETING_CAPTURE_LOCALE="en-US",
+               MEETING_CAPTURE_STT="apple", MEETING_CAPTURE_MIC="0")
+    audio = home / ".meeting-capture" / "audio"
+    failed = audio / "failed"
+    db = tmp_path / "context.db"
+
+    def rows():
+        if not db.exists():
+            return {}
+        return {r["meeting_id"]: r["body"] for r in store.recent(10, path=db)}
+
+    def transcribing(name):
+        return any(c[-1].endswith(name) for c in fake_helper.transcribe_calls())
+
+    def run(starts, grace, log):
+        with open(log, "w") as err:
+            return subprocess.Popen([sys.executable, str(script), ",".join(map(str, starts)), str(grace)],
+                                    env=env, stderr=err, stdout=subprocess.DEVNULL)
+
+    first = run([t0, t0 + 15, t0 + 30], 0.5, tmp_path / "run1.log")
+    try:
+        _wait(lambda: transcribing(names[1]) and (audio / names[2]).exists(), timeout=20)
+        first.send_signal(signal.SIGTERM)
+        assert first.wait(10) == 0
+    finally:
+        first.kill()
+    log1 = (tmp_path / "run1.log").read_text()
+    assert "received signal" in log1 and "stopping mid-transcription" in log1, log1
+    assert json.loads((audio / names[1].replace(".wav", ".json")).read_text())["meeting_id"].startswith("meeting-")
+
+    fake_helper.configure(sleeps={})
+    second = run([], 0.5, tmp_path / "run2.log")
+    try:
+        _wait(lambda: not list(failed.glob("chunk-*.wav")) and not list(audio.glob("chunk-*.wav"))
+              and len(fake_helper.transcribe_calls()) >= 4, timeout=20)
+        second.send_signal(signal.SIGTERM)
+        second.wait(10)
+    finally:
+        second.kill()
+    got = rows()
+    assert len(got) == 1, (got, (tmp_path / "run2.log").read_text())
+    body = next(iter(got.values()))
+    assert body.index("FIRST") < body.index("SECOND-inflight") < body.index("THIRD-queued")
+
+
+def test_the_daemon_logs_the_upgrade_note_once(fake_helper, gemini_key, monkeypatch, caplog):
+    monkeypatch.setattr(daemon, "_notice_logged", False)
+    with caplog.at_level("INFO", logger="meeting-capture"):
+        daemon._log_engine()
+        daemon._log_upgrade_notice()
+    notes = [l for l in _lines(caplog) if "NOTE:" in l]
+    assert len(notes) == 1
+    assert notes[0].startswith("WARNING NOTE: transcription now runs on this Mac (on-device, en-US) instead of "
+                               "Gemini") and "`meeting-capture stt gemini`" in notes[0]
+    monkeypatch.setattr(daemon, "_notice_logged", False)
+    monkeypatch.setenv("MEETING_CAPTURE_STT", "auto")
+    caplog.clear()
+    with caplog.at_level("INFO", logger="meeting-capture"):
+        daemon._log_engine()
+    assert not any("NOTE:" in l for l in _lines(caplog))
+
+
+def test_no_english_model_download_when_auto_keeps_gemini_for_the_macs_language(fake_helper, gemini_key,
+                                                                                monkeypatch):
+    from meeting_capture import transcriber
+    monkeypatch.setattr(transcriber, "_mac_preferences", lambda: (("pl-PL",), "pl_PL"))
+    fake_helper.configure(installed=[])
+    w = daemon.TranscriptionWorker()
+    w._maybe_install_model()
+    assert not any("--install" in c for c in fake_helper.calls())
+
+
+def test_a_note_survives_parking_straight_from_the_queue(dirs):
+    audio, failed = dirs
+    w = daemon.TranscriptionWorker(maxsize=1)                  # never started
+    a, b = _chunk(audio, 1714003200), _chunk(audio, 1714003210)
+    assert w.submit(a, "meeting-a") is True
+    assert w.submit(b, "meeting-b") is False                   # full: parked at once
+    assert daemon._read_meta(failed / b.path.name)["meeting_id"] == "meeting-b"
+    assert not (audio / b.path.with_suffix(".json").name).exists()
