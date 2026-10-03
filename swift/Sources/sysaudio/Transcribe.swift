@@ -228,6 +228,17 @@ final class UncheckedBox<T>: @unchecked Sendable {
     init(_ v: T) { value = v }
 }
 
+/// One chunk for AVAudioConverter's input block, handed over at most once.
+/// AVAudioConverter calls the block synchronously inside convert(to:).
+final class PendingBuffer: @unchecked Sendable {
+    private var buffer: AVAudioPCMBuffer?
+    init(_ b: AVAudioPCMBuffer?) { buffer = b }
+    func take() -> AVAudioPCMBuffer? {
+        defer { buffer = nil }
+        return buffer
+    }
+}
+
 @available(macOS 26.0, *)
 enum OnDeviceTranscriber {
     // SFSpeechErrorDomain codes. Numbers, not SFSpeechError.Code names, so the
@@ -546,12 +557,13 @@ enum OnDeviceTranscriber {
             guard let outBuf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: outCapacity) else {
                 throw AudioFileError("cannot allocate a \(format) buffer")
             }
-            var supplied = false
-            var convError: NSError?
+            // The input block is @Sendable in the macOS 26 SDK, so it captures
+            // only constants: the chunk is handed over at most once via `pending`.
+            let pending = PendingBuffer(inBuf)
             let atEOF = eof
+            var convError: NSError?
             let status = conv.convert(to: outBuf, error: &convError) { _, inputStatus in
-                if let b = inBuf, !supplied {
-                    supplied = true
+                if let b = pending.take() {
                     inputStatus.pointee = .haveData
                     return b
                 }

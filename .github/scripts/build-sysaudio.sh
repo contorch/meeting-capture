@@ -25,17 +25,24 @@ if [ "${SDK_VERSION%%.*}" -lt 26 ]; then
 fi
 
 cd swift
+LOG=$(mktemp)
+trap 'rm -f "$LOG"' EXIT
 # `swift build` intermittently SIGABRTs (exit 134) with an NSFileHandle crash
 # on the GitHub runner. That is a known flaky toolchain bug, not our code, so
 # retry a few times before giving up.
 for attempt in 1 2 3; do
-    if swift build -c release --arch arm64 --arch x86_64 2>&1 | tail -20; then
+    if swift build -c release --arch arm64 --arch x86_64 >"$LOG" 2>&1; then
+        tail -20 "$LOG"
         break
     fi
+    tail -20 "$LOG"
     echo "swift build attempt $attempt failed (likely the flaky NSFileHandle SIGABRT), retrying"
     rm -rf .build/apple 2>/dev/null || true
     sleep 5
 done
+# The tail above can cut a diagnostic in half; list every compiler warning
+# and error in full.
+grep -E "(warning|error): " "$LOG" | grep -v -E "ld: warning: search path" | sort -u || true
 
 # Universal products land in .build/apple/Products/Release (older toolchains)
 # or .build/out/Products/Release (Swift 6.x). Never fall back to a
