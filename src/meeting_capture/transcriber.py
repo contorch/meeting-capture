@@ -19,9 +19,20 @@ Which one runs is MEETING_CAPTURE_STT (in the launchd plist; `meeting-capture st
           parked and retried on-device later.
   gemini  always Gemini (the behaviour before on-device transcription).
 
-MEETING_CAPTURE_LOCALE picks the on-device language (default en-US; Gemini
-detects the language itself). The legacy MEETING_CAPTURE_TRANSCRIBER
-(gemini|whisper) found in old plists is read as auto.
+MEETING_CAPTURE_LOCALE picks the on-device language (Gemini detects the
+language itself). Unset, it follows the Mac: the first preferred language
+(AppleLanguages, with AppleLocale's region when that language has none) that
+the helper's probe lists as supported; otherwise en-US. When that fallback is
+a guess — the Mac's language isn't English and can't be transcribed on this
+Mac — auto prefers Gemini if a key is set (locale_choice(), resolve_backend()).
+`meeting-capture stt|language` and the settings page always write the choice
+they make, so an unset MEETING_CAPTURE_STT means nobody has picked an engine
+yet: someone with a Gemini key whose auto setting now runs on this Mac gets
+upgrade_notice() in status, doctor, `stt`, the settings page and the daemon
+log until they do. (pipeline-monitor's transcription.py mirrors this
+resolution for the menu bar without running meeting-capture: change both.)
+The legacy MEETING_CAPTURE_TRANSCRIBER (gemini|whisper) found in old plists is
+read as auto.
 
 Helper contract (``sysaudio transcribe``; MEETING_CAPTURE_TRANSCRIBE_BIN
 overrides the binary for development and tests):
@@ -69,6 +80,7 @@ import base64
 import json
 import logging
 import os
+import plistlib
 import subprocess
 import threading
 import time
@@ -202,10 +214,122 @@ def normalize_locale(text: str) -> str:
     return "-".join(out)
 
 
-def stt_locale(env=None) -> str:
+@dataclass(frozen=True)
+class LocaleChoice:
+    locale: str          # the on-device language to use
+    source: str          # "setting" (MEETING_CAPTURE_LOCALE) | "mac" (the Mac's language) | "default"
+    mac: str = ""        # the Mac's preferred language, normalized ("" if unknown)
+
+    @property
+    def guessed(self) -> bool:
+        """en-US only because the Mac's language — known, not English — can't
+        be transcribed on this Mac: likely the wrong language for its meetings."""
+        return (self.source == "default" and bool(self.mac)
+                and self.mac.split("-")[0].lower() != "en")
+
+    def describe(self) -> str:
+        """Where the language comes from, for status/doctor/stt."""
+        if self.source == "setting":
+            return "chosen with `meeting-capture language`"
+        if self.source == "mac":
+            return "this Mac's language"
+        if self.mac:
+            return f"default — this Mac's language ({self.mac}) can't be transcribed on this Mac"
+        return "default"
+
+
+MAC_PREFS_TTL_S = 600.0       # like the probe: a changed Mac language shows up within 10 minutes
+MAC_PREFS_RETRY_S = 60.0      # an unreadable read (e.g. right at login) is retried sooner
+_mac_prefs_cache: list = []   # [(monotonic time, ttl, value)]
+
+
+def _read_mac_preferences() -> Optional[tuple]:
+    """(AppleLanguages, AppleLocale) from the user's global defaults — the
+    Mac's preferred languages, most preferred first, and its region format,
+    e.g. (("en-IN",), "en_IN"). Read-only. None if it can't be read."""
+    try:
+        r = subprocess.run(["/usr/bin/defaults", "export", "-g", "-"], capture_output=True,
+                           timeout=5, stdin=subprocess.DEVNULL)
+        data = plistlib.loads(r.stdout) if r.returncode == 0 and r.stdout else None
+    except Exception:   # no `defaults` (not macOS), a timeout, an unparsable plist
+        return None
+    if not isinstance(data, dict):
+        return None
+    langs, region = data.get("AppleLanguages"), data.get("AppleLocale")
+    return (tuple(str(x) for x in langs or () if isinstance(x, str)) if isinstance(langs, list) else (),
+            region if isinstance(region, str) else "")
+
+
+def _mac_preferences() -> tuple:
+    """_read_mac_preferences(), cached; ((), "") while it can't be read."""
+    now = time.monotonic()
+    if _mac_prefs_cache and now - _mac_prefs_cache[0][0] < _mac_prefs_cache[0][1]:
+        return _mac_prefs_cache[0][2]
+    got = _read_mac_preferences()
+    value = got if got is not None else ((), "")
+    _mac_prefs_cache[:] = [(now, MAC_PREFS_TTL_S if got is not None else MAC_PREFS_RETRY_S, value)]
+    return value
+
+
+def mac_locale_candidates() -> list[str]:
+    """Locales the Mac's settings point at, best first: its most preferred
+    language (AppleLanguages[0]), then the region format (AppleLocale) when it
+    is the same language — so "en" or "en-GB" with region en_IN also tries
+    en-IN. A region in another language is ignored."""
+    langs, region = _mac_preferences()
+    region = normalize_locale(region.split("@")[0])        # en_IN@rg=inzzzz -> en-IN
+    first = normalize_locale(langs[0]) if langs else ""
+    if not first:
+        return [region] if region else []
+    out = [first]
+    if region and region != first and region.split("-")[0] == first.split("-")[0]:
+        out.append(region)
+    return out
+
+
+def _pick_supported(candidates: list[str], supported: list[str]) -> Optional[str]:
+    """The first candidate the helper supports: exactly (any case), then
+    without a script subtag (zh-Hans-CN -> zh-CN), then a bare language's only
+    region (match_locale)."""
+    by_lower = {s.lower(): s for s in supported}
+    for c in candidates:
+        parts = c.split("-")
+        for want in (c, f"{parts[0]}-{parts[-1]}" if len(parts) == 3 else ""):
+            if want and want.lower() in by_lower:
+                return by_lower[want.lower()]
+    for c in candidates:
+        if "-" not in c:
+            m = match_locale(c, supported)
+            if m:
+                return m
+    return None
+
+
+def locale_choice(env=None, probe: bool = True) -> LocaleChoice:
+    """The on-device language: MEETING_CAPTURE_LOCALE when set; else the
+    Mac's language when the helper supports it (one cached probe for the
+    supported list); else en-US. probe=False never runs the helper (the Mac's
+    language is then only used when it is en-US)."""
     env = os.environ if env is None else env
     v = normalize_locale(env.get(ENV_LOCALE) or "")
-    return v or DEFAULT_LOCALE
+    if v:
+        return LocaleChoice(v, "setting")
+    cands = mac_locale_candidates()
+    if not cands:
+        return LocaleChoice(DEFAULT_LOCALE, "default")
+    mac = cands[0]
+    if mac.lower() == DEFAULT_LOCALE.lower():
+        return LocaleChoice(DEFAULT_LOCALE, "mac", mac)
+    if not probe:
+        return LocaleChoice(DEFAULT_LOCALE, "default", mac)
+    picked = _pick_supported(cands, apple_status(DEFAULT_LOCALE).supported)
+    if picked:
+        return LocaleChoice(picked, "mac", mac)
+    return LocaleChoice(DEFAULT_LOCALE, "default", mac)
+
+
+def stt_locale(env=None) -> str:
+    return locale_choice(env).locale
 
 
 def match_locale(text: str, supported: list[str]) -> Optional[str]:
@@ -480,15 +604,25 @@ def resolve_backend(choice: Optional[str] = None, locale: Optional[str] = None, 
     choice = (choice or stt_choice(env)).strip().lower()
     if choice not in STT_CHOICES:
         choice = DEFAULT_STT
-    locale = normalize_locale(locale) if locale else stt_locale(env)
-    if choice == "gemini":
+    if choice == "gemini":     # never runs the helper
+        locale = normalize_locale(locale) if locale else locale_choice(env, probe=False).locale
         if gemini_key_present(env):
             return Backend("gemini", choice, "chosen with `meeting-capture stt gemini`", locale, True)
         return Backend("gemini", choice, "chosen with `meeting-capture stt gemini`, but no Google API key is set "
                        "(GOOGLE_API_KEY / GEMINI_API_KEY / ~/.config/google/key)", locale, False)
+    lc = LocaleChoice(normalize_locale(locale), "setting") if locale else locale_choice(env)
+    locale = lc.locale
+    if choice == "auto" and lc.guessed and gemini_key_present(env):
+        # On this Mac would be en-US for someone whose Mac speaks another
+        # language: Gemini, which detects the language, is the better guess.
+        return Backend("gemini", choice, f"this Mac's language ({lc.mac}) can't be transcribed on this Mac, "
+                       "so Gemini (it detects the language) transcribes; `meeting-capture language LOCALE` "
+                       "picks an on-device language", locale, True)
     st = apple_status(locale)
     if st.usable:
-        return Backend("apple", choice, st.reason, st.locale or locale, True)
+        note = (f"; this Mac's language ({lc.mac}) isn't available on-device — "
+                "`meeting-capture language LOCALE` to change") if lc.guessed else ""
+        return Backend("apple", choice, st.reason + note, st.locale or locale, True)
     if choice == "apple":
         return Backend("apple", choice, st.reason, locale, False)
     if gemini_key_present(env):
@@ -497,17 +631,42 @@ def resolve_backend(choice: Optional[str] = None, locale: Optional[str] = None, 
                    locale, False)
 
 
+def upgrade_notice(env=None, backend: Optional[Backend] = None) -> Optional[str]:
+    """A note for someone with a Gemini key whose transcription now runs on
+    this Mac without anyone having picked that: MEETING_CAPTURE_STT unset (the
+    default for every install that predates on-device transcription; `stt`,
+    `language` and the settings page always write it), a key present, and auto
+    resolving to on this Mac. Shown until they pick an engine or a language."""
+    env = os.environ if env is None else env
+    if (env.get(ENV_STT) or "").strip() or not gemini_key_present(env):
+        return None
+    b = backend if backend is not None else resolve_backend(None, None, env)
+    if b.engine != "apple" or not b.ready:
+        return None
+    lc = locale_choice(env)
+    lang = b.locale + (" — this Mac's language" if lc.source == "mac" and lc.locale == b.locale else "")
+    return (f"transcription now runs on this Mac (on-device, {lang}) instead of Gemini; custom "
+            f"vocabulary and speaker labels are Gemini-only")
+
+
+# How to act on upgrade_notice() from a terminal (the settings page has its own).
+NOTICE_CLI_HINT = ("meetings in another language: `meeting-capture language LOCALE`; back to Gemini: "
+                   "`meeting-capture stt gemini`; keep this and hide the note: `meeting-capture stt auto`")
+
+
 def engine_summary(env=None) -> dict:
     """Everything the CLI and the settings page show about transcription, for
     the configuration in `env` (the launchd plist's, normally)."""
-    choice, locale = stt_choice(env), stt_locale(env)
+    choice, lc = stt_choice(env), locale_choice(env)
+    locale = lc.locale
     st = apple_status(locale)
-    b = resolve_backend(choice, locale, env)
+    b = resolve_backend(choice, None, env)
     return {
         "choice": choice, "choice_label": CHOICE_LABELS[choice],
         "engine": b.engine, "engine_label": b.label, "reason": b.reason, "ready": b.ready,
-        "locale": locale, "apple": st.as_dict(), "gemini_key": gemini_key_present(env),
-        "uploads": b.engine == "gemini",
+        "locale": locale, "locale_source": lc.source, "locale_why": lc.describe(),
+        "mac_language": lc.mac, "apple": st.as_dict(), "gemini_key": gemini_key_present(env),
+        "uploads": b.engine == "gemini", "notice": upgrade_notice(env, b),
     }
 
 

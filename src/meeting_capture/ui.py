@@ -465,6 +465,8 @@ button:focus-visible,select:focus-visible,.choice:focus-within{outline:2px solid
 .tag.cloud{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 45%,transparent)}
 .tag.off{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 45%,transparent)}
 .msg.err{color:var(--bad)} .msg.ok{color:var(--ok)}
+.notice{border-left:3px solid var(--warn);padding:6px 10px;margin:0 0 12px;font-size:.9rem}
+.notice:empty{display:none}
 pre{margin:0;font-family:var(--mono);font-size:.82rem;white-space:pre-wrap;line-height:1.55;max-height:260px;overflow:auto}
 .me{color:var(--me)} .them{color:var(--them)}
 .muted{color:var(--muted)}
@@ -511,6 +513,7 @@ pre{margin:0;font-family:var(--mono);font-size:.82rem;white-space:pre-wrap;line-
 
 <section id="sttbox">
   <h2>Transcription</h2>
+  <p class="notice" id="sttnotice" role="note"></p>
   <p class="now" id="sttnow"></p>
   <div class="choices">
     <label class="choice"><input type="radio" name="stt" value="apple" id="stt-apple">
@@ -614,6 +617,9 @@ function renderStt(first){
   const engine = t.engine === "apple" ? "On this Mac" + (t.ready ? " (" + langName(t.locale) + ")" : "")
                : t.engine === "gemini" ? "Gemini" : "Nothing yet";
   $("sttnow").innerHTML = `<span>Now: <b>${esc(engine)}</b></span>${tag}<span class="muted">${esc(t.reason)}</span>`;
+  // Saving here picks an engine, which also clears this note.
+  $("sttnotice").textContent = t.notice ? "Note: " + t.notice + ". If your meetings are in another "
+    + "language, pick it below; choose Gemini to go back. Saving these settings hides this note." : "";
   $("stt-apple").disabled = !a.available;
   $("stt-apple-note").textContent = a.available
     ? "Apple's on-device speech recognition. Audio never leaves this Mac; no account or key."
@@ -636,6 +642,7 @@ function renderStt(first){
 function sttHint(){
   const t = S.transcription, a = (t && t.apple) || {};
   const loc = $("locale").value, bits = [];
+  if (loc && loc === t.locale && t.locale_why) bits.push(`Language: ${langName(loc)} (${t.locale_why}).`);
   if (a.available && loc && !(a.installed_locales || []).includes(loc))
     bits.push(`Saving downloads the speech model for ${langName(loc)} from Apple once (English ≈ 140 MB; the shared Indian-languages model ≈ 250 MB).`);
   if (isIndic(loc)) bits.push("Indian languages come out romanized (Latin script); mixed Hindi and English (“Hinglish”) lands in one transcript.");

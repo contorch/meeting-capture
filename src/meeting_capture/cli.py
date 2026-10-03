@@ -114,6 +114,9 @@ def cmd_status(_args) -> int:
     print(f"  mode:             {_mode_line()} ({'launchd plist' if LAUNCHD_PLIST.exists() else 'default'})")
     s = transcription_summary()
     print(f"  transcription:    {_engine_line(s)}")
+    print(f"  language:         {s['locale']} ({s['locale_why']})")
+    if s.get("notice"):
+        print(f"  note:             {_notice(s)}")
     key_needed = s["engine"] == "gemini" or _plist_mode() == "live"
     print(f"  gemini key:       {'set' if s['gemini_key'] else 'not set'}"
           f"{'' if key_needed else ' (optional)'}")
@@ -127,6 +130,8 @@ def _parked_line() -> str:
     from .daemon import parked_counts
     c = parked_counts()
     bits = []
+    if c["queued"]:
+        bits.append(f"{c['queued']} chunk(s) in the transcription queue")
     if c["parked"]:
         bits.append(f"{c['parked']} chunk(s) waiting to be transcribed")
     if c["quarantined"]:
@@ -280,7 +285,10 @@ def cmd_doctor(_args) -> int:
         _fail(f"no transcription engine can run ({s['reason']})",
               "on macOS 26+ / Apple silicon: `meeting-capture language en-US` installs the on-device "
               "model; otherwise add a Gemini key (~/.config/google/key). Audio is kept until then.")
-    print(f"  · setting: {s['choice']} (`meeting-capture stt`), language: {s['locale']} (`meeting-capture language`)")
+    print(f"  · setting: {s['choice']} (`meeting-capture stt`), language: {s['locale']} "
+          f"({s['locale_why']}; `meeting-capture language`)")
+    if s.get("notice"):
+        print(f"  ! {_notice(s)}")
     if apple["usable"]:
         _ok("on-device model", f"{apple['locale']} installed")
     elif apple["installable"]:
@@ -733,6 +741,11 @@ ENGINE_DESCRIPTIONS = {
 }
 
 
+def _notice(s: dict) -> str:
+    from .transcriber import NOTICE_CLI_HINT
+    return f"{s['notice']}. {NOTICE_CLI_HINT[0].upper()}{NOTICE_CLI_HINT[1:]}."
+
+
 def _engine_line(s: dict) -> str:
     if s["engine"] == "apple" and s["ready"]:
         head = f"on this Mac ({s['locale']})"
@@ -761,7 +774,7 @@ def apply_transcription(stt: str | None = None, locale: str | None = None, progr
     the plist is touched; raises RuntimeError with a user-facing message.
     Shared by `stt`, `language` and the settings page."""
     from .transcriber import (
-        CHOICE_LABELS, DEFAULT_LOCALE, DEFAULT_STT, ENV_LEGACY_TRANSCRIBER, ENV_LOCALE, ENV_STT,
+        CHOICE_LABELS, ENV_LEGACY_TRANSCRIBER, ENV_LOCALE, ENV_STT,
         STT_CHOICES, AppleError, TranscriptionUnavailable, apple_status, install_apple_model,
         match_locale, stt_choice, stt_locale,
     )
@@ -803,17 +816,13 @@ def apply_transcription(stt: str | None = None, locale: str | None = None, progr
                     raise RuntimeError(str(exc)) from exc
                 notes.append(f"couldn't install the on-device model ({exc})")
 
-    sets: dict = {}
-    removes = [ENV_LEGACY_TRANSCRIBER]
-    if new_stt == DEFAULT_STT:
-        removes.append(ENV_STT)
-    else:
-        sets[ENV_STT] = new_stt
-    if new_locale == DEFAULT_LOCALE:
-        removes.append(ENV_LOCALE)
-    else:
+    # Always written, auto included: an unset MEETING_CAPTURE_STT means nobody
+    # has picked an engine yet (transcriber.upgrade_notice). A language is
+    # written only when one is chosen — unset, it follows the Mac's language.
+    sets: dict = {ENV_STT: new_stt}
+    if locale is not None:
         sets[ENV_LOCALE] = new_locale
-    _update_plist_env(sets, remove=tuple(removes))
+    _update_plist_env(sets, remove=(ENV_LEGACY_TRANSCRIBER,))
     _relaunch()
 
     s = transcription_summary()
@@ -843,7 +852,8 @@ def cmd_stt(args) -> int:
         print(f"engine:    {ENGINE_DESCRIPTIONS[s['engine']]}{'' if s['ready'] else ' (not ready)'}")
         print(f"why:       {s['reason']}")
         print(f"setting:   {s['choice']}   (meeting-capture stt auto|apple|gemini)")
-        print(f"language:  {s['locale']}   (meeting-capture language LOCALE; on this Mac only)")
+        print(f"language:  {s['locale']}   ({s['locale_why']}; meeting-capture language LOCALE; "
+              "on this Mac only)")
         key = "set" if s["gemini_key"] else "not set"
         live = _plist_mode() == "live"
         print(f"gemini:    API key {key}"
@@ -853,6 +863,8 @@ def cmd_stt(args) -> int:
             print(f"live mode: requested, but {why} — running batch" if why else
                   "live mode: on — calls stream to Gemini (uploaded); the engine above only "
                   "transcribes parked audio")
+        if s.get("notice"):
+            print(f"note:      {_notice(s)}")
         return 0
     if not LAUNCHD_PLIST.exists():
         print("no launchd agent installed — run `meeting-capture install` first", file=sys.stderr)
@@ -878,6 +890,7 @@ def cmd_language(args) -> int:
         else:
             state = f"on-device transcription unavailable: {apple['reason']}"
         print(f"language:  {s['locale']} ({state})")
+        print(f"from:      {s['locale_why']}")
         if apple["supported"]:
             print(f"supported: {', '.join(apple['supported'])}")
         if apple["installed_locales"]:

@@ -361,7 +361,7 @@ def test_a_bad_file_is_quarantined_after_three_attempts_and_never_blocks_the_res
     assert quarantined.exists() and not bad.exists()
     assert daemon._read_meta(quarantined)["attempts"] == 3
     assert daemon.parked_chunks() == []
-    assert daemon.parked_counts() == {"parked": 0, "quarantined": 1}
+    assert daemon.parked_counts() == {"queued": 0, "parked": 0, "quarantined": 1}
 
 
 def test_an_unclassified_error_on_one_file_cannot_hold_up_the_rest(dirs, monkeypatch):
@@ -719,3 +719,249 @@ def test_worker_never_downloads_a_model_when_gemini_is_chosen(fake_helper, monke
     monkeypatch.setenv("MEETING_CAPTURE_STT", "gemini")
     daemon.TranscriptionWorker()._maybe_install_model()
     assert not any("--install" in c for c in fake_helper.calls())
+
+
+# ---- a restart mid-chunk (launchd SIGTERM: stt, language, mode, settings, upgrade) -------
+
+def test_every_queued_chunk_carries_a_note_naming_its_meeting(dirs):
+    audio, _ = dirs
+    w = daemon.TranscriptionWorker()         # never started: stays queued
+    c = _chunk(audio, 1714003200)
+    w.submit(c, "meeting-a")
+    assert daemon._read_meta(c.path) == {"meeting_id": "meeting-a", "attempts": 0}
+
+
+def test_the_chunk_in_hand_at_stop_goes_back_into_its_own_meeting(dirs, monkeypatch):
+    """SIGTERM while a chunk is being transcribed: it can't finish in time.
+    It used to be left without a note and came back as a one-chunk meeting of
+    its own; now it keeps its meeting, and status counts it meanwhile."""
+    import threading
+    audio, failed = dirs
+    in_hand, release = threading.Event(), threading.Event()
+    first, mid, last = (_chunk(audio, 1714003200 + i * 20) for i in range(3))
+
+    def dying(path, role):
+        if path.name == mid.path.name:
+            in_hand.set()
+            release.wait(10)            # the process would be gone by now
+            raise RuntimeError("the old process's last gasp")
+        return "FIRST"
+
+    monkeypatch.setattr(daemon, "transcribe", dying)
+    w = daemon.TranscriptionWorker()
+    w._next_check = float("inf")
+    w.start()
+    for c in (first, mid, last):
+        w.submit(c, "meeting-a")
+    assert in_hand.wait(5)
+    w.stop(timeout=0.2)
+    assert mid.path.exists() and daemon._read_meta(mid.path)["meeting_id"] == "meeting-a"
+    assert daemon._read_meta(failed / last.path.name)["meeting_id"] == "meeting-a"
+    assert daemon.parked_counts() == {"queued": 1, "parked": 1, "quarantined": 0}
+
+    # The next start: nothing is in flight in a fresh process.
+    texts = {mid.path.name: "SECOND", last.path.name: "THIRD"}
+    monkeypatch.setattr(daemon, "transcribe", lambda path, role: texts[path.name])
+    assert daemon.adopt_at_start(other_daemon=False) == 1
+    assert not list(audio.glob("chunk-*"))                        # the note moved with the audio
+    assert daemon.retry_failed_chunks() == 2
+    body = _body("meeting-a")
+    assert body.index("FIRST") < body.index("SECOND") < body.index("THIRD")
+    assert [r["meeting_id"] for r in store.recent(10)] == ["meeting-a"]   # no phantom meeting
+    assert list(failed.iterdir()) == []
+    release.set()
+    w._thread.join(5)
+
+
+def test_stop_lets_the_chunk_in_hand_finish(dirs, monkeypatch):
+    import inspect, threading, time
+    audio, _ = dirs
+    started = threading.Event()
+
+    def slow(path, role):
+        started.set()
+        time.sleep(0.3)
+        return "finished"
+
+    monkeypatch.setattr(daemon, "transcribe", slow)
+    w = daemon.TranscriptionWorker()
+    w._next_check = float("inf")
+    w.start()
+    c = _chunk(audio, 1714003200)
+    w.submit(c, "meeting-a")
+    assert started.wait(5)
+    w.stop()
+    assert "finished" in _body("meeting-a")
+    assert not list(audio.glob("chunk-*"))
+    # The default leaves launchd's 20 s ExitTimeOut room for sysaudio's own 5 s.
+    assert inspect.signature(daemon.TranscriptionWorker.stop).parameters["timeout"].default is None
+    assert 5.0 <= daemon.STOP_GRACE_S <= 12.0
+
+
+def test_adopt_at_start_takes_even_fresh_orphans_unless_another_daemon_runs(dirs):
+    audio, failed = dirs
+    c = _chunk(audio, 1714003200)                                # written a moment ago
+    daemon._write_meta(c.path, {"meeting_id": "meeting-a", "attempts": 0})
+    assert daemon.adopt_at_start(other_daemon=True) == 0          # may be the other one's queue
+    assert c.path.exists()
+    assert daemon.adopt_at_start(other_daemon=False) == 1
+    assert daemon._read_meta(failed / c.path.name)["meeting_id"] == "meeting-a"
+    assert not list(audio.glob("chunk-*"))
+
+
+def test_a_note_without_its_audio_is_cleaned_up(dirs):
+    import os, time
+    audio, _ = dirs
+    note = audio / "chunk-1714003200-them.json"
+    note.write_text('{"meeting_id": "meeting-a"}')
+    os.utime(note, (time.time() - 3600,) * 2)
+    daemon.adopt_orphans()
+    assert not note.exists()
+
+
+def test_another_daemon_running(tmp_path, monkeypatch):
+    import os, subprocess, sys
+    pid_file = tmp_path / "daemon.pid"
+    monkeypatch.setattr(daemon, "PID_FILE", pid_file)
+    assert daemon._another_daemon_running() is False             # no pid file
+    pid_file.write_text(str(os.getpid()))
+    assert daemon._another_daemon_running() is False             # ourselves
+    pid_file.write_text("garbage")
+    assert daemon._another_daemon_running() is False
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    pid_file.write_text(str(dead.pid))
+    assert daemon._another_daemon_running() is False
+    pid_file.write_text(str(os.getppid()))
+    assert daemon._another_daemon_running() is True
+    daemon._clear_pid()                                          # not ours: left alone
+    assert pid_file.read_text() == str(os.getppid())
+    pid_file.write_text(str(os.getpid()))
+    daemon._clear_pid()
+    assert not pid_file.exists()
+
+
+DAEMON_RUN = r'''
+import sys, time, wave
+from meeting_capture import daemon
+from meeting_capture.recorder import Chunk
+
+starts = [int(x) for x in sys.argv[1].split(",") if x]
+daemon.STOP_GRACE_S = float(sys.argv[2])
+
+def fake_stream(out_dir, should_record):
+    for ts in starts:
+        p = out_dir / f"chunk-{ts}-them.wav"
+        with wave.open(str(p), "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+            w.writeframes(b"\x00\x00" * 16000)
+        yield Chunk(path=p, started_at=float(ts), duration_seconds=1.0, role="them")
+    while True:                     # the call goes on
+        time.sleep(0.05)
+
+# No capture of any kind: chunks come from fake_stream; the mic gate is faked.
+daemon.stream_chunks = fake_stream
+daemon.is_mic_active = lambda: True
+daemon.default_devices_snapshot = lambda: {}
+daemon.mic_name = lambda: "test mic"
+daemon.mic_capture_enabled = lambda: False
+daemon.check_and_maybe_exit = lambda: None
+daemon.run()
+'''
+
+
+def test_sigterm_mid_chunk_then_restart_keeps_every_chunk_in_its_meeting(tmp_path, fake_helper):
+    """The real daemon.run(), the real SIGTERM path, the contract-following
+    fake helper: chunk 2 is being transcribed (slowly) and chunk 3 is queued
+    when launchd stops the daemon; the next run puts both into meeting 1."""
+    import json, os, signal, subprocess, sys, time
+    home = tmp_path / "home"
+    home.mkdir()
+    script = tmp_path / "run_daemon.py"
+    script.write_text(DAEMON_RUN)
+    t0 = 1714003200
+    names = [f"chunk-{t0 + i * 15}-them.wav" for i in range(3)]
+    fake_helper.configure(texts=dict(zip(names, ["FIRST", "SECOND-inflight", "THIRD-queued"])),
+                          sleeps={names[1]: 6})
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MEETING_CAPTURE_")}
+    env.update(HOME=str(home), CO_DB_PATH=str(tmp_path / "context.db"),
+               MEETING_CAPTURE_TRANSCRIBE_BIN=str(fake_helper.path), MEETING_CAPTURE_LOCALE="en-US",
+               MEETING_CAPTURE_STT="apple", MEETING_CAPTURE_MIC="0")
+    audio = home / ".meeting-capture" / "audio"
+    failed = audio / "failed"
+    db = tmp_path / "context.db"
+
+    def rows():
+        if not db.exists():
+            return {}
+        return {r["meeting_id"]: r["body"] for r in store.recent(10, path=db)}
+
+    def transcribing(name):
+        return any(c[-1].endswith(name) for c in fake_helper.transcribe_calls())
+
+    def run(starts, grace, log):
+        with open(log, "w") as err:
+            return subprocess.Popen([sys.executable, str(script), ",".join(map(str, starts)), str(grace)],
+                                    env=env, stderr=err, stdout=subprocess.DEVNULL)
+
+    first = run([t0, t0 + 15, t0 + 30], 0.5, tmp_path / "run1.log")
+    try:
+        _wait(lambda: transcribing(names[1]) and (audio / names[2]).exists(), timeout=20)
+        first.send_signal(signal.SIGTERM)
+        assert first.wait(10) == 0
+    finally:
+        first.kill()
+    log1 = (tmp_path / "run1.log").read_text()
+    assert "received signal" in log1 and "stopping mid-transcription" in log1, log1
+    assert json.loads((audio / names[1].replace(".wav", ".json")).read_text())["meeting_id"].startswith("meeting-")
+
+    fake_helper.configure(sleeps={})
+    second = run([], 0.5, tmp_path / "run2.log")
+    try:
+        _wait(lambda: not list(failed.glob("chunk-*.wav")) and not list(audio.glob("chunk-*.wav"))
+              and len(fake_helper.transcribe_calls()) >= 4, timeout=20)
+        second.send_signal(signal.SIGTERM)
+        second.wait(10)
+    finally:
+        second.kill()
+    got = rows()
+    assert len(got) == 1, (got, (tmp_path / "run2.log").read_text())
+    body = next(iter(got.values()))
+    assert body.index("FIRST") < body.index("SECOND-inflight") < body.index("THIRD-queued")
+
+
+def test_the_daemon_logs_the_upgrade_note_once(fake_helper, gemini_key, monkeypatch, caplog):
+    monkeypatch.setattr(daemon, "_notice_logged", False)
+    with caplog.at_level("INFO", logger="meeting-capture"):
+        daemon._log_engine()
+        daemon._log_upgrade_notice()
+    notes = [l for l in _lines(caplog) if "NOTE:" in l]
+    assert len(notes) == 1
+    assert notes[0].startswith("WARNING NOTE: transcription now runs on this Mac (on-device, en-US) instead of "
+                               "Gemini") and "`meeting-capture stt gemini`" in notes[0]
+    monkeypatch.setattr(daemon, "_notice_logged", False)
+    monkeypatch.setenv("MEETING_CAPTURE_STT", "auto")
+    caplog.clear()
+    with caplog.at_level("INFO", logger="meeting-capture"):
+        daemon._log_engine()
+    assert not any("NOTE:" in l for l in _lines(caplog))
+
+
+def test_no_english_model_download_when_auto_keeps_gemini_for_the_macs_language(fake_helper, gemini_key,
+                                                                                monkeypatch):
+    from meeting_capture import transcriber
+    monkeypatch.setattr(transcriber, "_mac_preferences", lambda: (("pl-PL",), "pl_PL"))
+    fake_helper.configure(installed=[])
+    w = daemon.TranscriptionWorker()
+    w._maybe_install_model()
+    assert not any("--install" in c for c in fake_helper.calls())
+
+
+def test_a_note_survives_parking_straight_from_the_queue(dirs):
+    audio, failed = dirs
+    w = daemon.TranscriptionWorker(maxsize=1)                  # never started
+    a, b = _chunk(audio, 1714003200), _chunk(audio, 1714003210)
+    assert w.submit(a, "meeting-a") is True
+    assert w.submit(b, "meeting-b") is False                   # full: parked at once
+    assert daemon._read_meta(failed / b.path.name)["meeting_id"] == "meeting-b"
+    assert not (audio / b.path.with_suffix(".json").name).exists()

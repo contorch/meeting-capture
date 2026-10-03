@@ -43,7 +43,7 @@ if "--install" in args:
     out({"installed": rc == 0, "locale": locale, "seconds": 0.1})
     sys.exit(rc)
 path = args[-1]
-time.sleep(cfg.get("sleep", 0))
+time.sleep(cfg.get("sleeps", {}).get(os.path.basename(path), cfg.get("sleep", 0)))
 if cfg.get("signal"):                      # the helper crashes
     os.kill(os.getpid(), cfg["signal"])
 rc = cfg.get("transcribe_rc", {}).get(os.path.basename(path), cfg.get("default_rc", 0))
@@ -128,6 +128,8 @@ def _isolated_transcription(tmp_path, monkeypatch):
                 "GOOGLE_API_KEY", "GEMINI_API_KEY", "MEETING_CAPTURE_MODE"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(transcriber, "GEMINI_KEY_FILE", tmp_path / "no-gemini-key")
+    # Nor the developer's Mac language (it picks the default on-device locale).
+    monkeypatch.setattr(transcriber, "_mac_preferences", lambda: ((), ""))
     monkeypatch.setattr(cli, "LAUNCHD_PLIST", tmp_path / "no-agent.plist")
     monkeypatch.setattr(recorder, "LAUNCHD_PLIST", tmp_path / "no-agent.plist")
     monkeypatch.setattr(cli, "_relaunch", lambda: pytest.fail("a test tried to restart the real launchd agent"))

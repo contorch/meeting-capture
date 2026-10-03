@@ -10,6 +10,8 @@ import pytest
 
 from meeting_capture import transcriber as t
 
+_real_mac_preferences = t._mac_preferences          # conftest stubs it out for every test
+
 
 def _wav(path: Path, seconds: float = 1.0, rate: int = 16000) -> Path:
     with wave.open(str(path), "wb") as w:
@@ -343,3 +345,158 @@ def test_a_key_in_the_daemon_env_counts(fake_helper):
     assert t.engine_summary(env)["gemini_key"] is True
     assert t.resolve_backend(env=env).ready
     assert t.engine_summary({})["gemini_key"] is False
+
+
+# --- the default language follows the Mac; an upgrader from Gemini is told -----------------
+
+@pytest.fixture
+def mac(monkeypatch):
+    """Set this Mac's language settings: mac("es-ES", region="es_ES")."""
+    def _set(*langs, region=""):
+        monkeypatch.setattr(t, "_mac_preferences", lambda: (tuple(langs), region))
+    return _set
+
+
+class TestMacLanguage:
+    def test_reads_apple_languages_and_locale(self, monkeypatch):
+        import plistlib, subprocess
+        xml = plistlib.dumps({"AppleLanguages": ["hi-IN", "en-IN"], "AppleLocale": "en_IN@rg=inzzzz",
+                              "Other": 1})
+        seen = []
+
+        def fake_run(cmd, **kw):
+            seen.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, xml, b"")
+        monkeypatch.setattr(t.subprocess, "run", fake_run)
+        assert t._read_mac_preferences() == (("hi-IN", "en-IN"), "en_IN@rg=inzzzz")
+        assert seen == [["/usr/bin/defaults", "export", "-g", "-"]]          # read-only
+
+    def test_unreadable_defaults_mean_unknown(self, monkeypatch):
+        def boom(cmd, **kw):
+            raise FileNotFoundError("defaults")
+        monkeypatch.setattr(t.subprocess, "run", boom)
+        assert t._read_mac_preferences() is None
+
+    def test_cached_but_a_failed_read_is_retried_sooner(self, monkeypatch):
+        monkeypatch.setattr(t, "_mac_preferences", _real_mac_preferences)
+        reads, clock = [], [1000.0]
+        monkeypatch.setattr(t, "_mac_prefs_cache", [])
+        monkeypatch.setattr(t.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(t, "_read_mac_preferences", lambda: reads.append(1) or (None if len(reads) == 1
+                                                                                   else (("es-ES",), "")))
+        assert t._mac_preferences() == ((), "")            # unreadable at login
+        clock[0] += t.MAC_PREFS_RETRY_S + 1
+        assert t._mac_preferences() == (("es-ES",), "")
+        clock[0] += t.MAC_PREFS_TTL_S - 1
+        assert t._mac_preferences() == (("es-ES",), "") and len(reads) == 2
+
+    @pytest.mark.parametrize("langs, region, want", [
+        (("es-ES",), "es_ES", ["es-ES"]),
+        (("en",), "en_IN@rg=inzzzz", ["en", "en-IN"]),        # a bare language takes the region's country
+        (("en-GB",), "en_IN", ["en-GB", "en-IN"]),
+        (("en-US",), "hi_IN", ["en-US"]),                      # another language's region: not a candidate
+        ((), "fr_FR", ["fr-FR"]),
+        ((), "", []),
+    ])
+    def test_candidates(self, mac, langs, region, want):
+        mac(*langs, region=region)
+        assert t.mac_locale_candidates() == want
+
+
+class TestDefaultLocale:
+    def test_unknown_mac_language_is_en_us(self, fake_helper):
+        assert t.locale_choice({}) == t.LocaleChoice("en-US", "default")
+
+    def test_a_supported_mac_language_is_the_default(self, fake_helper, mac):
+        mac("es-ES", region="es_ES")
+        assert t.locale_choice({}) == t.LocaleChoice("es-ES", "mac", "es-ES")
+        assert t.stt_locale({}) == "es-ES"
+
+    def test_bare_english_takes_the_region(self, fake_helper, mac):
+        mac("en", region="en_IN")
+        assert t.stt_locale({}) == "en-IN"
+
+    def test_a_script_subtag_is_dropped(self, fake_helper, mac):
+        fake_helper.configure(supported=["en-US", "zh-CN"])
+        mac("zh-Hans-CN", region="zh_CN")
+        assert t.stt_locale({}) == "zh-CN"
+
+    def test_the_setting_wins(self, fake_helper, mac):
+        mac("es-ES")
+        assert t.locale_choice({t.ENV_LOCALE: "fr_fr"}) == t.LocaleChoice("fr-FR", "setting")
+        assert fake_helper.calls() == []
+
+    def test_an_unsupported_mac_language_falls_back_and_says_so(self, fake_helper, mac):
+        mac("pl-PL", region="pl_PL")
+        lc = t.locale_choice({})
+        assert lc == t.LocaleChoice("en-US", "default", "pl-PL") and lc.guessed
+        assert "pl-PL" in lc.describe()
+
+    def test_an_unsupported_english_variant_is_not_a_guess(self, fake_helper, mac):
+        mac("en-NZ", region="en_NZ")
+        lc = t.locale_choice({})
+        assert lc.locale == "en-US" and not lc.guessed
+
+    def test_without_on_device_support_it_is_en_us(self, fake_helper, mac):
+        fake_helper.configure(old=True)
+        mac("es-ES")
+        assert t.locale_choice({}).locale == "en-US"
+
+    def test_gemini_never_runs_the_helper_for_the_language(self, fake_helper, mac, gemini_key):
+        mac("es-ES")
+        b = t.resolve_backend(env={t.ENV_STT: "gemini", "GOOGLE_API_KEY": "k"})
+        assert (b.engine, b.ready) == ("gemini", True) and fake_helper.calls() == []
+
+
+UPGRADER = {"MEETING_CAPTURE_TRANSCRIBER": "gemini", "GOOGLE_API_KEY": "k"}   # a pre-on-device plist
+
+
+class TestUpgradeFromGemini:
+    def test_a_spanish_mac_transcribes_in_spanish(self, fake_helper, mac):
+        """The review's case: a Gemini user on a Spanish Mac is no longer
+        switched to the en-US model. Until es-ES is on the Mac, Gemini keeps
+        going; once it is (the daemon downloads it), on this Mac in Spanish."""
+        mac("es-ES", region="es_ES")
+        s = t.engine_summary(dict(UPGRADER))
+        assert (s["engine"], s["locale"], s["locale_source"]) == ("gemini", "es-ES", "mac")
+        assert s["notice"] is None
+        fake_helper.configure(installed=["en-US", "es-ES"])
+        s = t.engine_summary(dict(UPGRADER))
+        assert (s["engine"], s["locale"], s["ready"]) == ("apple", "es-ES", True)
+        assert "on-device, es-ES — this Mac's language) instead of Gemini" in s["notice"]
+
+    def test_a_mac_language_on_device_cannot_do_keeps_gemini(self, fake_helper, mac):
+        mac("pl-PL", region="pl_PL")
+        b = t.resolve_backend(env=dict(UPGRADER))
+        assert (b.engine, b.ready) == ("gemini", True) and "pl-PL" in b.reason
+        assert t.upgrade_notice(dict(UPGRADER)) is None
+
+    def test_without_a_key_that_mac_still_transcribes_here_and_says_why(self, fake_helper, mac):
+        mac("pl-PL", region="pl_PL")
+        b = t.resolve_backend(env={})
+        assert (b.engine, b.locale, b.ready) == ("apple", "en-US", True)
+        assert "pl-PL" in b.reason and "meeting-capture language" in b.reason
+
+    def test_on_device_only_stays_on_device(self, fake_helper, mac, gemini_key):
+        mac("pl-PL")
+        b = t.resolve_backend(env={t.ENV_STT: "apple", "GOOGLE_API_KEY": "k"})
+        assert (b.engine, b.locale) == ("apple", "en-US")
+
+    def test_an_english_mac_gets_the_notice(self, fake_helper):
+        s = t.engine_summary(dict(UPGRADER))
+        assert s["engine"] == "apple" and s["notice"].startswith(
+            "transcription now runs on this Mac (on-device, en-US) instead of Gemini")
+        assert "vocabulary" in s["notice"]
+
+    @pytest.mark.parametrize("env", [
+        {"MEETING_CAPTURE_TRANSCRIBER": "gemini"},                         # no key: never used Gemini
+        dict(UPGRADER, MEETING_CAPTURE_STT="auto"),                       # picked auto
+        dict(UPGRADER, MEETING_CAPTURE_STT="apple"),                      # picked on this Mac
+        dict(UPGRADER, MEETING_CAPTURE_STT="gemini"),                     # picked Gemini
+    ])
+    def test_no_notice_once_an_engine_is_picked_or_without_a_key(self, fake_helper, env):
+        assert t.engine_summary(env)["notice"] is None
+
+    def test_no_notice_while_gemini_still_transcribes(self, fake_helper):
+        fake_helper.configure(installed=[])
+        assert t.engine_summary(dict(UPGRADER))["notice"] is None

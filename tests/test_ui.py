@@ -225,13 +225,23 @@ def test_state_carries_the_transcription_settings(fake_helper, monkeypatch, tmp_
     assert (t["engine"], t["choice"], t["locale"], t["ready"]) == ("apple", "auto", "en-US", True)
     assert "hi-IN" in t["apple"]["supported"] and "en-US" in t["apple"]["installed_locales"]
     assert t["gemini_key"] is False and t["uploads"] is False
+    assert t["notice"] is None and t["locale_why"] == "default"
+
+
+def test_state_carries_the_upgrade_note(fake_helper, gemini_key, monkeypatch, tmp_path):
+    from meeting_capture import cli, linein
+    monkeypatch.setattr(linein, "_import_sounddevice", lambda: FakeSD())
+    monkeypatch.setattr(cli, "LAUNCHD_PLIST", tmp_path / "none.plist")
+    t = ui.state()["transcription"]
+    assert t["engine"] == "apple" and "instead of Gemini" in t["notice"]
 
 
 def test_page_has_the_transcription_section(server):
     base, *_ = server
     _, body = call(base + "/?t=tok", token="")
     for needle in (b"Transcription", b'value="apple"', b'value="gemini"', b'value="auto"',
-                   b"On this Mac", b"Automatic", b'id="locale"', b"/api/transcription", b"romanized"):
+                   b"On this Mac", b"Automatic", b'id="locale"', b"/api/transcription", b"romanized",
+                   b'id="sttnotice"', b"t.notice"):
         assert needle in body
 
 

@@ -336,7 +336,7 @@ def test_stt_apple_refused_where_it_cannot_run(fake_helper, agent, capsys):
     assert "needs macOS 26" in capsys.readouterr().err
 
 
-def test_stt_gemini_warns_without_a_key_and_auto_removes_the_key(fake_helper, agent, capsys):
+def test_stt_gemini_warns_without_a_key_and_auto_is_written_too(fake_helper, agent, capsys):
     plist, calls = agent
     assert cli.main(["stt", "gemini"]) == 0
     out = capsys.readouterr().out
@@ -344,7 +344,8 @@ def test_stt_gemini_warns_without_a_key_and_auto_removes_the_key(fake_helper, ag
     assert "no Google API key is set" in out
     assert not any("--install" in c for c in fake_helper.calls())
     assert cli.main(["stt", "auto"]) == 0
-    assert "MEETING_CAPTURE_STT" not in _read_env(plist)
+    # Written, not removed: unset means nobody picked an engine (upgrade_notice).
+    assert _read_env(plist)["MEETING_CAPTURE_STT"] == "auto"
     assert calls == ["relaunch", "relaunch"]
 
 
@@ -363,12 +364,13 @@ def test_language_installs_then_switches(fake_helper, agent, capsys):
     assert "romanized" in out and "hi-IN" in out
 
 
-def test_language_bare_code_and_back_to_default(fake_helper, agent):
+def test_language_bare_code_and_back_to_english(fake_helper, agent):
     plist, _ = agent
     assert cli.main(["language", "hi"]) == 0
     assert _read_env(plist)["MEETING_CAPTURE_LOCALE"] == "hi-IN"
+    # A chosen en-US is kept: unset would follow the Mac's language instead.
     assert cli.main(["language", "en-US"]) == 0
-    assert "MEETING_CAPTURE_LOCALE" not in _read_env(plist)
+    assert _read_env(plist)["MEETING_CAPTURE_LOCALE"] == "en-US"
 
 
 def test_language_bad_input_lists_the_supported_ones(fake_helper, agent, capsys):
@@ -461,6 +463,7 @@ def _quiet_system(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "PAUSE_FILE", tmp_path / "paused")
     monkeypatch.setattr(cli, "PID_FILE", tmp_path / "daemon.pid")
     monkeypatch.setattr(daemon, "FAILED_AUDIO_DIR", tmp_path / "failed")
+    monkeypatch.setattr(daemon, "AUDIO_DIR", tmp_path / "audio")
     real_run = subprocess.run
 
     def run(cmd, *a, **k):
@@ -536,3 +539,66 @@ def test_vocab_says_it_is_for_gemini_only(fake_helper, agent, tmp_path, monkeypa
     assert cli.main(["vocab"]) == 0
     out = capsys.readouterr().out
     assert "Gemini transcription only" in out and "runs on this Mac" in out
+
+
+# ---- upgrading from Gemini: say so, until an engine is picked ------------------------------
+
+def test_an_upgrader_with_a_gemini_key_is_told_until_they_pick(fake_helper, agent, gemini_key,
+                                                                  monkeypatch, capsys, tmp_path):
+    """The plist of an install from before on-device transcription: the legacy
+    TRANSCRIBER key, no STT, a Gemini key. Auto now runs on this Mac — say
+    so in status, doctor and `stt` until they pick an engine or a language."""
+    _quiet_system(monkeypatch, tmp_path)
+    plist, _ = agent
+    cli.main(["status"])
+    out = capsys.readouterr().out
+    assert "note:             transcription now runs on this Mac (on-device, en-US) instead of Gemini" in out
+    assert "`meeting-capture stt gemini`" in out and "`meeting-capture stt auto`" in out
+    cli.main(["doctor"])
+    assert "! transcription now runs on this Mac" in capsys.readouterr().out
+    cli.main(["stt"])
+    assert "note:      transcription now runs on this Mac" in capsys.readouterr().out
+    assert cli.main(["stt", "auto"]) == 0                 # keep it: the note goes
+    capsys.readouterr()
+    cli.main(["status"])
+    assert "note:" not in capsys.readouterr().out
+    _write_plist(plist, {"MEETING_CAPTURE_TRANSCRIBER": "gemini"})
+    assert cli.main(["language", "en-GB"]) == 0           # picking a language counts too
+    assert _read_env(plist)["MEETING_CAPTURE_STT"] == "auto"
+    capsys.readouterr()
+    cli.main(["stt"])
+    assert "note:" not in capsys.readouterr().out
+
+
+def test_no_note_without_a_key_or_once_gemini_is_chosen(fake_helper, agent, monkeypatch, capsys, tmp_path):
+    _quiet_system(monkeypatch, tmp_path)
+    cli.main(["status"])                                  # never had Gemini: nothing changed for them
+    assert "note:" not in capsys.readouterr().out
+    monkeypatch.setenv("GOOGLE_API_KEY", "k")
+    cli._update_plist_env({"MEETING_CAPTURE_STT": "gemini"})
+    cli.main(["status"])
+    assert "note:" not in capsys.readouterr().out
+
+
+def test_status_and_stt_say_where_the_language_comes_from(fake_helper, agent, monkeypatch, capsys, tmp_path):
+    from meeting_capture import transcriber
+    _quiet_system(monkeypatch, tmp_path)
+    monkeypatch.setattr(transcriber, "_mac_preferences", lambda: (("es-ES", "en-US"), "es_ES"))
+    fake_helper.configure(installed=["en-US", "es-ES"])
+    cli.main(["status"])
+    out = capsys.readouterr().out
+    assert "transcription:    on this Mac (es-ES)" in out
+    assert "language:         es-ES (this Mac's language)" in out
+    cli.main(["stt"])
+    assert "language:  es-ES   (this Mac's language;" in capsys.readouterr().out
+    cli.main(["language"])
+    assert "from:      this Mac's language" in capsys.readouterr().out
+
+
+def test_status_counts_audio_a_stopped_daemon_left_in_the_queue(fake_helper, agent, monkeypatch, capsys,
+                                                                tmp_path):
+    _quiet_system(monkeypatch, tmp_path)
+    (tmp_path / "audio").mkdir()
+    (tmp_path / "audio" / "chunk-1714003200-them.wav").write_bytes(b"RIFF")
+    cli.main(["status"])
+    assert "waiting audio:    1 chunk(s) in the transcription queue" in capsys.readouterr().out

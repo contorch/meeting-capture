@@ -6,9 +6,13 @@ start time) and hands it to a bounded queue; one TranscriptionWorker thread
 drains the queue in order and, when it has nothing new, retries parked audio.
 Capture never waits on transcription: a full queue parks the chunk instead.
 
+Every chunk gets a small JSON note beside it (chunk-X.json) the moment it is
+queued, naming the meeting it belongs to, so audio a stopped or killed daemon
+never got to — the chunk being transcribed when launchd's SIGTERM arrives
+included — goes back into its own meeting at the next start (adopt_orphans).
+
 Failures never lose audio. A chunk that can't be transcribed is moved to
-FAILED_AUDIO_DIR with a small JSON sidecar (its meeting id, attempt count,
-last error):
+FAILED_AUDIO_DIR with its note (meeting id, attempt count, last error):
 
   * the engine is unavailable (no key, on-device model missing, ...): parked,
     and the retry of parked audio waits until an engine is available again;
@@ -65,6 +69,7 @@ from .transcriber import (
     clear_apple_status_cache,
     install_apple_model,
     last_backend,
+    locale_choice,
     resolve_backend,
     stt_choice,
     transcribe,
@@ -96,6 +101,11 @@ WORKER_IDLE_POLL_S = 2.0
 ENGINE_RECHECK_S = 60.0        # how often a blocked worker asks whether an engine is back
 MODEL_INSTALL_RETRY_S = 3600.0 # at most one automatic on-device model download per hour
 ORPHAN_MIN_AGE_S = 120.0       # chunk files left in AUDIO_DIR by a killed daemon
+# On SIGTERM, how long the worker gets to finish the chunk in hand. launchd
+# sends SIGKILL after its ExitTimeOut (20 s); sysaudio's own shutdown takes up
+# to 5 s of that. A chunk not finished in time keeps its note and is retried
+# into its meeting at the next start.
+STOP_GRACE_S = 10.0
 
 log = logging.getLogger("meeting-capture")
 
@@ -195,6 +205,15 @@ def _write_meta(wav: Path, meta: dict) -> None:
         log.error("could not record retry state for %s: %s", wav.name, exc)
 
 
+def _drop_meta(wav: Path) -> None:
+    try:
+        _meta_path(wav).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log.warning("could not remove %s: %s", _meta_path(wav).name, exc)
+
+
 def _discard(wav: Path) -> None:
     for p in (wav, _meta_path(wav)):
         try:
@@ -225,15 +244,21 @@ def _park_failed(chunk: Chunk, reason: BaseException | str, meeting_id: str | No
     except OSError as exc:
         log.error("could not park failed chunk %s: %s", chunk.path, exc)
         return None
-    meta = _read_meta(dest)
+    # A chunk parked straight from the queue brings the note written when it
+    # was queued (submit); it is removed only once the new one is written.
+    meta = _read_meta(dest if already_parked else chunk.path)
     attempts = int(meta.get("attempts") or 0) + (1 if count else 0)
     meta.update(attempts=attempts, last_error=str(reason)[:300], parked_at=time.time())
     if meeting_id or meta.get("meeting_id"):
         meta["meeting_id"] = meeting_id or meta.get("meeting_id")
     if count and attempts >= MAX_ATTEMPTS:
-        return _quarantine(dest, meta, reason)
+        out = _quarantine(dest, meta, reason)
+        if not already_parked:
+            _drop_meta(chunk.path)
+        return out
     _write_meta(dest, meta)
     if not already_parked:
+        _drop_meta(chunk.path)
         log.warning(
             "transcription failed (%s) — kept %.1fs of audio at %s; %s",
             reason, chunk.duration_seconds, dest,
@@ -297,15 +322,19 @@ def parked_chunks() -> list[Chunk]:
 
 
 def parked_counts() -> dict:
-    """{"parked": n, "quarantined": n} — for status/doctor."""
+    """{"queued": n, "parked": n, "quarantined": n} — for status/doctor.
+    "queued": chunks in AUDIO_DIR — waiting for (or in) transcription while
+    the daemon runs, or left there by a daemon that stopped before
+    transcribing them (the next start retries them)."""
     def _n(d: Path) -> int:
-        return len(list(d.glob("chunk-*.wav"))) if d.is_dir() else 0
-    return {"parked": _n(FAILED_AUDIO_DIR), "quarantined": _n(_quarantine_dir())}
+        return len([p for p in d.glob("chunk-*.wav") if _FAILED_NAME.match(p.name)]) if d.is_dir() else 0
+    return {"queued": _n(AUDIO_DIR), "parked": _n(FAILED_AUDIO_DIR), "quarantined": _n(_quarantine_dir())}
 
 
 def adopt_orphans(exclude=frozenset(), min_age_s: float = ORPHAN_MIN_AGE_S) -> int:
     """Chunk files left in AUDIO_DIR by a daemon that was stopped or crashed
-    before transcribing them: park them so the retry picks them up."""
+    before transcribing them: park them, with the note naming their meeting,
+    so the retry picks them up and puts them back into that meeting."""
     if not AUDIO_DIR.is_dir():
         return 0
     now, moved = time.time(), 0
@@ -318,6 +347,19 @@ def adopt_orphans(exclude=frozenset(), min_age_s: float = ORPHAN_MIN_AGE_S) -> i
             FAILED_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
             path.replace(FAILED_AUDIO_DIR / path.name)
             moved += 1
+        except OSError:
+            continue
+        note = _meta_path(path)
+        try:
+            note.replace(FAILED_AUDIO_DIR / note.name)
+        except FileNotFoundError:
+            pass                 # queued by a version that wrote no note
+        except OSError as exc:
+            log.warning("could not move %s with its audio: %s", note.name, exc)
+    for note in AUDIO_DIR.glob("chunk-*.json"):          # a note whose audio is gone
+        try:
+            if not note.with_suffix(".wav").exists() and now - note.stat().st_mtime >= min_age_s:
+                note.unlink()
         except OSError:
             continue
     if moved:
@@ -513,7 +555,10 @@ class TranscriptionWorker:
 
     def submit(self, chunk: Chunk, meeting_id: str) -> bool:
         """Queue a chunk for transcription. Never blocks: if the worker is that
-        far behind, the chunk is parked for the retry instead."""
+        far behind, the chunk is parked for the retry instead. Its meeting is
+        written beside it first, so a daemon stopped or killed before the chunk
+        is transcribed loses neither the audio nor which meeting it belongs to."""
+        _write_meta(chunk.path, {"meeting_id": meeting_id, "attempts": 0})
         with self._lock:
             self._inflight.add(chunk.path)
         try:
@@ -541,14 +586,20 @@ class TranscriptionWorker:
     def request_retry(self) -> None:
         self._retry_wanted = True
 
-    def stop(self, timeout: float = 2.0) -> None:
-        """Park whatever is still queued (the daemon is exiting) and stop."""
+    def stop(self, timeout: float | None = None) -> None:
+        """The daemon is exiting: park whatever is still queued, give the chunk
+        being transcribed up to `timeout` (STOP_GRACE_S) to finish, and stop. A
+        chunk still unfinished then stays in AUDIO_DIR with its note (submit)
+        and goes back into its meeting at the next start."""
+        timeout = STOP_GRACE_S if timeout is None else timeout
         while True:
             try:
                 item = self._q.get_nowait()
             except queue.Empty:
                 break
             if isinstance(item, tuple):
+                with self._lock:
+                    self._inflight.discard(item[0].path)
                 _park_failed(item[0], "the daemon stopped before transcribing it", item[1])
         try:
             self._q.put_nowait(_STOP)
@@ -556,6 +607,12 @@ class TranscriptionWorker:
             pass
         if self._thread is not None:
             self._thread.join(timeout)
+            if self._thread.is_alive():
+                with self._lock:
+                    left = sorted(p.name for p in self._inflight)
+                if left:
+                    log.info("stopping mid-transcription — %s kept with its meeting; "
+                             "transcribed at the next start", ", ".join(left))
 
     def idle(self) -> bool:
         return self._q.empty() and self._pass is None
@@ -681,6 +738,8 @@ class TranscriptionWorker:
         b = resolve_backend()
         if b.choice == "gemini" or (b.engine == "apple" and b.ready):
             return
+        if b.engine == "gemini" and b.ready and locale_choice().guessed:
+            return     # auto keeps Gemini for a Mac language on-device can't do: no en-US model needed
         st = apple_status(b.locale)
         if not st.installable:
             return
@@ -693,6 +752,7 @@ class TranscriptionWorker:
                 install_apple_model(st.locale)
                 log.info("on-device speech model for %s installed in %.0fs", st.locale, time.monotonic() - t0)
                 self._next_check = 0.0           # pick it up right away
+                _log_upgrade_notice()            # auto may switch to on this Mac now
             except Exception as exc:
                 log.warning("could not install the on-device speech model for %s: %s", st.locale, exc)
             finally:
@@ -776,6 +836,27 @@ def live_permitted() -> bool:
     return False
 
 
+_notice_logged = False
+
+
+def _log_upgrade_notice(backend=None) -> None:
+    """Once per run: tell someone with a Gemini key who never picked an
+    engine that transcription now runs on this Mac (transcriber.upgrade_notice;
+    status, doctor, `stt` and the settings page show it too)."""
+    global _notice_logged
+    if _notice_logged:
+        return
+    from .transcriber import NOTICE_CLI_HINT, upgrade_notice
+    try:
+        note = upgrade_notice(backend=backend)
+    except Exception:
+        log.debug("could not work out the engine notice", exc_info=True)
+        return
+    if note:
+        _notice_logged = True
+        log.warning("NOTE: %s — %s", note, NOTICE_CLI_HINT)
+
+
 def _log_engine() -> None:
     """Backend-neutral startup line naming the engine and why."""
     from .transcriber import (
@@ -784,6 +865,7 @@ def _log_engine() -> None:
     )
     b = resolve_backend()
     log.info("transcription engine: %s — %s (stt=%s, locale=%s)", b.engine, b.reason, b.choice, b.locale)
+    _log_upgrade_notice(b)
     if b.engine == "gemini":
         model = resolve_model()
         log.info(
@@ -803,21 +885,57 @@ def _write_pid() -> None:
     PID_FILE.write_text(str(os.getpid()))
 
 
-def _clear_pid() -> None:
+def _another_daemon_running() -> bool:
+    """Is the pid in PID_FILE — before this run writes its own — a live
+    process other than this one? (Two daemons at once, e.g. `meeting-capture
+    run` beside the launchd agent: the other one's queue is not ours to take.)"""
     try:
+        pid = int(PID_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    if pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True              # exists, owned by someone else
+    return True
+
+
+def adopt_at_start(other_daemon: bool) -> int:
+    """Before capture starts: everything in AUDIO_DIR was left by the
+    previous run (nothing is in flight in a fresh process), so park it all now,
+    whatever its age — status counts it and the startup retry transcribes it
+    into its meeting. If another daemon is running, only take what is old
+    enough to be abandoned."""
+    return adopt_orphans(min_age_s=ORPHAN_MIN_AGE_S if other_daemon else 0.0)
+
+
+def _clear_pid() -> None:
+    """Remove the pid file — only if it is still ours: a daemon finishing its
+    grace period must not delete the pid file of the one that replaced it."""
+    try:
+        if PID_FILE.read_text().strip() not in (str(os.getpid()), ""):
+            return
         PID_FILE.unlink()
     except FileNotFoundError:
         pass
+    except OSError as exc:
+        log.warning("could not remove %s: %s", PID_FILE, exc)
 
 
 def run() -> None:
     ensure_dirs()
     _setup_logging()
+    other_daemon = _another_daemon_running()
     _write_pid()
 
     def _shutdown(signum, frame):
+        # The pid file stays until the worker has had its grace period (the
+        # finally below): until then this daemon still owns AUDIO_DIR.
         log.info("received signal %s, shutting down", signum)
-        _clear_pid()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)
@@ -852,8 +970,10 @@ def run() -> None:
     backoff = FailureBackoff()
 
     # One thread transcribes; capture only hands it chunks. Anything parked by
-    # an earlier run (e.g. recorded before the key existed, or the on-device
-    # model wasn't installed yet) is retried there whenever it's idle.
+    # an earlier run (e.g. recorded before the key existed, the on-device
+    # model wasn't installed yet, or the daemon was restarted mid-chunk) is
+    # retried there whenever it's idle.
+    adopt_at_start(other_daemon)
     worker = TranscriptionWorker().start()
     worker.request_retry()
 
