@@ -34,6 +34,8 @@ if "--probe" in args:
          "installed_locales": installed})
     sys.exit(rc)
 if "--install" in args:
+    for line in cfg.get("install_stderr", []):   # download progress, as the real helper logs it
+        sys.stderr.write(line + "\n"); sys.stderr.flush()
     rc = cfg.get("install_rc")
     if rc is None:
         rc = 0 if locale in supported else 69
@@ -104,8 +106,20 @@ def fake_helper(tmp_path, monkeypatch):
 
 @pytest.fixture
 def gemini_key(monkeypatch):
+    """A key in this process's environment: what the daemon itself reads. The
+    CLI asking on an installed agent's behalf doesn't count it (the launchd
+    daemon never sees the shell) — use key_file for that."""
     monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
     return "test-key"
+
+
+@pytest.fixture
+def key_file():
+    """A key in ~/.config/google/key (a stand-in): seen by the daemon and by
+    the CLI asking on its behalf."""
+    from meeting_capture import transcriber
+    transcriber.GEMINI_KEY_FILE.write_text("test-key-file\n")
+    return "test-key-file"
 
 
 @pytest.fixture(autouse=True)

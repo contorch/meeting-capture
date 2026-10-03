@@ -114,7 +114,7 @@ def test_set_plist_mode_batch_removes_key(tmp_path, monkeypatch):
     assert "MEETING_CAPTURE_MODE" not in _read_env(plist)
 
 
-def test_cmd_mode_switch_relaunches(tmp_path, monkeypatch, capsys, gemini_key):
+def test_cmd_mode_switch_relaunches(tmp_path, monkeypatch, capsys, key_file):
     plist = tmp_path / "agent.plist"
     _write_plist(plist, {})
     monkeypatch.setattr(cli, "LAUNCHD_PLIST", plist)
@@ -126,7 +126,7 @@ def test_cmd_mode_switch_relaunches(tmp_path, monkeypatch, capsys, gemini_key):
     assert "switched to live" in capsys.readouterr().out
 
 
-def test_cmd_mode_noop_when_already_set(tmp_path, monkeypatch, capsys, gemini_key):
+def test_cmd_mode_noop_when_already_set(tmp_path, monkeypatch, capsys, key_file):
     plist = tmp_path / "agent.plist"
     _write_plist(plist, {"MEETING_CAPTURE_MODE": "live"})
     monkeypatch.setattr(cli, "LAUNCHD_PLIST", plist)
@@ -341,7 +341,7 @@ def test_stt_gemini_warns_without_a_key_and_auto_is_written_too(fake_helper, age
     assert cli.main(["stt", "gemini"]) == 0
     out = capsys.readouterr().out
     assert _read_env(plist)["MEETING_CAPTURE_STT"] == "gemini"
-    assert "no Google API key is set" in out
+    assert "no Google API key the recorder can see" in out
     assert not any("--install" in c for c in fake_helper.calls())
     assert cli.main(["stt", "auto"]) == 0
     # Written, not removed: unset means nobody picked an engine (upgrade_notice).
@@ -404,7 +404,7 @@ def test_language_show(fake_helper, agent, capsys):
     assert "supported: " in out and "hi-IN" in out
 
 
-def test_mode_live_allowed_in_auto_even_when_batch_runs_on_this_mac(fake_helper, agent, gemini_key, capsys):
+def test_mode_live_allowed_in_auto_even_when_batch_runs_on_this_mac(fake_helper, agent, key_file, capsys):
     """Live mode is an explicit choice to stream to Gemini: auto doesn't block it."""
     plist, calls = agent
     assert cli.transcription_summary()["engine"] == "apple"
@@ -437,7 +437,7 @@ def test_mode_live_counts_a_key_in_the_daemon_env(fake_helper, agent):
     assert cli.main(["mode", "live"]) == 0 and calls == ["relaunch"]
 
 
-def test_mode_live_allowed_with_gemini(fake_helper, agent, gemini_key):
+def test_mode_live_allowed_with_gemini(fake_helper, agent, key_file):
     plist, calls = agent
     cli._update_plist_env({"MEETING_CAPTURE_STT": "gemini"})
     assert cli.main(["mode", "live"]) == 0
@@ -506,7 +506,7 @@ def test_status_doctor_and_stt_say_when_live_is_requested_but_runs_batch(fake_he
     assert captured.out == "live\n" and "runs batch" in captured.err
 
 
-def test_status_doctor_and_stt_when_live_runs(fake_helper, agent, gemini_key, monkeypatch, capsys, tmp_path):
+def test_status_doctor_and_stt_when_live_runs(fake_helper, agent, key_file, monkeypatch, capsys, tmp_path):
     _quiet_system(monkeypatch, tmp_path)
     cli._update_plist_env({"MEETING_CAPTURE_MODE": "live"})
     cli.main(["status"])
@@ -543,7 +543,7 @@ def test_vocab_says_it_is_for_gemini_only(fake_helper, agent, tmp_path, monkeypa
 
 # ---- upgrading from Gemini: say so, until an engine is picked ------------------------------
 
-def test_an_upgrader_with_a_gemini_key_is_told_until_they_pick(fake_helper, agent, gemini_key,
+def test_an_upgrader_with_a_key_file_is_told_until_they_pick(fake_helper, agent, key_file,
                                                                   monkeypatch, capsys, tmp_path):
     """The plist of an install from before on-device transcription: the legacy
     TRANSCRIBER key, no STT, a Gemini key. Auto now runs on this Mac — say

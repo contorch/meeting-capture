@@ -69,7 +69,7 @@ from .transcriber import (
     clear_apple_status_cache,
     install_apple_model,
     last_backend,
-    locale_choice,
+    model_needed,
     resolve_backend,
     stt_choice,
     transcribe,
@@ -736,13 +736,9 @@ class TranscriptionWorker:
         if self._installing or now - self._last_install < MODEL_INSTALL_RETRY_S:
             return
         b = resolve_backend()
-        if b.choice == "gemini" or (b.engine == "apple" and b.ready):
+        if not model_needed(b):         # the rule `meeting-capture stt --json` reports as needs_model
             return
-        if b.engine == "gemini" and b.ready and locale_choice().guessed:
-            return     # auto keeps Gemini for a Mac language on-device can't do: no en-US model needed
-        st = apple_status(b.locale)
-        if not st.installable:
-            return
+        st = apple_status(b.locale)     # the probe model_needed just ran (cached)
         self._last_install, self._installing = now, True
 
         def _work() -> None:

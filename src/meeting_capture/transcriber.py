@@ -29,10 +29,12 @@ Mac — auto prefers Gemini if a key is set (locale_choice(), resolve_backend())
 they make, so an unset MEETING_CAPTURE_STT means nobody has picked an engine
 yet: someone with a Gemini key whose auto setting now runs on this Mac gets
 upgrade_notice() in status, doctor, `stt`, the settings page and the daemon
-log until they do. (pipeline-monitor's transcription.py mirrors this
-resolution for the menu bar without running meeting-capture: change both.)
-The legacy MEETING_CAPTURE_TRANSCRIBER (gemini|whisper) found in old plists is
-read as auto.
+log until they do. This module is the only implementation of these rules:
+pipeline-monitor (menu bar, `contorch setup|status|doctor`) asks for the
+result with `meeting-capture stt --json` (engine_summary() plus live mode,
+cli.transcription_summary(); the contract is in the README under "Contract")
+instead of re-deriving it. The legacy MEETING_CAPTURE_TRANSCRIBER
+(gemini|whisper) found in old plists is read as auto.
 
 Helper contract (``sysaudio transcribe``; MEETING_CAPTURE_TRANSCRIBE_BIN
 overrides the binary for development and tests):
@@ -81,6 +83,7 @@ import json
 import logging
 import os
 import plistlib
+import re
 import subprocess
 import threading
 import time
@@ -322,7 +325,11 @@ def locale_choice(env=None, probe: bool = True) -> LocaleChoice:
         return LocaleChoice(DEFAULT_LOCALE, "mac", mac)
     if not probe:
         return LocaleChoice(DEFAULT_LOCALE, "default", mac)
-    picked = _pick_supported(cands, apple_status(DEFAULT_LOCALE).supported)
+    # Any probe lists the supported locales. Probing the Mac's own locale
+    # (when it names a region) also answers for it when it is picked — the
+    # usual case — so the caller's apple_status() for it is cached: one helper
+    # run, not two.
+    picked = _pick_supported(cands, apple_status(mac if "-" in mac else DEFAULT_LOCALE).supported)
     if picked:
         return LocaleChoice(picked, "mac", mac)
     return LocaleChoice(DEFAULT_LOCALE, "default", mac)
@@ -430,11 +437,41 @@ OLD_HELPER_REASON = ("this sysaudio predates on-device transcription — "
                      "upgrade meeting-capture (brew upgrade meeting-capture)")
 
 
-def _run_helper(binary: Path, args: list[str], timeout: float) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [str(binary), "transcribe", *args],
-        capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
-    )
+def _run_helper(binary: Path, args: list[str], timeout: float,
+                on_stderr=None) -> subprocess.CompletedProcess:
+    """Run `binary transcribe ARGS`. With `on_stderr`, each stderr line is
+    also handed to it as the helper prints it (download progress)."""
+    cmd = [str(binary), "transcribe", *args]
+    if on_stderr is None:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            stdin=subprocess.DEVNULL)
+    out: list[str] = []
+    err: list[str] = []
+
+    def _stderr() -> None:
+        for line in proc.stderr:
+            err.append(line)
+            try:
+                on_stderr(line.rstrip("\n"))
+            except Exception:   # a progress printer must never fail the install
+                pass
+
+    readers = [threading.Thread(target=_stderr, daemon=True),
+               threading.Thread(target=lambda: out.append(proc.stdout.read()), daemon=True)]
+    for t in readers:
+        t.start()
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise
+    finally:
+        for t in readers:
+            t.join(timeout=5)
+    return subprocess.CompletedProcess(cmd, rc, "".join(out), "".join(err))
 
 
 def _probe(binary: Path, locale: str) -> AppleStatus:
@@ -487,20 +524,47 @@ def apple_status(locale: Optional[str] = None, refresh: bool = False) -> AppleSt
             return hit[1]
     st = _probe(binary, locale)
     with _probe_lock:
-        _probe_cache[key] = (time.monotonic(), st)
+        now = time.monotonic()
+        _probe_cache[key] = (now, st)
+        if st.available and st.locale and normalize_locale(st.locale) != locale:
+            # The helper resolved an equivalent (zh-Hans-CN -> zh-CN): same answer.
+            _probe_cache[(str(binary), normalize_locale(st.locale))] = (now, st)
     return st
 
 
-def install_apple_model(locale: str, timeout: float = INSTALL_TIMEOUT_S) -> dict:
+def _install_progress(progress):
+    """The helper's stderr during --install, as lines for `progress`: its
+    "<locale> model download N%" ticks (one a second) only when N reaches a
+    new tenth, reservation notes and errors as they come. Its own
+    "downloading…" line repeats what the caller already said."""
+    last = [-1]
+
+    def on_line(line: str) -> None:
+        line = line.strip()
+        if not line or line.startswith("downloading the on-device speech model"):
+            return
+        m = re.search(r" model download (\d+)%$", line)     # a tick, not "100%, installed"
+        if m:
+            tenth = int(m.group(1)) // 10
+            if tenth == last[0] or tenth >= 10:
+                return
+            last[0] = tenth
+        progress(f"  {line}")
+    return on_line
+
+
+def install_apple_model(locale: str, timeout: float = INSTALL_TIMEOUT_S, progress=None) -> dict:
     """Download (once) and reserve the on-device model for `locale`.
     Returns the helper's {"installed", "locale", "seconds"}. Raises
-    AppleUnavailable (unsupported here) or AppleError (anything else)."""
+    AppleUnavailable (unsupported here) or AppleError (anything else).
+    `progress`, if given, gets the download's progress lines as they come."""
     locale = normalize_locale(locale)
     binary = helper_binary()
     if binary is None:
         raise AppleUnavailable("the on-device transcription helper (sysaudio) was not found")
     try:
-        r = _run_helper(binary, ["--install", "--locale", locale], timeout)
+        r = _run_helper(binary, ["--install", "--locale", locale], timeout,
+                        on_stderr=_install_progress(progress) if progress else None)
     except subprocess.TimeoutExpired as exc:
         raise AppleError(f"installing the on-device model for {locale} timed out after {timeout:.0f}s") from exc
     except OSError as exc:
@@ -590,13 +654,20 @@ class Backend:
         return ENGINE_LABELS.get(self.engine, self.engine)
 
 
+KEY_ENV_VARS = ("GOOGLE_API_KEY", "GEMINI_API_KEY")
+
+
 def gemini_key_present(env=None) -> bool:
-    """Would Gemini find a key? `env` is the daemon's configuration when the
-    CLI asks on its behalf (a key can sit in the launchd plist's env); the
-    daemon itself passes nothing and reads its own environment."""
-    if env is not None and (env.get("GOOGLE_API_KEY") or env.get("GEMINI_API_KEY")):
+    """Would Gemini find a key? The daemon itself passes nothing and reads its
+    own environment, then the key file. `env` is the daemon's configuration
+    when the CLI asks on its behalf (its launchd plist's env): a key there or
+    in the key file counts, a key only in the CLI's own shell does not — the
+    launchd daemon never sees that shell."""
+    if env is None:
+        return bool(_resolve_gemini_api_key())
+    if any(str(env.get(v) or "").strip() for v in KEY_ENV_VARS):
         return True
-    return bool(_resolve_gemini_api_key())
+    return bool(_key_file_value())
 
 
 def resolve_backend(choice: Optional[str] = None, locale: Optional[str] = None, env=None) -> Backend:
@@ -654,19 +725,58 @@ NOTICE_CLI_HINT = ("meetings in another language: `meeting-capture language LOCA
                    "`meeting-capture stt gemini`; keep this and hide the note: `meeting-capture stt auto`")
 
 
+def model_needed(b: Backend, lc: Optional[LocaleChoice] = None,
+                 st: Optional[AppleStatus] = None) -> bool:
+    """Is on-device transcription held up only by its language's model? The
+    setting wants it (auto or apple — but not auto keeping Gemini for a Mac
+    language on-device can't do, which needs no en-US model), it isn't
+    running, and the helper says the model can be installed here (probe exit
+    75: not on the Mac, or not reserved by this app yet). The daemon then
+    downloads it by itself (at most once an hour); `meeting-capture language
+    LOCALE` does it now. `lc` (locale_choice()) and `st` (apple_status(b.locale))
+    are looked up only when needed, so a Gemini setting never runs the helper."""
+    if b.choice == "gemini" or (b.engine == "apple" and b.ready):
+        return False
+    if b.engine == "gemini" and b.ready and (lc if lc is not None else locale_choice()).guessed:
+        return False
+    return (st if st is not None else apple_status(b.locale)).installable
+
+
+def on_device_hint(b: Backend, lc: LocaleChoice, st: AppleStatus, key: bool) -> Optional[str]:
+    """The one command that makes batch transcription run on this Mac (it
+    installs the language's model first when needed), or None when it already
+    does or this Mac can't. Keeps auto's Gemini fallback (not `stt apple`)."""
+    if (b.engine == "apple" and b.ready) or not (st.usable or st.installable):
+        return None
+    if b.choice == "gemini":
+        if lc.guessed and key:     # auto alone would keep Gemini for this Mac's language
+            return f"meeting-capture stt auto --language {lc.locale}"
+        return "meeting-capture stt auto"
+    return f"meeting-capture language {lc.locale}"
+
+
 def engine_summary(env=None) -> dict:
     """Everything the CLI and the settings page show about transcription, for
-    the configuration in `env` (the launchd plist's, normally)."""
+    the configuration in `env` (the launchd plist's, normally). One helper
+    probe per language at most (apple_status() caches them)."""
     choice, lc = stt_choice(env), locale_choice(env)
     locale = lc.locale
     st = apple_status(locale)
     b = resolve_backend(choice, None, env)
+    key = gemini_key_present(env)
+    needs_model = model_needed(b, lc, st)
     return {
         "choice": choice, "choice_label": CHOICE_LABELS[choice],
         "engine": b.engine, "engine_label": b.label, "reason": b.reason, "ready": b.ready,
         "locale": locale, "locale_source": lc.source, "locale_why": lc.describe(),
-        "mac_language": lc.mac, "apple": st.as_dict(), "gemini_key": gemini_key_present(env),
-        "uploads": b.engine == "gemini", "notice": upgrade_notice(env, b),
+        "locale_guessed": lc.guessed, "mac_language": lc.mac,
+        "apple": st.as_dict(), "gemini_key": key,
+        "uploads": b.engine == "gemini",
+        "gemini_fallback": choice == "auto" and b.engine == "apple" and key,
+        "needs_model": needs_model,
+        "install_hint": f"meeting-capture language {locale}" if needs_model else None,
+        "on_device_hint": on_device_hint(b, lc, st, key),
+        "notice": upgrade_notice(env, b),
     }
 
 
@@ -968,10 +1078,14 @@ def _transcribe_gemini(
 
 def _resolve_gemini_api_key() -> Optional[str]:
     """Look up the Gemini API key in env first, then ~/.config/google/key."""
-    for var in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
+    for var in KEY_ENV_VARS:
         v = os.environ.get(var)
         if v:
             return v.strip()
+    return _key_file_value()
+
+
+def _key_file_value() -> Optional[str]:
     if GEMINI_KEY_FILE.exists():
         try:
             return GEMINI_KEY_FILE.read_text(encoding="utf-8").strip() or None

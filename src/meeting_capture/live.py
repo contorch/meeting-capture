@@ -68,7 +68,8 @@ LIVE_NEVER_UPLOADS = "transcription is set to on this Mac only (stt apple), whic
 LIVE_NEEDS_KEY = "live mode streams to Gemini and no Google API key is set"
 LIVE_FIXES = {
     LIVE_NEVER_UPLOADS: "`meeting-capture stt auto` (or `stt gemini`) allows live mode",
-    LIVE_NEEDS_KEY: "add one (GOOGLE_API_KEY / GEMINI_API_KEY / ~/.config/google/key, mode 600)",
+    LIVE_NEEDS_KEY: ("write one to ~/.config/google/key (mode 600) — the recorder runs under launchd "
+                     "and never sees GOOGLE_API_KEY from your shell"),
 }
 
 
@@ -82,7 +83,8 @@ def live_blocker(env=None) -> Optional[str]:
     refused only with stt=apple (on this Mac only: never uploads) and without
     a Google API key (it could not connect; batch keeps the audio). The daemon,
     `status`, `doctor`, `stt`, `mode` and the settings page all use this rule;
-    pipeline-monitor's menu bar mirrors it."""
+    pipeline-monitor reads the outcome from `meeting-capture stt --json`
+    ("live"), never a copy of it."""
     from .transcriber import gemini_key_present, stt_choice
 
     env = os.environ if env is None else env

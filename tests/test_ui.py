@@ -254,7 +254,7 @@ def test_new_meeting_button_requests_a_new_meeting(server, monkeypatch):
     assert (tmp / "new-meeting").exists()
 
 
-def test_state_says_when_live_mode_is_requested_but_runs_batch(fake_helper, gemini_key, monkeypatch, tmp_path):
+def test_state_says_when_live_mode_is_requested_but_runs_batch(fake_helper, key_file, monkeypatch, tmp_path):
     import plistlib
     from meeting_capture import cli
     plist = tmp_path / "agent.plist"

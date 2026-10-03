@@ -54,7 +54,7 @@ CLI commands for inspection and control:
 | `meeting-capture pause` | Pause capture (creates `~/.meeting-capture/paused`) |
 | `meeting-capture resume` | Resume capture |
 | `meeting-capture new` | Start a new meeting (speech from now on goes into a new transcript) |
-| `meeting-capture stt [auto\|apple\|gemini]` | Show the transcription engine in use and why, or switch it (restarts the daemon) |
+| `meeting-capture stt [auto\|apple\|gemini] [--language L]` | Show the transcription engine in use and why, or switch it (restarts the daemon); `--json` prints the state for other programs (see [Contract](#contract)) |
 | `meeting-capture language [LOCALE]` | Show or set the on-device language (installs its model first) |
 | `meeting-capture ui` | Settings page: audio source, interface inputs and levels, transcription engine and language |
 | `meeting-capture install` | Install the launchd auto-start agent |
@@ -174,11 +174,31 @@ Only needed for Gemini (chosen, or the fallback of `auto` when on-device isn't a
 2. `$GEMINI_API_KEY`
 3. `~/.config/google/key` (mode 600)
 
-`meeting-capture doctor` reports whether a key is found.
+`meeting-capture doctor` reports whether a key is found — one the recorder will see. It runs under launchd, so `$GOOGLE_API_KEY` exported in your shell never reaches it (only one in its plist env would); the key file is the place for it.
 
 ### Memory guardrail
 
 The daemon self-exits (and launchd respawns it) if its `phys_footprint` exceeds `MEETING_CAPTURE_MAX_FOOTPRINT_MB` (default 2048) — a backstop against any runaway-memory regression. The check uses `phys_footprint`, not RSS, because leaked memory is often compressed/swapped and invisible to RSS.
+
+## Contract
+
+**`meeting-capture stt --json`** is how other programs learn how meetings get transcribed. pipeline-monitor (the Contorch menu bar, `contorch setup`, `status`, `doctor`) runs it instead of re-implementing the rules in `transcriber.py` — this repo is the only implementation; change the fields here and in pipeline-monitor's `transcription.py` together (its README has the same section). It prints one JSON object on stdout (diagnostics go to stderr) describing what the recorder's configuration — the launchd plist env, or this shell's when no agent is installed; a key only in the caller's shell doesn't count for an installed agent — resolves to, and exits 0 whenever it could answer (1: it couldn't, nothing on stdout; 2: usage — a meeting-capture without `stt --json` also exits 2, which callers read as "too old"). It runs the helper's read-only probe once per language (≈ 0.1–0.2 s in all). `"schema": 1`; adding a field keeps the schema, removing or redefining one bumps it.
+
+| Field | Meaning |
+|---|---|
+| `schema`, `version`, `agent_installed` | contract version (1), meeting-capture's version, whether the launchd agent exists |
+| `choice`, `choice_label` | the setting: `auto` \| `apple` \| `gemini` |
+| `engine`, `engine_label`, `ready`, `reason` | what transcribes batch chunks now: `apple` (on this Mac) \| `gemini` \| `none` (audio kept until one can), whether it can run, and why |
+| `uploads` | batch chunks go to Google (engine `gemini`; when not ready, once a key exists) |
+| `live.requested`, `live.active`, `live.blocker` | live mode asked for; actually streaming every call to Gemini (**also uploads**); why it runs batch instead |
+| `gemini_fallback` | `auto` with a key: if on-device transcription stops working, chunks fall back to Gemini |
+| `locale`, `locale_source`, `locale_why`, `locale_guessed`, `mac_language` | on-device language, where it comes from (`setting` \| `mac` \| `default`), whether en-US is only a guess because the Mac's language can't be done on-device |
+| `apple` | the helper's probe: `available`, `usable`, `installable`, `installed`, `reason`, `supported`, `installed_locales`, `exit_code`, … |
+| `needs_model`, `install_hint` | on-device would run but its language's model isn't installed/reserved yet; the exact command that fixes it (else `null`) |
+| `on_device_hint` | the exact command that makes batch transcription run on this Mac (installing the model if needed), or `null` when it already does or can't |
+| `gemini_key`, `notice` | a key the recorder will see; the upgrade note (`null` when none) |
+
+Privacy wording belongs to these fields only: audio leaves the Mac when `uploads` or `live.active` is true. `meeting-capture stt auto|apple|gemini [--language L]` and `meeting-capture language L` are safe to run from another program: no prompts, progress as lines on stdout (model download percentages included), errors on stderr, exit 0 when applied (then ask `stt --json` for the result), 1 when refused with the plist untouched, 2 for usage errors.
 
 ## Tests
 
