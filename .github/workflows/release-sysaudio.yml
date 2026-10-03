@@ -19,10 +19,23 @@ permissions:
 
 jobs:
   build-sign:
-    runs-on: macos-15
+    # `sysaudio transcribe` (on-device SpeechAnalyzer) needs the macOS 26 SDK,
+    # so the build needs Xcode 26+. macOS 26 also lets the smoke test run the
+    # real macOS 26 transcribe code path instead of its "needs macOS 26" stub.
+    runs-on: macos-26
     timeout-minutes: 30
+    env:
+      # Pinned. Keep it the same as the `sysaudio` job in tests.yml (the PR-time
+      # build check), so a PR builds with exactly what a release ships.
+      XCODE_APP: /Applications/Xcode_26.6.app
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s "$XCODE_APP"
+          xcrun --sdk macosx --show-sdk-version
 
       - name: Import signing identity into a throwaway keychain
         env:
@@ -38,36 +51,11 @@ jobs:
           security list-keychains -d user -s ci.keychain login.keychain
           rm /tmp/cert.p12
 
+      # Asserts SDK >= 26, retries the flaky swift build, fails unless the
+      # binary is universal and both slices link Speech.framework, and leaves
+      # ./sysaudio at the repo root.
       - name: Build universal sysaudio
-        run: |
-          set -euo pipefail
-          sw_vers
-          # Cosmetic, and it can hit the same flaky NSFileHandle SIGABRT as the
-          # build — outside the retry loop that would have killed the job.
-          xcodebuild -version 2>/dev/null | head -1 || true
-          cd swift
-          # `swift build` intermittently SIGABRTs (exit 134) with an
-          # NSFileHandle crash on the GitHub runner — a known-flaky toolchain
-          # bug, not our code. Retry a few times before giving up.
-          for attempt in 1 2 3; do
-            if swift build -c release --arch arm64 --arch x86_64 2>&1 | tail -20; then
-              break
-            fi
-            echo "swift build attempt $attempt failed (likely the flaky NSFileHandle SIGABRT) — retrying"
-            rm -rf .build/apple 2>/dev/null || true
-            sleep 5
-          done
-          # Universal products land in .build/apple/Products/Release (older
-          # toolchains) or .build/out/Products/Release (Swift 6.x). Never fall
-          # back to a single-arch build: fail if either arch is missing.
-          for name in sysaudio; do
-            BIN=$(find .build -path "*/Products/Release/$name" -type f | head -1)
-            [ -n "$BIN" ] || { echo "no universal $name in .build"; exit 1; }
-            lipo -info "$BIN"
-            lipo -archs "$BIN" | grep -q arm64 && lipo -archs "$BIN" | grep -q x86_64 \
-              || { echo "FATAL: $name is not universal"; exit 1; }
-            cp "$BIN" "../$name"
-          done
+        run: .github/scripts/build-sysaudio.sh
 
       - name: Sign with Developer ID (hardened runtime + timestamp)
         run: |
@@ -84,6 +72,12 @@ jobs:
           echo "== entitlements ==" && codesign -d --entitlements - --xml sysaudio 2>/dev/null | grep -q "audio-input" \
             && echo "audio-input entitlement present" \
             || { echo "FATAL: audio-input entitlement missing after signing"; exit 1; }
+
+      # On the signed binary. Never captures: it checks the capture CLI still
+      # parses as before and that `sysaudio transcribe --probe` runs and exits
+      # 0, 69 or 75 (plus the rest of the transcribe exit-code contract).
+      - name: Smoke-test the signed binary (no capture)
+        run: .github/scripts/sysaudio-smoke.sh ./sysaudio
 
       - name: Package
         run: |
