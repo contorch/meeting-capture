@@ -19,6 +19,9 @@
 // Usage: sysaudio [--sample-rate N] [--mic]
 //   --sample-rate  output sample rate in Hz (default 16000)
 //   --mic          also capture the default microphone as a second channel
+//
+// `sysaudio transcribe …` is a separate subcommand (Transcribe.swift):
+// on-device speech-to-text of an audio file. It captures nothing.
 
 import Foundation
 import ScreenCaptureKit
@@ -326,6 +329,14 @@ struct SysAudio {
         var sampleRate = 16000
         var wantMic = false
         var args = Array(CommandLine.arguments.dropFirst())
+        // `sysaudio transcribe …` (Transcribe.swift) is a separate tool that
+        // shares this signed binary, its Developer ID and its bundle id. Route
+        // it before the capture flags are parsed: it never touches
+        // ScreenCaptureKit, the mic or any TCC-gated API, and capture argument
+        // handling below stays exactly as it was.
+        if args.first == "transcribe" {
+            exit(await TranscribeCommand.run(Array(args.dropFirst())))
+        }
         while !args.isEmpty {
             let a = args.removeFirst()
             switch a {

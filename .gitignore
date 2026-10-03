@@ -14,3 +14,4 @@ swift/.build/
 *.flac
 *.aiff
 !skills/**
+/sysaudio
