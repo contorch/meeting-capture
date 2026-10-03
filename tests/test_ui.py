@@ -242,3 +242,16 @@ def test_new_meeting_button_requests_a_new_meeting(server, monkeypatch):
     status, body = call(base + "/api/new-meeting", {})
     assert status == 200 and "new transcript" in json.loads(body)["message"]
     assert (tmp / "new-meeting").exists()
+
+
+def test_state_says_when_live_mode_is_requested_but_runs_batch(fake_helper, gemini_key, monkeypatch, tmp_path):
+    import plistlib
+    from meeting_capture import cli
+    plist = tmp_path / "agent.plist"
+    monkeypatch.setattr(cli, "LAUNCHD_PLIST", plist)
+    plist.write_bytes(plistlib.dumps({"EnvironmentVariables": {"MEETING_CAPTURE_MODE": "live"}}))
+    d = ui._daemon_state()
+    assert d["mode"] == "live" and d["live_blocked"] == ""          # auto + key: live streams
+    plist.write_bytes(plistlib.dumps({"EnvironmentVariables": {"MEETING_CAPTURE_MODE": "live",
+                                                               "MEETING_CAPTURE_STT": "apple"}}))
+    assert "never uploads" in ui._daemon_state()["live_blocked"]

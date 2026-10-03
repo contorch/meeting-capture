@@ -195,11 +195,30 @@ class TestHelperExitCodes:
         with pytest.raises(t.AppleUnavailable):
             t._transcribe_apple(_wav(tmp_path / "c.wav"))
 
-    def test_timeout_on_a_chunk_is_a_chunk_failure(self, fake_helper, tmp_path, monkeypatch):
+    def test_timeout_is_not_charged_to_the_file(self, fake_helper, tmp_path, monkeypatch):
+        """A hang is usually the speech service, not the file: AppleError (the
+        daemon's judge decides), never AppleChunkFailed (counted at once)."""
         monkeypatch.setattr(t, "APPLE_MIN_TIMEOUT_S", 0.3)
         fake_helper.configure(sleep=3)
-        with pytest.raises(t.AppleChunkFailed, match="timed out"):
+        with pytest.raises(t.AppleError, match="timed out") as e:
             t._transcribe_apple(_wav(tmp_path / "c.wav"))
+        assert not isinstance(e.value, t.ChunkFailed)
+
+    def test_a_crash_is_not_charged_to_the_file(self, fake_helper, tmp_path):
+        import signal
+        fake_helper.configure(signal=signal.SIGKILL)
+        with pytest.raises(t.AppleError, match="signal 9") as e:
+            t._transcribe_apple(_wav(tmp_path / "c.wav"))
+        assert not isinstance(e.value, t.ChunkFailed)
+
+    def test_exit_0_without_a_transcript_is_an_error(self, fake_helper, tmp_path):
+        fake_helper.configure(no_json=True)
+        with pytest.raises(t.AppleError, match="no transcript"):
+            t._transcribe_apple(_wav(tmp_path / "c.wav"))
+
+    def test_only_exit_70_is_charged_to_the_file(self):
+        assert issubclass(t.AppleChunkFailed, t.ChunkFailed)
+        assert not issubclass(t.AppleError, t.ChunkFailed)
 
     def test_timeout_scales_with_the_chunk(self, tmp_path, monkeypatch):
         seen = []
@@ -315,3 +334,12 @@ def test_engine_summary(fake_helper):
     assert s["engine"] == "apple" and s["ready"] and s["locale"] == "en-IN" and not s["uploads"]
     assert s["choice_label"] == "Automatic" and s["gemini_key"] is False
     assert "hi-IN" in s["apple"]["supported"]
+
+
+def test_a_key_in_the_daemon_env_counts(fake_helper):
+    """The CLI asks on the daemon's behalf: a key in the launchd plist's env is
+    one the daemon will see (the CLI's own environment doesn't have it)."""
+    env = {"MEETING_CAPTURE_STT": "gemini", "GOOGLE_API_KEY": "in-the-plist"}
+    assert t.engine_summary(env)["gemini_key"] is True
+    assert t.resolve_backend(env=env).ready
+    assert t.engine_summary({})["gemini_key"] is False

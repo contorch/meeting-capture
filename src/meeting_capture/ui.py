@@ -139,7 +139,7 @@ class Meter:
 
 
 def _daemon_state() -> dict:
-    from .cli import LAUNCHD_PLIST, _is_running, _plist_mode, _read_pid
+    from .cli import LAUNCHD_PLIST, _is_running, _plist_mode, _read_pid, live_mode_blocker
 
     from .mic import is_mic_active
 
@@ -148,12 +148,19 @@ def _daemon_state() -> dict:
         in_call = is_mic_active()
     except Exception:
         in_call = False
+    mode = _plist_mode() if LAUNCHD_PLIST.exists() else "batch"
+    try:
+        live_blocked = (live_mode_blocker() or "") if mode == "live" else ""
+    except Exception:   # never break the page over it
+        live_blocked = ""
     return {
         "installed": LAUNCHD_PLIST.exists(),
         "running": bool(pid and _is_running(pid)),
         "paused": PAUSE_FILE.exists(),
         "in_call": in_call,
-        "mode": _plist_mode() if LAUNCHD_PLIST.exists() else "batch",
+        "mode": mode,
+        # live requested but the recorder runs batch: why (empty otherwise)
+        "live_blocked": live_blocked,
     }
 
 
@@ -563,7 +570,8 @@ function render(first){
   $("pause").textContent = d.paused ? "Resume recording" : "Pause recording";
   $("pause").disabled = !d.installed;
   $("newmeeting").disabled = !d.installed || d.paused;
-  $("ver").textContent = "meeting-capture " + S.version + (d.installed ? " · " + d.mode + " mode" : "");
+  $("ver").textContent = "meeting-capture " + S.version + (!d.installed ? "" :
+    d.mode === "live" && d.live_blocked ? " · live mode requested, running batch" : " · " + d.mode + " mode");
   if (first || !dirty) {
     $("src-"+S.source.source).checked = true;
     const devSel = $("device");
@@ -632,7 +640,9 @@ function sttHint(){
     bits.push(`Saving downloads the speech model for ${langName(loc)} from Apple once (English ≈ 140 MB; the shared Indian-languages model ≈ 250 MB).`);
   if (isIndic(loc)) bits.push("Indian languages come out romanized (Latin script); mixed Hindi and English (“Hinglish”) lands in one transcript.");
   bits.push("Gemini API key: " + (t.gemini_key ? "set" : "not set") + (t.engine === "gemini" || t.choice === "gemini" ? "." : " (optional)."));
-  if (S.daemon && S.daemon.mode === "live") bits.push("Live mode streams to Gemini; with on-device transcription the recorder runs batch.");
+  if (S.daemon && S.daemon.mode === "live") bits.push(S.daemon.live_blocked
+    ? "Live mode is requested, but " + S.daemon.live_blocked + ", so the recorder runs batch."
+    : "Live mode is on: calls stream to Gemini (uploaded) whatever is chosen here, which then only transcribes parked audio.");
   $("stthint").textContent = bits.join(" ");
 }
 function sayStt(text, kind){ const m=$("sttmsg"); m.textContent=text; m.className="msg "+(kind||""); }

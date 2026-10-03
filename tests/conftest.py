@@ -44,7 +44,11 @@ if "--install" in args:
     sys.exit(rc)
 path = args[-1]
 time.sleep(cfg.get("sleep", 0))
+if cfg.get("signal"):                      # the helper crashes
+    os.kill(os.getpid(), cfg["signal"])
 rc = cfg.get("transcribe_rc", {}).get(os.path.basename(path), cfg.get("default_rc", 0))
+if rc == 0 and cfg.get("no_json"):         # exits 0 without a transcript
+    sys.exit(0)
 if rc == 0:
     text = cfg.get("texts", {}).get(os.path.basename(path), cfg.get("text", "hello from this mac"))
     out({"text": text, "segments": [{"start": 0.0, "end": 1.0, "text": text, "confidence": 0.9}],

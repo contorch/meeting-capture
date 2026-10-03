@@ -12,15 +12,20 @@ last error):
 
   * the engine is unavailable (no key, on-device model missing, ...): parked,
     and the retry of parked audio waits until an engine is available again;
-  * this file failed (on-device exit 70, a crash or timeout on it): parked
-    with an attempt counted; after MAX_ATTEMPTS it moves to quarantine/ and
-    the queue moves on;
-  * anything else (Gemini/network): parked; this retry pass stops (no
-    hammering a rate-limited API) and the next one runs after the next
-    session, at startup, or when the engine comes back.
+  * the engine says this file can't be read (on-device exit 70): parked with
+    an attempt counted; after MAX_ATTEMPTS it moves to quarantine/ and the
+    queue moves on;
+  * anything else (Gemini/network errors; on-device exit 1, a hang, a crash):
+    parked, NOT counted yet — one failure can't tell a bad file from a broken
+    engine. _Judge counts it against the file only when the next attempt
+    shows the engine working. Two in a row mean the engine: nothing is
+    counted, the retry pass stops (no hammering) and the next one runs after
+    the next session, at startup, or when the engine comes back. So a
+    systemic failure never walks good audio into quarantine.
 """
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 import logging
@@ -52,15 +57,16 @@ from .recorder import (
     stream_chunks,
 )
 from .linein import linein_mode_enabled, stream_chunks_linein
-from .live import live_mode_enabled, run_live_session
+from .live import LIVE_FIXES, live_blocker, live_mode_enabled, run_live_session
 from .transcriber import (
-    AppleError,
     ChunkFailed,
     TranscriptionUnavailable,
     apple_status,
+    clear_apple_status_cache,
     install_apple_model,
     last_backend,
     resolve_backend,
+    stt_choice,
     transcribe,
 )
 from .watchdog import check_and_maybe_exit
@@ -85,6 +91,7 @@ BACKOFF_MAX_SECONDS = 300.0
 # Transcription worker.
 QUEUE_MAX = 64                 # chunks waiting for transcription before new ones are parked
 MAX_ATTEMPTS = 3               # per-file failures before a chunk is quarantined
+REPROBE_AFTER_FAILURES = 3     # unclassified failures in a row before the on-device probe is redone
 WORKER_IDLE_POLL_S = 2.0
 ENGINE_RECHECK_S = 60.0        # how often a blocked worker asks whether an engine is back
 MODEL_INSTALL_RETRY_S = 3600.0 # at most one automatic on-device model download per hour
@@ -234,7 +241,7 @@ def _park_failed(chunk: Chunk, reason: BaseException | str, meeting_id: str | No
             else "transcribed once that is fixed",
         )
     elif count:
-        log.warning("parked %s failed again (%s) — attempt %d of %d",
+        log.warning("parked %s failed (%s) — attempt %d of %d",
                     dest.name, reason, attempts, MAX_ATTEMPTS)
     return dest
 
@@ -325,23 +332,67 @@ OK, UNAVAILABLE, CHUNK_FAILED, FAILED = "ok", "unavailable", "chunk-failed", "fa
 
 def _attempt(chunk: Chunk, meeting_id: str) -> tuple[str, str]:
     """Transcribe one chunk and append it to `meeting_id`. Returns (outcome,
-    text-or-error). The audio is deleted on success and parked otherwise."""
+    text-or-error). The audio is deleted on success and parked otherwise;
+    only CHUNK_FAILED counts an attempt here (see _Judge for FAILED)."""
     try:
         text = transcribe(chunk.path, role=chunk.role)
     except TranscriptionUnavailable as exc:
         _park_failed(chunk, exc, meeting_id)
         return UNAVAILABLE, _why(exc)
-    except (ChunkFailed, AppleError) as exc:
+    except ChunkFailed as exc:
         _park_failed(chunk, exc, meeting_id, count=True)
         return CHUNK_FAILED, _why(exc)
     except Exception as exc:
         # Keep the audio. Deleting it here meant a call recorded before the
-        # Gemini key was set up was lost for good.
+        # Gemini key was set up was lost for good. Not counted: this may be
+        # the engine (on-device exit 1 / hang / crash, Gemini, network).
         _park_failed(chunk, exc, meeting_id)
         return FAILED, f"{type(exc).__name__}: {_why(exc)}"
     _append(meeting_id, chunk, text)
     _discard(chunk.path)
     return OK, text
+
+
+def _charge(chunk: Chunk, why: str) -> None:
+    """Count one failed attempt against a chunk parked earlier — unless it was
+    recovered or quarantined meanwhile."""
+    parked = FAILED_AUDIO_DIR / chunk.path.name
+    if parked.exists():
+        _park_failed(dataclasses.replace(chunk, path=parked), why, count=True)
+
+
+class _Judge:
+    """Tells a bad file from a broken engine for unclassified failures (FAILED:
+    on-device exit 1, a hang or a crash; Gemini or network errors).
+
+    The first FAILED after anything else is held, not counted. If the next
+    attempt shows the engine working — a chunk transcribes, or the engine
+    rejects a file by name (CHUNK_FAILED) — the held failure counts one
+    attempt toward that file's quarantine. If the next attempt — on another
+    file — fails the same way, it is the engine: nothing is counted, and
+    `streak` keeps rising. (The held file failing again, e.g. retried at the
+    session's end, says nothing about the engine: it stays held.)
+
+    So a systemic problem (an outage, Apple's speech service broken after an
+    OS update or wedged while its probe still says usable) never walks good
+    audio into quarantine, while a file that fails on its own still gets
+    there. The worker shares one judge between new and parked chunks."""
+
+    def __init__(self) -> None:
+        self.streak = 0                       # unclassified failures in a row
+        self._held: tuple[Chunk, str] | None = None
+
+    def record(self, chunk: Chunk, outcome: str, detail: str) -> None:
+        if outcome == FAILED:
+            if self._held is not None and self._held[0].path.name == chunk.path.name:
+                self._held = (chunk, detail)
+                return
+            self.streak += 1
+            self._held = (chunk, detail) if self.streak == 1 else None
+            return
+        held, self._held, self.streak = self._held, None, 0
+        if held is not None and outcome in (OK, CHUNK_FAILED):
+            _charge(*held)                    # the engine works: it was that file
 
 
 SUSPECT = "suspect"
@@ -352,19 +403,19 @@ class _RetryPass:
     goes back to the meeting it was recorded in (its sidecar), else to the
     meeting of the chunk before it unless the gap exceeds SESSION_GAP_SECONDS.
 
-    An unclassified error (FAILED) may be the network/key — stop, don't
-    hammer — or this one file. So the next chunk is tried once: if it fails
-    the same way the pass stops; if it works, the first failure was about
-    that file and counts toward its quarantine. One bad file can't hold up
-    the rest for ever, and an outage costs one extra request per pass."""
+    An unclassified error (FAILED) may be the engine/network/key — stop,
+    don't hammer — or this one file. So after the first one the next chunk is
+    tried once (SUSPECT) and the judge decides: a second failure in a row
+    stops the pass with nothing counted. One bad file can't hold up the rest
+    for ever, and an outage costs one extra request per pass."""
 
-    def __init__(self, chunks: list[Chunk]) -> None:
+    def __init__(self, chunks: list[Chunk], judge: _Judge | None = None) -> None:
         self.chunks = chunks
         self.i = 0
         self.session: str | None = None
         self.last_end = 0.0
         self.recovered = 0
-        self._suspect: tuple[Chunk, str] | None = None
+        self.judge = judge if judge is not None else _Judge()
 
     def done(self) -> bool:
         return self.i >= len(self.chunks)
@@ -386,15 +437,9 @@ class _RetryPass:
             log.info("recovered parked %s %.1fs [%s] -> %s (%d chars)%s",
                      chunk.path.name, chunk.duration_seconds, chunk.role, self.session,
                      len(detail), _via())
-        if outcome == FAILED:
-            if self._suspect is None and not self.done():
-                self._suspect = (chunk, detail)
-                return SUSPECT, detail
-            return FAILED, detail
-        if self._suspect is not None and outcome in (OK, CHUNK_FAILED):
-            bad, why = self._suspect
-            _park_failed(bad, why, count=True)       # the engine works: it was that file
-        self._suspect = None
+        self.judge.record(chunk, outcome, detail)
+        if outcome == FAILED and self.judge.streak == 1 and not self.done():
+            return SUSPECT, detail            # try the next one to tell file from engine
         return outcome, detail
 
 
@@ -449,6 +494,7 @@ class TranscriptionWorker:
         self._inflight: set[Path] = set()
         self._retry_wanted = False
         self._pass: _RetryPass | None = None
+        self._judge = _Judge()                # one for new and parked chunks alike
         self.blocked: str | None = None       # why no engine can run, while that lasts
         self._next_check = 0.0
         self._last_install = -MODEL_INSTALL_RETRY_S
@@ -539,6 +585,8 @@ class TranscriptionWorker:
         outcome, detail = _attempt(chunk, meeting_id)
         with self._lock:
             self._inflight.discard(chunk.path)
+        self._judge.record(chunk, outcome, detail)
+        self._maybe_reprobe(detail)
         if outcome == OK:
             # Log vocabulary is a contract: the Contorch menu bar
             # (pipeline-monitor status.recording_status) parses
@@ -560,6 +608,18 @@ class TranscriptionWorker:
         if current:      # no newer session started meanwhile
             log.info("mic inactive — session ended")
         self.request_retry()
+
+    def _maybe_reprobe(self, detail: str) -> None:
+        """Every REPROBE_AFTER_FAILURES unclassified failures in a row, forget
+        the cached on-device probe so the next chunk asks the helper again: a
+        wedged or broken speech service that the probe now reports as
+        unusable then parks audio as unavailable (and auto falls back to
+        Gemini) instead of burning a helper run, or a timeout, per chunk."""
+        n = self._judge.streak
+        if n and n % REPROBE_AFTER_FAILURES == 0 and stt_choice() != "gemini":
+            log.warning("%d transcriptions in a row failed (last: %s) — rechecking on-device "
+                        "transcription; the audio is kept and not counted against the files", n, detail)
+            clear_apple_status_cache()
 
     def _block(self, reason: str) -> None:
         if self.blocked is None:
@@ -595,9 +655,11 @@ class TranscriptionWorker:
             if not chunks:
                 return
             log.info("retrying %d parked chunk(s) from earlier failed transcriptions", len(chunks))
-            self._pass = _RetryPass(chunks)
+            self._pass = _RetryPass(chunks, self._judge)
         rp = self._pass
         outcome, detail = rp.step()
+        if outcome in (FAILED, SUSPECT):
+            self._maybe_reprobe(detail)
         if outcome == UNAVAILABLE:
             self._block(detail)
         elif outcome == FAILED:
@@ -693,23 +755,25 @@ def _permission_hint() -> str:
     )
 
 
-_live_refusal_logged = False
+_live_refusal_logged: str | None = None
 
 
 def live_permitted() -> bool:
-    """Live mode streams audio to Gemini. When transcription is (or resolves
-    to) on this Mac it must never upload, so live is refused and the session
-    runs batch."""
+    """Can MODE=live stream this session? Live mode is an explicit opt-in to
+    streaming the call to Gemini, so it runs with stt=auto as well (even when
+    batch would transcribe on this Mac). Refused — the session runs batch —
+    only with stt=apple, which never uploads, or without a Google API key
+    (live could not connect; batch keeps the audio). live.live_blocker()."""
     global _live_refusal_logged
-    b = resolve_backend()
-    if b.choice == "apple" or b.engine == "apple":
-        if not _live_refusal_logged:
-            log.warning(
-                "MODE: live requested, but transcription runs on this Mac and must never upload — "
-                "running batch instead (`meeting-capture stt gemini` to use live mode)")
-            _live_refusal_logged = True
-        return False
-    return True
+    why = live_blocker()
+    if why is None:
+        _live_refusal_logged = None
+        return True
+    if why != _live_refusal_logged:
+        log.warning("MODE: live requested, but %s — running batch instead (%s)",
+                    why, LIVE_FIXES.get(why, "see `meeting-capture doctor`"))
+        _live_refusal_logged = why
+    return False
 
 
 def _log_engine() -> None:

@@ -506,16 +506,169 @@ def test_chunks_left_behind_by_a_killed_daemon_are_adopted(dirs):
     assert daemon.adopt_orphans(exclude={fresh}, min_age_s=0) == 0     # queued right now: not an orphan
 
 
-def test_live_mode_is_refused_when_transcription_is_on_this_mac(fake_helper, gemini_key, monkeypatch, caplog):
-    monkeypatch.setattr(daemon, "_live_refusal_logged", False)
+def test_live_mode_survives_the_upgrade_to_on_device_transcription(fake_helper, gemini_key, monkeypatch):
+    """An existing live-mode user (key set, no MEETING_CAPTURE_STT) on a Mac
+    whose English model is installed: auto resolves batch to on this Mac,
+    but live mode — their explicit choice to stream to Gemini — keeps working."""
+    from meeting_capture import transcriber
+    monkeypatch.setattr(daemon, "_live_refusal_logged", None)
+    assert transcriber.resolve_backend().engine == "apple"
+    assert daemon.live_permitted() is True
+    # …and it doesn't flip once the daemon downloads a missing model either.
+    fake_helper.configure(installed=[])
+    assert transcriber.resolve_backend().engine == "gemini" and daemon.live_permitted() is True
+    fake_helper.configure(installed=["en-US"])
+    assert transcriber.resolve_backend().engine == "apple" and daemon.live_permitted() is True
+
+
+def test_live_mode_is_refused_only_for_on_device_only_or_without_a_key(fake_helper, gemini_key, monkeypatch,
+                                                                    caplog):
+    monkeypatch.setattr(daemon, "_live_refusal_logged", None)
     monkeypatch.setenv("MEETING_CAPTURE_STT", "apple")
     with caplog.at_level("WARNING", logger="meeting-capture"):
         assert daemon.live_permitted() is False
-    assert "never upload" in caplog.text
-    monkeypatch.setenv("MEETING_CAPTURE_STT", "auto")       # auto resolves to on this Mac here
-    assert daemon.live_permitted() is False
+        assert daemon.live_permitted() is False             # logged once, not per session
+    assert "never upload" in caplog.text and caplog.text.count("MODE: live requested") == 1
     monkeypatch.setenv("MEETING_CAPTURE_STT", "gemini")
     assert daemon.live_permitted() is True
+    monkeypatch.delenv("GOOGLE_API_KEY")
+    for stt in ("auto", "gemini"):                         # live could not connect: batch keeps the audio
+        monkeypatch.setenv("MEETING_CAPTURE_STT", stt)
+        with caplog.at_level("WARNING", logger="meeting-capture"):
+            assert daemon.live_permitted() is False
+    assert "no Google API key" in caplog.text
+
+
+# ---- a systemic failure is not the files' fault -----------------------------------------
+
+def _drain(w):
+    """Run the worker's retry of parked audio to the end, synchronously."""
+    w.request_retry()
+    for _ in range(100):
+        w._idle()
+        if w._pass is None and not w._retry_wanted:
+            return
+    raise AssertionError("retry pass never ended")
+
+
+SYSTEMIC = {
+    "exit 1": dict(default_rc=1),
+    "no transcript": dict(no_json=True),
+    "hang": dict(sleep=3),
+    "crash": dict(signal=9),
+}
+
+
+@pytest.mark.parametrize("failure", list(SYSTEMIC))
+def test_a_systemic_on_device_failure_never_quarantines_audio(dirs, fake_helper, monkeypatch, failure):
+    """Apple's speech service broken (after an OS update), wedged or crashing
+    while its probe still says usable: every chunk fails. Across a session,
+    several session ends and restarts nothing may be counted against the
+    files — and once the service is back, everything is transcribed."""
+    from meeting_capture import transcriber
+    audio, failed = dirs
+    monkeypatch.setenv("MEETING_CAPTURE_STT", "apple")
+    monkeypatch.setattr(transcriber, "APPLE_MIN_TIMEOUT_S", 0.2)
+    fake_helper.configure(**SYSTEMIC[failure])
+    w = daemon.TranscriptionWorker()
+    w._next_check = float("inf")
+    for i in range(4):                                    # one session
+        w._new_chunk(_chunk(audio, 1714003200 + i * 20), "meeting-a")
+    for n in range(3):                                    # session ends, daemon restarts
+        _drain(w)
+        daemon.retry_failed_chunks()
+        daemon.TranscriptionWorker()._new_chunk(_chunk(audio, 1714003300 + n * 20), "meeting-a")
+    parked = sorted(failed.glob("chunk-*.wav"))
+    assert len(parked) == 7
+    assert not list((failed / "quarantine").glob("*.wav"))
+    assert [daemon._read_meta(p)["attempts"] for p in parked] == [0] * 7
+    assert w.blocked is None                              # the probe still says usable
+    fake_helper.configure(default_rc=0, no_json=False, sleep=0, signal=None)
+    _drain(w)
+    assert not list(failed.glob("chunk-*.wav"))
+    assert _body("meeting-a").count("hello from this mac") == 7
+
+
+def test_a_failure_streak_rechecks_the_engine(dirs, fake_helper, monkeypatch, caplog):
+    """After REPROBE_AFTER_FAILURES unclassified failures in a row the cached
+    probe is dropped: if the helper now reports on-device unusable, the audio
+    is parked as unavailable (no helper run per chunk, nothing counted)."""
+    audio, failed = dirs
+    monkeypatch.setenv("MEETING_CAPTURE_STT", "apple")
+    fake_helper.configure(default_rc=1)
+    w = daemon.TranscriptionWorker()
+    w._next_check = float("inf")
+    w._new_chunk(_chunk(audio, 1714003200), "meeting-a")
+    w._new_chunk(_chunk(audio, 1714003210), "meeting-a")
+    fake_helper.configure(clear_cache=False, probe_rc=75)      # e.g. the model was released
+    with caplog.at_level("WARNING", logger="meeting-capture"):
+        w._new_chunk(_chunk(audio, 1714003220), "meeting-a")   # third in a row: re-probe next time
+    assert "3 transcriptions in a row failed" in caplog.text
+    n = len(fake_helper.transcribe_calls())
+    w._new_chunk(_chunk(audio, 1714003230), "meeting-a")
+    assert len(fake_helper.transcribe_calls()) == n            # the probe said no: helper not run
+    assert w.blocked and "isn't installed" in w.blocked
+    parked = list(failed.glob("chunk-*.wav"))
+    assert len(parked) == 4 and all(daemon._read_meta(p)["attempts"] == 0 for p in parked)
+
+
+def test_a_file_that_fails_on_its_own_still_reaches_quarantine(dirs, fake_helper, monkeypatch):
+    """The judge counts an unclassified failure once the next chunk shows the
+    engine working — also when the bad file is the only one parked."""
+    audio, failed = dirs
+    monkeypatch.setenv("MEETING_CAPTURE_STT", "apple")
+    bad = _chunk(audio, 1714003200)
+    fake_helper.configure(transcribe_rc={bad.path.name: 1})
+    w = daemon.TranscriptionWorker()
+    w._next_check = float("inf")
+    w._new_chunk(bad, "meeting-a")
+    for i in range(3):
+        w._new_chunk(_chunk(audio, 1714003300 + i * 20), "meeting-a")   # works: the bad one counts
+        if i < 2:
+            assert daemon._read_meta(failed / bad.path.name)["attempts"] == i + 1
+            _drain(w)                                    # session end: it fails again (held)
+    assert (failed / "quarantine" / bad.path.name).exists()
+    assert daemon._read_meta(failed / "quarantine" / bad.path.name)["attempts"] == 3
+    assert _body("meeting-a").count("hello from this mac") == 3
+
+
+def test_the_same_file_failing_twice_is_not_read_as_a_broken_engine(dirs, fake_helper, monkeypatch):
+    """The session's last chunk fails, then fails again when it is retried at
+    the session's end: that says nothing about the engine, so it is still
+    counted once the next session's first chunk works."""
+    audio, failed = dirs
+    monkeypatch.setenv("MEETING_CAPTURE_STT", "apple")
+    bad = _chunk(audio, 1714003300)
+    fake_helper.configure(transcribe_rc={bad.path.name: 1})
+    w = daemon.TranscriptionWorker()
+    w._next_check = float("inf")
+    w._new_chunk(_chunk(audio, 1714003200), "meeting-a")
+    w._new_chunk(bad, "meeting-a")
+    _drain(w)
+    assert len([c for c in fake_helper.transcribe_calls() if c[-1].endswith(bad.path.name)]) == 2
+    assert daemon._read_meta(failed / bad.path.name)["attempts"] == 0
+    w._new_chunk(_chunk(audio, 1714009000), "meeting-b")
+    assert daemon._read_meta(failed / bad.path.name)["attempts"] == 1
+
+
+def test_two_unclassified_failures_in_a_row_count_against_neither_file(dirs, monkeypatch):
+    """Judge rule: two unclassified failures in a row (new or parked) are the
+    engine — neither is counted, whatever works afterwards."""
+    audio, failed = dirs
+    results = iter([RuntimeError("a"), RuntimeError("b"), "fine"])
+
+    def fake(path, role):
+        r = next(results)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    monkeypatch.setattr(daemon, "transcribe", fake)
+    j = daemon._Judge()
+    chunks = [_chunk(audio, 1714003200 + i * 20) for i in range(3)]
+    for c in chunks:
+        j.record(c, *daemon._attempt(c, "meeting-a"))
+    assert [daemon._read_meta(failed / c.path.name)["attempts"] for c in chunks[:2]] == [0, 0]
 
 
 def test_worker_downloads_a_missing_on_device_model_once(fake_helper, monkeypatch):

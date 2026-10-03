@@ -114,7 +114,7 @@ def test_set_plist_mode_batch_removes_key(tmp_path, monkeypatch):
     assert "MEETING_CAPTURE_MODE" not in _read_env(plist)
 
 
-def test_cmd_mode_switch_relaunches(tmp_path, monkeypatch, capsys):
+def test_cmd_mode_switch_relaunches(tmp_path, monkeypatch, capsys, gemini_key):
     plist = tmp_path / "agent.plist"
     _write_plist(plist, {})
     monkeypatch.setattr(cli, "LAUNCHD_PLIST", plist)
@@ -126,7 +126,7 @@ def test_cmd_mode_switch_relaunches(tmp_path, monkeypatch, capsys):
     assert "switched to live" in capsys.readouterr().out
 
 
-def test_cmd_mode_noop_when_already_set(tmp_path, monkeypatch, capsys):
+def test_cmd_mode_noop_when_already_set(tmp_path, monkeypatch, capsys, gemini_key):
     plist = tmp_path / "agent.plist"
     _write_plist(plist, {"MEETING_CAPTURE_MODE": "live"})
     monkeypatch.setattr(cli, "LAUNCHD_PLIST", plist)
@@ -402,12 +402,37 @@ def test_language_show(fake_helper, agent, capsys):
     assert "supported: " in out and "hi-IN" in out
 
 
-def test_mode_live_refused_when_transcription_is_on_this_mac(fake_helper, agent, capsys):
+def test_mode_live_allowed_in_auto_even_when_batch_runs_on_this_mac(fake_helper, agent, gemini_key, capsys):
+    """Live mode is an explicit choice to stream to Gemini: auto doesn't block it."""
+    plist, calls = agent
+    assert cli.transcription_summary()["engine"] == "apple"
+    assert cli.main(["mode", "live"]) == 0
+    assert _read_env(plist)["MEETING_CAPTURE_MODE"] == "live" and calls == ["relaunch"]
+    assert "stream to Gemini" in capsys.readouterr().out
+
+
+def test_mode_live_refused_when_on_device_only(fake_helper, agent, gemini_key, capsys):
+    plist, calls = agent
+    cli._update_plist_env({"MEETING_CAPTURE_STT": "apple"})
+    before = plist.read_bytes()
+    assert cli.main(["mode", "live"]) == 1
+    err = capsys.readouterr().err
+    assert "never uploads" in err and "stt auto" in err
+    assert plist.read_bytes() == before and calls == []
+
+
+def test_mode_live_refused_without_a_key(fake_helper, agent, capsys):
     plist, calls = agent
     before = plist.read_bytes()
-    assert cli.main(["mode", "live"]) == 1                      # auto resolves to on this Mac
-    assert "never uploads" in capsys.readouterr().err
+    assert cli.main(["mode", "live"]) == 1
+    assert "no Google API key" in capsys.readouterr().err
     assert plist.read_bytes() == before and calls == []
+
+
+def test_mode_live_counts_a_key_in_the_daemon_env(fake_helper, agent):
+    plist, calls = agent
+    cli._update_plist_env({"GOOGLE_API_KEY": "from-the-plist"})
+    assert cli.main(["mode", "live"]) == 0 and calls == ["relaunch"]
 
 
 def test_mode_live_allowed_with_gemini(fake_helper, agent, gemini_key):
@@ -458,6 +483,44 @@ def test_status_and_doctor_show_the_engine(fake_helper, agent, monkeypatch, caps
     assert "✓ on-device model — en-US installed" in out
     assert "Google API key: not set (optional" in out
     assert "Google API key missing" not in out
+
+
+def test_status_doctor_and_stt_say_when_live_is_requested_but_runs_batch(fake_helper, agent, gemini_key,
+                                                                         monkeypatch, capsys, tmp_path):
+    _quiet_system(monkeypatch, tmp_path)
+    cli._update_plist_env({"MEETING_CAPTURE_MODE": "live", "MEETING_CAPTURE_STT": "apple"})
+    cli.main(["status"])
+    out = capsys.readouterr().out
+    assert "mode:             live requested — running batch: transcription is set to on this Mac only" in out
+    assert cli.main(["doctor"]) == 1
+    out = capsys.readouterr().out
+    assert "✗ live mode requested, but the recorder runs batch: transcription is set to on this Mac only" in out
+    assert "stt auto" in out
+    cli.main(["stt"])
+    assert "live mode: requested, but transcription is set to on this Mac only" in capsys.readouterr().out
+    assert cli.main(["mode"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "live\n" and "runs batch" in captured.err
+
+
+def test_status_doctor_and_stt_when_live_runs(fake_helper, agent, gemini_key, monkeypatch, capsys, tmp_path):
+    _quiet_system(monkeypatch, tmp_path)
+    cli._update_plist_env({"MEETING_CAPTURE_MODE": "live"})
+    cli.main(["status"])
+    out = capsys.readouterr().out
+    assert "mode:             live — calls stream to Gemini" in out
+    assert "gemini key:       set\n" in out                # needed for live, not "optional"
+    cli.main(["doctor"])
+    assert "✓ capture mode — live" in capsys.readouterr().out
+    cli.main(["stt"])
+    assert "live mode: on — calls stream to Gemini" in capsys.readouterr().out
+
+
+def test_live_on_line_in_is_reported_as_batch(fake_helper, agent, gemini_key, monkeypatch, capsys, tmp_path):
+    _quiet_system(monkeypatch, tmp_path)
+    cli._update_plist_env({"MEETING_CAPTURE_MODE": "live", "MEETING_CAPTURE_SOURCE": "linein"})
+    cli.main(["status"])
+    assert "live requested — running batch: the audio source is line-in" in capsys.readouterr().out
 
 
 def test_doctor_fails_when_nothing_can_transcribe(agent, monkeypatch, capsys, tmp_path):

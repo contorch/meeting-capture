@@ -111,11 +111,12 @@ def cmd_status(_args) -> int:
     print(f"  transcripts db:   {store.db_path()}")
     print(f"  log file:         {LOG_FILE}")
     print(f"  launchd:          {'installed' if LAUNCHD_PLIST.exists() else 'not installed'}")
-    print(f"  mode:             {_plist_mode()} ({'launchd plist' if LAUNCHD_PLIST.exists() else 'default'})")
+    print(f"  mode:             {_mode_line()} ({'launchd plist' if LAUNCHD_PLIST.exists() else 'default'})")
     s = transcription_summary()
     print(f"  transcription:    {_engine_line(s)}")
+    key_needed = s["engine"] == "gemini" or _plist_mode() == "live"
     print(f"  gemini key:       {'set' if s['gemini_key'] else 'not set'}"
-          f"{'' if s['engine'] == 'gemini' else ' (optional)'}")
+          f"{'' if key_needed else ' (optional)'}")
     parked = _parked_line()
     if parked:
         print(f"  waiting audio:    {parked}")
@@ -309,6 +310,16 @@ def cmd_doctor(_args) -> int:
     parked = _parked_line()
     if parked:
         print(f"  · {parked}")
+    if _plist_mode() == "live":
+        why = live_mode_blocker()
+        if why:
+            _fail(f"live mode requested, but the recorder runs batch: {why}",
+                  f"{_live_fix(why)}; or `meeting-capture mode batch`")
+        else:
+            _ok("capture mode", "live — calls stream to Gemini (in-meeting copilot); "
+                "the engine above only transcribes parked audio")
+    else:
+        print("  · capture mode: batch (`meeting-capture mode live` streams calls to Gemini for the copilot)")
 
     print("\nManual gates (cannot be checked from code):")
     print("  ?  Screen Recording TCC granted to the sysaudio binary itself (bin/sysaudio)")
@@ -512,9 +523,38 @@ def _plist_env() -> dict:
 
 
 def _plist_mode() -> str:
-    """Capture mode the launchd daemon runs in ("batch" unless the plist says live)."""
+    """Capture mode the launchd daemon is asked to run in ("batch" unless the
+    plist says live). Whether live can actually run: live_mode_blocker()."""
     v = _plist_env().get(MODE_ENV_VAR, "batch").strip().lower()
     return v if v in MODES else "batch"
+
+
+LINEIN_IS_BATCH = "the audio source is line-in, which always records in batch"
+
+
+def live_mode_blocker() -> str | None:
+    """Why the daemon, asked for live mode, runs batch instead (None: live can
+    run) — live.live_blocker() for the daemon's configuration, plus line-in."""
+    from .live import live_blocker
+    if current_source()["source"] == "linein":
+        return LINEIN_IS_BATCH
+    return live_blocker(_daemon_env())
+
+
+def _live_fix(why: str) -> str:
+    from .live import LIVE_FIXES
+    if why == LINEIN_IS_BATCH:
+        return "`meeting-capture source sck` (this Mac's own call audio) allows live mode"
+    return LIVE_FIXES.get(why, "see `meeting-capture doctor`")
+
+
+def _mode_line() -> str:
+    """The capture mode as it really runs, for status: says so when live mode
+    is asked for but the recorder runs batch."""
+    if _plist_mode() != "live":
+        return "batch"
+    why = live_mode_blocker()
+    return f"live requested — running batch: {why}" if why else "live — calls stream to Gemini"
 
 
 def _set_plist_mode(mode: str) -> None:
@@ -641,17 +681,21 @@ def _relaunch() -> None:
 
 def cmd_mode(args) -> int:
     if args.mode is None:
-        print(_plist_mode())
+        print(_plist_mode(), flush=True)   # stdout stays one word (scripts compare it)
+        if _plist_mode() == "live":
+            why = live_mode_blocker()
+            if why:
+                print(f"note: live mode is requested, but the recorder runs batch: {why}", file=sys.stderr)
         return 0
     if not LAUNCHD_PLIST.exists():
         print("no launchd agent installed — run `meeting-capture install` first", file=sys.stderr)
         return 1
     if args.mode == "live":
-        s = transcription_summary()
-        if s["choice"] == "apple" or s["engine"] == "apple":
-            print("live mode streams audio to Gemini, but transcription runs on this Mac, which never "
-                  "uploads.\nSwitch first with `meeting-capture stt gemini` (needs a Google API key), "
-                  "then `meeting-capture mode live`.", file=sys.stderr)
+        from .live import live_blocker
+        why = live_blocker(_daemon_env())
+        if why:
+            print(f"can't switch to live mode: {why}.\n{_live_fix(why)}, then `meeting-capture mode live`.",
+                  file=sys.stderr)
             return 1
     current = _plist_mode()
     if args.mode == current:
@@ -661,6 +705,9 @@ def cmd_mode(args) -> int:
     _relaunch()
     print(f"switched to {args.mode} mode; daemon restarted via launchd")
     if args.mode == "live":
+        print("calls now stream to Gemini (uploaded), whatever `meeting-capture stt` picks for batch")
+        if current_source()["source"] == "linein":
+            print(f"note: {LINEIN_IS_BATCH}; live applies once the source is sck again")
         print("tail the feed with `meeting-capture live`, or `meeting-capture copilot` for whispers")
     return 0
 
@@ -778,9 +825,11 @@ def apply_transcription(stt: str | None = None, locale: str | None = None, progr
                      "audio is kept until then")
     elif not s["ready"]:
         lines.append(f"not ready yet: {s['reason']}")
-    if _plist_mode() == "live" and (new_stt == "apple" or s["engine"] == "apple"):
-        lines.append("live mode is on, but on-device transcription never uploads, so the recorder "
-                     "runs batch (`meeting-capture stt gemini` for live)")
+    if _plist_mode() == "live":
+        why = live_mode_blocker()
+        lines.append(f"live mode is on, but {why}, so the recorder runs batch" if why else
+                     "live mode is on: calls stream to Gemini; this engine only transcribes "
+                     "parked audio")
     if _is_indic(new_locale) and s["engine"] != "gemini":
         lines.append(HINGLISH_NOTE)
     return "\n".join(lines)
@@ -796,8 +845,14 @@ def cmd_stt(args) -> int:
         print(f"setting:   {s['choice']}   (meeting-capture stt auto|apple|gemini)")
         print(f"language:  {s['locale']}   (meeting-capture language LOCALE; on this Mac only)")
         key = "set" if s["gemini_key"] else "not set"
+        live = _plist_mode() == "live"
         print(f"gemini:    API key {key}"
-              f"{'' if s['engine'] == 'gemini' or s['choice'] == 'gemini' else ' (optional)'}")
+              f"{'' if s['engine'] == 'gemini' or s['choice'] == 'gemini' or live else ' (optional)'}")
+        if live:
+            why = live_mode_blocker()
+            print(f"live mode: requested, but {why} — running batch" if why else
+                  "live mode: on — calls stream to Gemini (uploaded); the engine above only "
+                  "transcribes parked audio")
         return 0
     if not LAUNCHD_PLIST.exists():
         print("no launchd agent installed — run `meeting-capture install` first", file=sys.stderr)

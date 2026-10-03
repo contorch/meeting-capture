@@ -126,8 +126,9 @@ class TranscriptionUnavailable(RuntimeError):
 
 
 class ChunkFailed(RuntimeError):
-    """This one audio file failed; the next may well work. The daemon parks it
-    with an attempt count and quarantines it after a few tries."""
+    """This one audio file can't be transcribed (the engine says so); the next
+    may well work. The daemon parks it with an attempt count and quarantines
+    it after a few tries."""
 
 
 class AppleUnavailable(TranscriptionUnavailable):
@@ -136,12 +137,16 @@ class AppleUnavailable(TranscriptionUnavailable):
 
 
 class AppleChunkFailed(ChunkFailed):
-    """The helper could not transcribe this file (exit 70, crashed on it, or
-    timed out on it)."""
+    """The helper says this file is unreadable or undecodable (exit 70). The
+    only on-device failure that is charged to the file straight away."""
 
 
 class AppleError(RuntimeError):
-    """The helper failed some other way (exit 1, unreadable output)."""
+    """The helper failed some other way: exit 1, no or unreadable output, a
+    timeout, a crash (signal). That may be this file or Apple's speech service
+    (broken after an OS update, wedged, an XPC interruption), so the daemon
+    doesn't count it against the file until another chunk shows the engine
+    working (daemon._Judge)."""
 
 
 # --- generate_content backend prompts ------------------------------------------------
@@ -420,7 +425,8 @@ def _transcribe_apple(audio_path: Path, role: str = "them", locale: Optional[str
     try:
         r = _run_helper(binary, ["--locale", locale, str(audio_path)], timeout)
     except subprocess.TimeoutExpired as exc:
-        raise AppleChunkFailed(
+        # A hang is far more often the speech service than the file: not ChunkFailed.
+        raise AppleError(
             f"on-device transcription of {audio_path.name} timed out after {timeout:.0f}s") from exc
     except OSError as exc:
         clear_apple_status_cache()
@@ -441,7 +447,7 @@ def _transcribe_apple(audio_path: Path, role: str = "them", locale: Optional[str
         clear_apple_status_cache()
         raise AppleUnavailable(OLD_HELPER_REASON)
     if rc < 0:
-        raise AppleChunkFailed(f"the transcription helper died (signal {-rc}) on {audio_path.name}")
+        raise AppleError(f"the transcription helper died (signal {-rc}) on {audio_path.name}")
     raise AppleError(f"on-device transcription failed (exit {rc}): {detail}")
 
 
@@ -460,7 +466,12 @@ class Backend:
         return ENGINE_LABELS.get(self.engine, self.engine)
 
 
-def gemini_key_present() -> bool:
+def gemini_key_present(env=None) -> bool:
+    """Would Gemini find a key? `env` is the daemon's configuration when the
+    CLI asks on its behalf (a key can sit in the launchd plist's env); the
+    daemon itself passes nothing and reads its own environment."""
+    if env is not None and (env.get("GOOGLE_API_KEY") or env.get("GEMINI_API_KEY")):
+        return True
     return bool(_resolve_gemini_api_key())
 
 
@@ -471,7 +482,7 @@ def resolve_backend(choice: Optional[str] = None, locale: Optional[str] = None, 
         choice = DEFAULT_STT
     locale = normalize_locale(locale) if locale else stt_locale(env)
     if choice == "gemini":
-        if gemini_key_present():
+        if gemini_key_present(env):
             return Backend("gemini", choice, "chosen with `meeting-capture stt gemini`", locale, True)
         return Backend("gemini", choice, "chosen with `meeting-capture stt gemini`, but no Google API key is set "
                        "(GOOGLE_API_KEY / GEMINI_API_KEY / ~/.config/google/key)", locale, False)
@@ -480,7 +491,7 @@ def resolve_backend(choice: Optional[str] = None, locale: Optional[str] = None, 
         return Backend("apple", choice, st.reason, st.locale or locale, True)
     if choice == "apple":
         return Backend("apple", choice, st.reason, locale, False)
-    if gemini_key_present():
+    if gemini_key_present(env):
         return Backend("gemini", choice, f"on this Mac isn't available ({st.reason}); using Gemini", locale, True)
     return Backend("none", choice, f"on this Mac isn't available ({st.reason}) and no Gemini API key is set",
                    locale, False)
@@ -495,7 +506,7 @@ def engine_summary(env=None) -> dict:
     return {
         "choice": choice, "choice_label": CHOICE_LABELS[choice],
         "engine": b.engine, "engine_label": b.label, "reason": b.reason, "ready": b.ready,
-        "locale": locale, "apple": st.as_dict(), "gemini_key": gemini_key_present(),
+        "locale": locale, "apple": st.as_dict(), "gemini_key": gemini_key_present(env),
         "uploads": b.engine == "gemini",
     }
 
@@ -565,8 +576,10 @@ def transcribe(
 
     Raises:
         TranscriptionUnavailable: no engine can run now (park the audio).
-        ChunkFailed: this file failed on-device (park it, count the attempt).
-        Anything else: a Gemini/network/helper error.
+        ChunkFailed: the engine says this file can't be read (park it, count
+            the attempt).
+        Anything else (AppleError, Gemini/network errors): the file or the
+            engine — can't tell from one failure.
     """
     _tls.backend = None
     if model == "apple":
