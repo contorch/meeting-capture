@@ -1,10 +1,10 @@
 # meeting-capture
 
-Always-on meeting transcription daemon for macOS. Detects when another app is using your microphone (any video/audio call), captures **both sides of the meeting** — system audio output (the other participants) and your own microphone — via ScreenCaptureKit, transcribes each side via Google's hosted Gemini audio models, and stores timestamped, speaker-attributed (`**Me:**` / `**Them:**`) transcripts in the contorch database (`~/.context-orchestrator/context.db`, table `transcripts`) — no transcript files.
+Always-on meeting transcription daemon for macOS. Detects when another app is using your microphone (any video/audio call), captures **both sides of the meeting** — system audio output (the other participants) and your own microphone — via ScreenCaptureKit, transcribes each side — on the Mac itself (macOS 26+, Apple silicon) or with Google's hosted Gemini models — and stores timestamped, speaker-attributed (`**Me:**` / `**Them:**`) transcripts in the contorch database (`~/.context-orchestrator/context.db`, table `transcripts`) — no transcript files.
 
 No driver, no kernel extension, no `sudo`, no reboot. Two user-grantable permissions: Screen Recording (system audio) and Microphone (your voice; macOS 15+, optional — without it you get system audio only).
 
-> **Note:** transcription is hosted (Gemini), so each audio chunk is sent to Google's API and a Google API key is required. A previous local mlx-whisper backend was removed — it ran on the GPU and its unbounded MLX Metal buffer cache leaked tens of GB in a long-lived daemon.
+> **Note:** on macOS 26+ with Apple silicon, transcription runs **on this Mac** by default (Apple's on-device speech recognition) — no audio leaves the machine and no API key is needed. Gemini is optional: it is used only when you choose it, or automatically when on-device transcription isn't available and a Google API key is set. See [Transcription](#transcription).
 
 Pairs with [context-orchestrator](https://github.com/contorch/context-orchestrator), which indexes each meeting into a searchable vector store and serves the full text (`get_transcript`). The two are coupled only via that SQLite table (the same `CREATE TABLE` on both sides; `CO_DB_PATH` overrides the location); either runs independently.
 
@@ -13,7 +13,8 @@ Pairs with [context-orchestrator](https://github.com/contorch/context-orchestrat
 - macOS 13.0 or later (ScreenCaptureKit); macOS 15.0+ for own-voice ("me") capture
 - Python 3.10+
 - Xcode command-line tools (`xcode-select --install`)
-- A Google API key for Gemini — from `$GOOGLE_API_KEY`, `$GEMINI_API_KEY`, or `~/.config/google/key` (mode 600)
+- For on-device transcription: macOS 26+ on Apple silicon (nothing else — no key, no account)
+- Otherwise (Intel, macOS < 26, or by choice): a Google API key for Gemini — from `$GOOGLE_API_KEY`, `$GEMINI_API_KEY`, or `~/.config/google/key` (mode 600)
 
 ## Install
 
@@ -52,6 +53,10 @@ CLI commands for inspection and control:
 | `meeting-capture tail` | Follow the daemon log |
 | `meeting-capture pause` | Pause capture (creates `~/.meeting-capture/paused`) |
 | `meeting-capture resume` | Resume capture |
+| `meeting-capture new` | Start a new meeting (speech from now on goes into a new transcript) |
+| `meeting-capture stt [auto\|apple\|gemini]` | Show the transcription engine in use and why, or switch it (restarts the daemon) |
+| `meeting-capture language [LOCALE]` | Show or set the on-device language (installs its model first) |
+| `meeting-capture ui` | Settings page: audio source, interface inputs and levels, transcription engine and language |
 | `meeting-capture install` | Install the launchd auto-start agent |
 | `meeting-capture uninstall` | Remove the launchd auto-start agent |
 | `meeting-capture start` / `stop` | Manual daemon control |
@@ -70,7 +75,8 @@ mic activates                                     mic deactivates
 │  - while active: spawns sysaudio subprocess                      │
 │  - two channels: system audio = "them", microphone = "me"        │
 │  - each channel splits on silence (≥3s gap, ≥8s min, ≤600s max)  │
-│  - sends each chunk to Gemini, appends labeled text to the DB    │
+│  - queues each chunk; one worker thread transcribes it (on this  │
+│    Mac or Gemini) and appends labeled text to the DB             │
 │  - on mic-off: flushes in-flight buffers, terminates sysaudio    │
 └──────────────────────────────────────────────────────────────────┘
             │                                          │
@@ -86,9 +92,11 @@ mic activates                                     mic deactivates
 
 A new transcript (row) is started whenever the gap between chunks exceeds 15 minutes. Mid-meeting mic mutes do not fragment it. If the database can't be written (locked, disk full), lines queue in `~/.meeting-capture/unsaved-lines.jsonl` and are written ahead of the next line. Raw audio chunks are deleted from disk after transcription.
 
+Capture never waits for transcription: the capture loop decides each chunk's meeting and hands it to a bounded queue, and a single worker thread transcribes the chunks in order. A chunk that can't be transcribed is never deleted — it is kept in `~/.meeting-capture/audio/failed/` (with a small `.json` note of its meeting and attempts) and retried when the worker is idle: after the engine comes back if it was unavailable (no key, on-device model missing), or after the next session for other errors. A file that fails on its own three times moves to `audio/failed/quarantine/` so it can't hold up the rest (move it back to retry).
+
 ### Two-channel (me/them) capture
 
-On macOS 15+ `sysaudio` captures the microphone alongside system audio in the same ScreenCaptureKit stream (`--mic`; framed stdout protocol, both channels 16 kHz mono int16). Each channel runs through its own silence chunker, and transcript lines are labeled `**Me:**` (your mic) or `**Them:**` (system audio). Speaker attribution across the me/them boundary is therefore exact; multiple remote speakers within a "them" chunk still get best-effort `[SPEAKER_n]` labels from Gemini. Set `MEETING_CAPTURE_MIC=0` to opt out (system audio only). On macOS 13/14 the daemon runs system-audio-only automatically.
+On macOS 15+ `sysaudio` captures the microphone alongside system audio in the same ScreenCaptureKit stream (`--mic`; framed stdout protocol, both channels 16 kHz mono int16). Each channel runs through its own silence chunker, and transcript lines are labeled `**Me:**` (your mic) or `**Them:**` (system audio). Speaker attribution across the me/them boundary is therefore exact; multiple remote speakers within a "them" chunk still get best-effort `[SPEAKER_n]` labels when Gemini transcribes. Set `MEETING_CAPTURE_MIC=0` to opt out (system audio only). On macOS 13/14 the daemon runs system-audio-only automatically.
 
 Mic-activity gating uses per-process Core Audio HAL attribution (`kAudioProcessPropertyIsRunningInput`) and ignores `com.apple.replayd`, ScreenCaptureKit's capture backend — otherwise the daemon's own mic capture would hold the "mic in use" gate open forever. Real meeting apps hold the mic under their own process, so gating is unaffected.
 
@@ -99,17 +107,38 @@ Note on echo: without headphones, your mic also picks up the other side from the
 - `~/.context-orchestrator/context.db` — transcripts (`meeting-capture last` prints the latest; contorch's `get_transcript` / `contorch-transcripts show` any)
 - `~/.meeting-capture/daemon.log` — daemon log (rotated by macOS)
 - `~/.meeting-capture/paused` — pause sentinel
-- `~/.meeting-capture/audio/` — temporary chunk WAVs (deleted post-transcription)
+- `~/.meeting-capture/audio/` — temporary chunk WAVs (deleted post-transcription); `audio/failed/` holds audio waiting for a retry, `audio/failed/quarantine/` files that failed three times
 - `~/Library/LaunchAgents/com.contorch.meeting-capture.plist` — launchd agent
 - `bin/sysaudio` — built audio-capture binary (gitignored)
 
 ## Transcription
 
-Transcription is hosted on Google's Gemini. Default model: `gemini-3.5-transcribe` — Google's purpose-built speech-to-text model (~$0.005 per meeting-minute per channel at list prices), called through the Interactions API in verbatim mode. If it errors, the chunk automatically falls back to `gemini-2.5-flash` (prompted transcription, ~$0.0025/min) so nothing is lost. Override with `MEETING_CAPTURE_GEMINI_MODEL`; both models return an empty string for silence/noise rather than hallucinated filler.
+Two engines, chosen with `meeting-capture stt` (or the settings page) and stored in the launchd plist as `MEETING_CAPTURE_STT`:
+
+| Setting | What happens |
+|---|---|
+| `auto` (default) | **On this Mac** when it can (macOS 26+, Apple silicon, the language's model installed); otherwise Gemini if a Google API key is set; otherwise the audio is kept and transcribed later. |
+| `apple` | **On this Mac only.** Never uploads anything: if on-device transcription can't run, the audio is kept and retried on-device later. |
+| `gemini` | Always Gemini (hosted; each chunk is uploaded to Google; needs a key). |
+
+```bash
+meeting-capture stt             # engine in use, why, and the language
+meeting-capture stt apple       # on-device only (restarts the daemon)
+meeting-capture language        # current language + the supported ones
+meeting-capture language hi-IN  # downloads that language's model from Apple once, then switches
+```
+
+**On this Mac.** Apple's on-device speech recognition (SpeechAnalyzer / SpeechTranscriber), run by the same signed `sysaudio` binary that captures audio (`sysaudio transcribe`). No account, no key, no Speech Recognition permission prompt, and nothing leaves the Mac. The model runs in Apple's speech service, outside the daemon, about 8–150× faster than real time on Apple silicon. In our tests its accuracy on clean English meeting speech matched `gemini-2.5-flash`; it ignores the custom vocabulary (proper nouns are its weak spot), is weaker in noise, and can't diarize multiple remote speakers. If the language's model isn't on the Mac yet, the daemon downloads it from Apple once (English ≈ 140 MB is usually already there; `meeting-capture language` does it up front).
+
+Languages (`MEETING_CAPTURE_LOCALE`, default `en-US`): English (US, UK, India, Australia, …), French, German, Spanish, Italian, Portuguese, Japanese, Korean, Chinese and the Indian languages — `meeting-capture language` lists exactly what this Mac supports. The English variants share one model (en-IN transcribes like en-US). **Hindi:** `hi-IN` downloads one shared Indian-languages model (≈ 250 MB, also covering Bengali, Tamil, Telugu, Marathi, Urdu, …) and its output is **romanized** — Hindi comes out in Latin script ("Hinglish"), and mixed Hindi/English speech works in one transcript (English-locale models mangle the Hindi words). For Devanagari output, use Gemini.
+
+**Gemini.** Default model: `gemini-3.5-transcribe` — Google's purpose-built speech-to-text model (~$0.005 per meeting-minute per channel at list prices), called through the Interactions API in verbatim mode. If it errors, the chunk automatically falls back to `gemini-2.5-flash` (prompted transcription, ~$0.0025/min) so nothing is lost. Override with `MEETING_CAPTURE_GEMINI_MODEL`; both models return an empty string for silence/noise rather than hallucinated filler. Gemini detects the language by itself, honours the custom vocabulary, and is required for live mode.
+
+`meeting-capture status` and `doctor` show the engine in use and why, the language and whether its model is installed, whether a Gemini key exists (optional unless Gemini is used), and how much audio is waiting. Each transcribed chunk's log line ends with the engine (`… (N chars) via apple`).
 
 ### Live mode & the in-meeting copilot
 
-By default the daemon runs in **batch** mode: it chunks audio and transcribes after each pause (cheapest, most robust). Run `meeting-capture mode live` once and the launchd daemon streams to `gemini-3.5-transcribe-live` instead — ~1-second interim hypotheses and finalized utterances — which is what the in-meeting copilot needs. Finals still land in the meeting's transcript row exactly as in batch mode; live *additionally* writes a per-session feed under `~/.meeting-capture/live/`.
+By default the daemon runs in **batch** mode: it chunks audio and transcribes after each pause (cheapest, most robust). Live mode streams to Gemini, so it needs `meeting-capture stt gemini` and a key: with on-device transcription (`apple`, or `auto` resolving to on this Mac) `mode live` is refused and a live plist runs batch, because on-device must never upload. Run `meeting-capture mode live` once and the launchd daemon streams to `gemini-3.5-transcribe-live` instead — ~1-second interim hypotheses and finalized utterances — which is what the in-meeting copilot needs. Finals still land in the meeting's transcript row exactly as in batch mode; live *additionally* writes a per-session feed under `~/.meeting-capture/live/`.
 
 Switch once, then one pane during a meeting:
 
@@ -125,17 +154,17 @@ Keep using the launchd daemon for live mode rather than `MEETING_CAPTURE_MODE=li
 
 ### Settings page
 
-`meeting-capture ui` — or **Recording settings…** in the Contorch menu bar ([pipeline-monitor](https://github.com/contorch/pipeline-monitor)) — opens a settings page in the browser (served from this Mac on 127.0.0.1 only; nothing to install). Choose where audio comes from — this Mac's call audio, or a USB interface such as a Behringer UMC202HD/UMC404HD — pick the device and which input is the host ("Me") and which the guests ("Them"), and watch live level meters for every input while you set the interface's gain knobs (aim for peaks between −18 and −6 dBFS; a CLIP flag means turn down or press PAD). Save restarts the recorder with the new settings — the same thing `meeting-capture source linein --device … --me … --them …` does. The page also pauses/resumes recording and shows the latest transcript lines as they arrive. Metering from the page never counts as "a call started".
+`meeting-capture ui` — or **Recording settings…** in the Contorch menu bar ([pipeline-monitor](https://github.com/contorch/pipeline-monitor)) — opens a settings page in the browser (served from this Mac on 127.0.0.1 only; nothing to install). Choose where audio comes from — this Mac's call audio, or a USB interface such as a Behringer UMC202HD/UMC404HD — pick the device and which input is the host ("Me") and which the guests ("Them"), and watch live level meters for every input while you set the interface's gain knobs (aim for peaks between −18 and −6 dBFS; a CLIP flag means turn down or press PAD). Save restarts the recorder with the new settings — the same thing `meeting-capture source linein --device … --me … --them …` does. The **Transcription** section shows the engine in use and why, switches between On this Mac / Gemini / Automatic, and picks the on-device language from the ones this Mac supports (a language whose model isn't installed is downloaded from Apple first; the page shows the download while it runs) — the same as `meeting-capture stt` / `language`. The page also pauses/resumes recording and shows the latest transcript lines as they arrive. Metering from the page never counts as "a call started".
 
 ### Vocabulary
 
-Proper nouns are where transcription goes wrong. Put yours — names, products, jargon — in `~/.meeting-capture/vocab.txt` (one per line, up to 1,000; `meeting-capture vocab edit`) and the transcribe model spells them deterministically. Without it, "contorch" came back as "Concourse" in our tests; with it, never.
+Proper nouns are where transcription goes wrong. Put yours — names, products, jargon — in `~/.meeting-capture/vocab.txt` (one per line, up to 1,000; `meeting-capture vocab edit`) and the Gemini transcribe model spells them deterministically. The vocabulary applies to Gemini only; on-device transcription ignores it. Without it, "contorch" came back as "Concourse" in our tests; with it, never.
 
 `MEETING_CAPTURE_DIARIZE=1` turns on speaker diarization for the `Them` channel (`[SPEAKER_n]` per turn). The API makes diarization and vocabulary mutually exclusive, so it's off by default — memory fidelity beats speaker labels within a channel; the Me/Them split is exact regardless.
 
 ### API key
 
-A Google API key is required, resolved in this order:
+Only needed for Gemini (chosen, or the fallback of `auto` when on-device isn't available) and live mode. Resolved in this order:
 
 1. `$GOOGLE_API_KEY`
 2. `$GEMINI_API_KEY`

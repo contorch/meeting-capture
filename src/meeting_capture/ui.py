@@ -6,9 +6,12 @@ UMC202HD/UMC404HD), pick the device and which input is the host ("Me") and
 which the guests ("Them"), watch live per-input level meters while setting the
 gain knobs, pause/resume, and see the latest transcript lines arrive.
 
-Settings go through the same code as the CLI (cli.apply_source → the launchd
-plist → daemon restart), so the page and `meeting-capture source` can't
-disagree. No new dependencies: stdlib http.server; the meters use the
+Settings go through the same code as the CLI (cli.apply_source /
+cli.apply_transcription → the launchd plist → daemon restart), so the page and
+`meeting-capture source|stt|language` can't disagree. The Transcription
+section picks the engine (on this Mac / Gemini / automatic) and the on-device
+language; a language whose model isn't on the Mac yet is downloaded from
+Apple first, while the page says so. No new dependencies: stdlib http.server; the meters use the
 sounddevice package the line-in extra already installs. macOS lets several
 processes read one input device, so metering works while the daemon records.
 
@@ -167,6 +170,16 @@ def _latest_transcript(lines: int = 12) -> dict:
             "age_s": round(time.time() - r["updated_at"])}
 
 
+def _transcription_state() -> dict:
+    """Engine in use and why, the setting, the language, what this Mac can do
+    on-device (supported / installed languages) and whether a Gemini key exists."""
+    try:
+        from .cli import transcription_summary
+        return transcription_summary()
+    except Exception as exc:   # never break the page over it
+        return {"error": str(exc)}
+
+
 def state(meter: "Meter | None" = None) -> dict:
     from .cli import current_source
     from .linein import list_input_devices, refresh_devices
@@ -183,6 +196,7 @@ def state(meter: "Meter | None" = None) -> dict:
         "source": current_source() if daemon["installed"] else
                   {"source": "sck", "device": "", "me": 0, "them": 1},
         "devices": list_input_devices(),
+        "transcription": _transcription_state(),
         "transcript": _latest_transcript(),
     }
 
@@ -199,10 +213,15 @@ class Activity:
         return time.time() - self.last
 
 
-def make_handler(token: str, meter: Meter, apply_source=None, activity: "Activity | None" = None):
+def make_handler(token: str, meter: Meter, apply_source=None, activity: "Activity | None" = None,
+                 apply_transcription=None):
     def _apply_source(**kw):
         from .cli import apply_source as real
         return (apply_source or real)(**kw)
+
+    def _apply_transcription(**kw):
+        from .cli import apply_transcription as real
+        return (apply_transcription or real)(**kw)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "meeting-capture-ui"
@@ -285,6 +304,13 @@ def make_handler(token: str, meter: Meter, apply_source=None, activity: "Activit
                             PAUSE_FILE.unlink(missing_ok=True)
                             request_new_meeting()
                         msg = "Recording resumed — the next speech starts a new transcript"
+                elif path == "/api/transcription":
+                    # Blocks while a language's model downloads (the page
+                    # says so); the threaded server keeps answering polls.
+                    stt = body.get("stt")
+                    locale = body.get("locale") or None
+                    msg = _apply_transcription(stt=None if stt is None else str(stt),
+                                               locale=None if locale is None else str(locale))
                 elif path == "/api/new-meeting":
                     from .meetings import request_new_meeting
                     request_new_meeting()
@@ -422,7 +448,15 @@ button:focus-visible,select:focus-visible,.choice:focus-within{outline:2px solid
 .scale span{position:absolute;transform:translateX(-50%);white-space:nowrap}
 .scale span:last-child{transform:translateX(-100%)}
 .hint{color:var(--muted);font-size:.88rem;margin:10px 0 0}
-.msg{min-height:1.4em;font-size:.9rem}
+.msg{min-height:1.4em;font-size:.9rem;white-space:pre-line}
+.choice:has(input:disabled){cursor:default}
+.choice:has(input:disabled) span{opacity:.55}
+.now{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;margin:0 0 12px;font-size:.92rem}
+.now b{font-weight:600}
+.tag{font-size:.75rem;font-weight:600;padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+.tag.local{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 45%,transparent)}
+.tag.cloud{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 45%,transparent)}
+.tag.off{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 45%,transparent)}
 .msg.err{color:var(--bad)} .msg.ok{color:var(--ok)}
 pre{margin:0;font-family:var(--mono);font-size:.82rem;white-space:pre-wrap;line-height:1.55;max-height:260px;overflow:auto}
 .me{color:var(--me)} .them{color:var(--them)}
@@ -466,6 +500,25 @@ pre{margin:0;font-family:var(--mono);font-size:.82rem;white-space:pre-wrap;line-
       <button class="primary" id="save">Save and restart recorder</button>
     </div>
   </div>
+</section>
+
+<section id="sttbox">
+  <h2>Transcription</h2>
+  <p class="now" id="sttnow"></p>
+  <div class="choices">
+    <label class="choice"><input type="radio" name="stt" value="apple" id="stt-apple">
+      <span><b>On this Mac</b><small id="stt-apple-note">Apple's on-device speech recognition. Audio never leaves this Mac; no account or key.</small></span></label>
+    <label class="choice"><input type="radio" name="stt" value="gemini" id="stt-gemini">
+      <span><b>Gemini</b><small>Google's hosted model: uploads each chunk and needs a Google API key. Custom vocabulary and live mode.</small></span></label>
+    <label class="choice"><input type="radio" name="stt" value="auto" id="stt-auto">
+      <span><b>Automatic</b><small>On this Mac when it can; Gemini otherwise, only if a key is set.</small></span></label>
+  </div>
+  <div class="row" style="margin-top:14px;align-items:flex-end">
+    <label class="f">Language (on this Mac)<select id="locale"></select></label>
+    <button id="sttsave">Save transcription settings</button>
+  </div>
+  <p class="hint" id="stthint"></p>
+  <div class="msg" id="sttmsg" role="status" aria-live="polite"></div>
 </section>
 
 <section>
@@ -533,7 +586,56 @@ function render(first){
   $("transcript").innerHTML = t.lines && t.lines.length ? t.lines.map(esc).map(l =>
     l.replace("**Me:**", '<b class="me">Me:</b>').replace("**Them:**", '<b class="them">Them:</b>')).join("\n") : "Nothing recorded yet.";
   buildMeters();
+  renderStt(first);
 }
+
+let sttDirty = false, sttBusy = false;
+const langNames = (() => { try { return new Intl.DisplayNames(["en"], {type:"language"}); } catch(e){ return null; } })();
+function langName(code){
+  if (code === "mul-IN") return "Indian languages (shared model)";
+  try { return (langNames && langNames.of(code)) || code; } catch(e){ return code; }
+}
+function isIndic(code){ return /-IN$/.test(code) && !/^en-/.test(code); }
+function renderStt(first){
+  const t = S.transcription;
+  if (!t || t.error) { $("sttnow").textContent = t && t.error ? "Can't read the transcription settings: " + t.error : ""; return; }
+  const a = t.apple || {};
+  const tag = t.engine === "apple" && t.ready ? '<span class="tag local">nothing uploaded</span>'
+            : t.engine === "gemini" && t.ready ? '<span class="tag cloud">uploads to Google</span>'
+            : '<span class="tag off">not transcribing — audio is kept</span>';
+  const engine = t.engine === "apple" ? "On this Mac" + (t.ready ? " (" + langName(t.locale) + ")" : "")
+               : t.engine === "gemini" ? "Gemini" : "Nothing yet";
+  $("sttnow").innerHTML = `<span>Now: <b>${esc(engine)}</b></span>${tag}<span class="muted">${esc(t.reason)}</span>`;
+  $("stt-apple").disabled = !a.available;
+  $("stt-apple-note").textContent = a.available
+    ? "Apple's on-device speech recognition. Audio never leaves this Mac; no account or key."
+    : "Not available here — " + a.reason;
+  if ((first || !sttDirty) && !sttBusy) {
+    const r = $("stt-" + t.choice); if (r) r.checked = true;
+    const sel = $("locale"); sel.innerHTML = "";
+    const list = (a.supported && a.supported.length) ? a.supported.slice() : [t.locale];
+    if (!list.includes(t.locale)) list.unshift(t.locale);
+    const have = new Set(a.installed_locales || []);
+    list.sort((x, y) => langName(x).localeCompare(langName(y)));
+    for (const code of list) {
+      sel.add(new Option(`${langName(code)} — ${code}${have.has(code) ? "" : " (downloads once)"}`, code));
+    }
+    sel.value = t.locale;
+  }
+  $("locale").disabled = !a.available || sttBusy;
+  sttHint();
+}
+function sttHint(){
+  const t = S.transcription, a = (t && t.apple) || {};
+  const loc = $("locale").value, bits = [];
+  if (a.available && loc && !(a.installed_locales || []).includes(loc))
+    bits.push(`Saving downloads the speech model for ${langName(loc)} from Apple once (English ≈ 140 MB; the shared Indian-languages model ≈ 250 MB).`);
+  if (isIndic(loc)) bits.push("Indian languages come out romanized (Latin script); mixed Hindi and English (“Hinglish”) lands in one transcript.");
+  bits.push("Gemini API key: " + (t.gemini_key ? "set" : "not set") + (t.engine === "gemini" || t.choice === "gemini" ? "." : " (optional)."));
+  if (S.daemon && S.daemon.mode === "live") bits.push("Live mode streams to Gemini; with on-device transcription the recorder runs batch.");
+  $("stthint").textContent = bits.join(" ");
+}
+function sayStt(text, kind){ const m=$("sttmsg"); m.textContent=text; m.className="msg "+(kind||""); }
 function ago(s){ return s<60? s+"s ago" : s<3600? Math.round(s/60)+" min ago" : Math.round(s/3600)+" h ago"; }
 function esc(s){ return s.replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
 
@@ -595,6 +697,24 @@ $("save").addEventListener("click", async () => {
   try { const r = await api("/api/source", body); dirty = false; say(r.message.replace(/^source: /, "Saved — "), "ok"); await refresh(true); }
   catch(e){ say(e.message, "err"); }
   finally { $("save").disabled = false; }
+});
+document.querySelectorAll('input[name=stt]').forEach(r => r.addEventListener("change", () => { sttDirty = true; sttHint(); }));
+$("locale").addEventListener("change", () => { sttDirty = true; sttHint(); });
+$("sttsave").addEventListener("click", async () => {
+  const t = S.transcription || {}, a = t.apple || {};
+  const body = {stt: document.querySelector('input[name=stt]:checked')?.value || "auto"};
+  const loc = $("locale").value;
+  if (a.available && loc && loc !== t.locale) body.locale = loc;
+  const download = body.locale && !(a.installed_locales || []).includes(body.locale);
+  const started = Date.now();
+  const status = () => download
+    ? `Downloading the speech model for ${langName(body.locale)} from Apple — this can take a minute… (${Math.round((Date.now() - started) / 1000)} s)`
+    : "Saving and restarting the recorder…";
+  sttBusy = true; $("sttsave").disabled = true; $("locale").disabled = true; sayStt(status());
+  const tick = setInterval(() => sayStt(status()), 1000);
+  try { const r = await api("/api/transcription", body); clearInterval(tick); sttDirty = false; sayStt(r.message, "ok"); }
+  catch(e){ clearInterval(tick); sayStt(e.message, "err"); }
+  finally { sttBusy = false; $("sttsave").disabled = false; await refresh(false); }
 });
 $("newmeeting").addEventListener("click", async () => {
   try { const r = await api("/api/new-meeting", {}); say(r.message, "ok"); await refresh(false); }

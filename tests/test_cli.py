@@ -276,3 +276,200 @@ def test_source_shows_current_mapping(linein_env, capsys):
     assert cli.main(["source"]) == 0
     out = capsys.readouterr().out
     assert out.startswith("linein") and "umc202" in out and "me = channel 1, them = channel 0" in out
+
+
+# ---- `meeting-capture stt` / `language` (plist env, like mode/source) --------------
+
+@pytest.fixture
+def agent(tmp_path, monkeypatch):
+    plist = tmp_path / "agent.plist"
+    _write_plist(plist, {"PATH": "/usr/bin", "MEETING_CAPTURE_SYSAUDIO": "/x/sysaudio",
+                         "MEETING_CAPTURE_TRANSCRIBER": "gemini"})
+    monkeypatch.setattr(cli, "LAUNCHD_PLIST", plist)
+    calls = []
+    monkeypatch.setattr(cli, "_relaunch", lambda: calls.append("relaunch"))
+    return plist, calls
+
+
+def test_stt_shows_engine_reason_and_language(fake_helper, agent, capsys):
+    assert cli.main(["stt"]) == 0
+    out = capsys.readouterr().out
+    assert "On this Mac — nothing is uploaded" in out
+    assert "on-device model for en-US is installed" in out
+    assert "setting:   auto" in out and "language:  en-US" in out
+    assert "API key not set (optional)" in out
+    assert "{" not in out                        # human text, not JSON
+
+
+def test_stt_shows_why_nothing_runs(agent, capsys):
+    assert cli.main(["stt"]) == 0                # no helper, no key
+    out = capsys.readouterr().out
+    assert out.startswith("engine:    none") and "no Gemini API key" in out
+
+
+def test_stt_apple_writes_the_plist_and_restarts(fake_helper, agent, capsys):
+    plist, calls = agent
+    assert cli.main(["stt", "apple"]) == 0
+    env = _read_env(plist)
+    assert env["MEETING_CAPTURE_STT"] == "apple"
+    assert "MEETING_CAPTURE_TRANSCRIBER" not in env              # legacy key dropped
+    assert env["MEETING_CAPTURE_SYSAUDIO"] == "/x/sysaudio"      # TCC-pinned path untouched
+    assert calls == ["relaunch"]
+    assert "nothing is uploaded" in capsys.readouterr().out
+
+
+def test_stt_apple_installs_a_missing_model_first(fake_helper, agent, capsys):
+    plist, calls = agent
+    fake_helper.configure(installed=[])
+    assert cli.main(["stt", "apple"]) == 0
+    assert ["transcribe", "--install", "--locale", "en-US"] in fake_helper.calls()
+    assert _read_env(plist)["MEETING_CAPTURE_STT"] == "apple" and calls == ["relaunch"]
+    assert "Downloading the on-device speech model for en-US" in capsys.readouterr().out
+
+
+def test_stt_apple_refused_where_it_cannot_run(fake_helper, agent, capsys):
+    plist, calls = agent
+    fake_helper.configure(probe_rc=69, reason="needs macOS 26 or later on Apple silicon", supported=[])
+    before = plist.read_bytes()
+    assert cli.main(["stt", "apple"]) == 1
+    assert plist.read_bytes() == before and calls == []
+    assert "needs macOS 26" in capsys.readouterr().err
+
+
+def test_stt_gemini_warns_without_a_key_and_auto_removes_the_key(fake_helper, agent, capsys):
+    plist, calls = agent
+    assert cli.main(["stt", "gemini"]) == 0
+    out = capsys.readouterr().out
+    assert _read_env(plist)["MEETING_CAPTURE_STT"] == "gemini"
+    assert "no Google API key is set" in out
+    assert not any("--install" in c for c in fake_helper.calls())
+    assert cli.main(["stt", "auto"]) == 0
+    assert "MEETING_CAPTURE_STT" not in _read_env(plist)
+    assert calls == ["relaunch", "relaunch"]
+
+
+def test_stt_set_requires_install(fake_helper, capsys):
+    assert cli.main(["stt", "apple"]) == 1
+    assert "install" in capsys.readouterr().err
+
+
+def test_language_installs_then_switches(fake_helper, agent, capsys):
+    plist, calls = agent
+    assert cli.main(["language", "hi_in"]) == 0
+    assert ["transcribe", "--install", "--locale", "hi-IN"] in fake_helper.calls()
+    assert _read_env(plist)["MEETING_CAPTURE_LOCALE"] == "hi-IN"
+    assert calls == ["relaunch"]
+    out = capsys.readouterr().out
+    assert "romanized" in out and "hi-IN" in out
+
+
+def test_language_bare_code_and_back_to_default(fake_helper, agent):
+    plist, _ = agent
+    assert cli.main(["language", "hi"]) == 0
+    assert _read_env(plist)["MEETING_CAPTURE_LOCALE"] == "hi-IN"
+    assert cli.main(["language", "en-US"]) == 0
+    assert "MEETING_CAPTURE_LOCALE" not in _read_env(plist)
+
+
+def test_language_bad_input_lists_the_supported_ones(fake_helper, agent, capsys):
+    plist, calls = agent
+    before = plist.read_bytes()
+    assert cli.main(["language", "klingon"]) == 1
+    err = capsys.readouterr().err
+    assert "unsupported language 'klingon'" in err and "hi-IN" in err and "en-GB" in err
+    assert plist.read_bytes() == before and calls == []
+    assert not any("--install" in c for c in fake_helper.calls())
+
+
+def test_language_where_on_device_is_unavailable(fake_helper, agent, capsys):
+    fake_helper.configure(old=True)
+    assert cli.main(["language", "hi-IN"]) == 1
+    assert "predates" in capsys.readouterr().err
+
+
+def test_language_install_failure_leaves_the_plist_alone(fake_helper, agent, capsys):
+    plist, calls = agent
+    fake_helper.configure(install_rc=1)
+    before = plist.read_bytes()
+    assert cli.main(["language", "hi-IN"]) == 1
+    assert plist.read_bytes() == before and calls == []
+
+
+def test_language_show(fake_helper, agent, capsys):
+    assert cli.main(["language"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("language:  en-US (installed on this Mac)")
+    assert "supported: " in out and "hi-IN" in out
+
+
+def test_mode_live_refused_when_transcription_is_on_this_mac(fake_helper, agent, capsys):
+    plist, calls = agent
+    before = plist.read_bytes()
+    assert cli.main(["mode", "live"]) == 1                      # auto resolves to on this Mac
+    assert "never uploads" in capsys.readouterr().err
+    assert plist.read_bytes() == before and calls == []
+
+
+def test_mode_live_allowed_with_gemini(fake_helper, agent, gemini_key):
+    plist, calls = agent
+    cli._update_plist_env({"MEETING_CAPTURE_STT": "gemini"})
+    assert cli.main(["mode", "live"]) == 0
+    assert _read_env(plist)["MEETING_CAPTURE_MODE"] == "live" and calls == ["relaunch"]
+
+
+def test_stt_apple_while_live_says_it_runs_batch(fake_helper, agent, capsys):
+    cli._update_plist_env({"MEETING_CAPTURE_MODE": "live"})
+    assert cli.main(["stt", "apple"]) == 0
+    assert "runs batch" in capsys.readouterr().out
+
+
+def _quiet_system(monkeypatch, tmp_path):
+    """status/doctor without the mic HAL, codesign, launchctl or ~/.meeting-capture."""
+    import subprocess
+    from meeting_capture import daemon, recorder
+    for name in ("is_mic_active", "active_mic_name", "mic_name"):
+        monkeypatch.setattr(cli, name, lambda: None)
+    monkeypatch.setattr(recorder, "find_sysaudio", lambda: None)
+    monkeypatch.setattr(recorder, "find_audiotee", lambda: None)
+    monkeypatch.setattr(cli, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(cli, "LOG_FILE", tmp_path / "daemon.log")
+    monkeypatch.setattr(cli, "PAUSE_FILE", tmp_path / "paused")
+    monkeypatch.setattr(cli, "PID_FILE", tmp_path / "daemon.pid")
+    monkeypatch.setattr(daemon, "FAILED_AUDIO_DIR", tmp_path / "failed")
+    real_run = subprocess.run
+
+    def run(cmd, *a, **k):
+        if cmd and cmd[0] in ("launchctl", "codesign"):
+            return subprocess.CompletedProcess(cmd, 1, "", "")
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+
+def test_status_and_doctor_show_the_engine(fake_helper, agent, monkeypatch, capsys, tmp_path):
+    _quiet_system(monkeypatch, tmp_path)
+    cli.main(["status"])
+    out = capsys.readouterr().out
+    assert "transcription:    on this Mac (en-US) [stt=auto]" in out
+    assert "gemini key:       not set (optional)" in out
+    cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert "✓ engine — on this Mac (en-US)" in out
+    assert "✓ on-device model — en-US installed" in out
+    assert "Google API key: not set (optional" in out
+    assert "Google API key missing" not in out
+
+
+def test_doctor_fails_when_nothing_can_transcribe(agent, monkeypatch, capsys, tmp_path):
+    _quiet_system(monkeypatch, tmp_path)
+    assert cli.main(["doctor"]) == 1
+    assert "✗ no transcription engine can run" in capsys.readouterr().out
+
+
+def test_vocab_says_it_is_for_gemini_only(fake_helper, agent, tmp_path, monkeypatch, capsys):
+    from meeting_capture import paths
+    monkeypatch.setattr(paths, "VOCAB_FILE", tmp_path / "vocab.txt")
+    monkeypatch.setattr(cli, "ensure_dirs", lambda: None)
+    assert cli.main(["vocab"]) == 0
+    out = capsys.readouterr().out
+    assert "Gemini transcription only" in out and "runs on this Mac" in out
