@@ -22,5 +22,12 @@ let package = Package(
                 ])
             ]
         ),
+        // `swift test`: the pure parts of `sysaudio transcribe` (no Speech
+        // calls, no capture). `swift build` does not build it.
+        .testTarget(
+            name: "sysaudioTests",
+            dependencies: ["sysaudio"],
+            path: "Tests/sysaudioTests"
+        ),
     ]
 )

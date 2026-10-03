@@ -28,3 +28,41 @@ jobs:
           devs = linein.list_input_devices()   # real PortAudio, no hardware assumed
           print(f"sounddevice OK; {len(devs)} input device(s) on the runner")
           PY
+
+  # Builds sysaudio with the release toolchain on every PR. Swift breakage,
+  # including the macOS 26-only `transcribe` code, then shows up here instead
+  # of at tag time in release-sysaudio.yml.
+  sysaudio:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      # Keep it the same as XCODE_APP in release-sysaudio.yml.
+      XCODE_APP: /Applications/Xcode_26.6.app
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s "$XCODE_APP"
+          xcrun --sdk macosx --show-sdk-version
+      # Pure logic only (no Speech calls, no capture). Retried like the build
+      # script's `swift build`, which can SIGABRT (exit 134) on this runner.
+      - name: Swift unit tests (swift test)
+        working-directory: swift
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            swift test && exit 0
+            echo "swift test attempt $attempt failed, retrying"
+            sleep 5
+          done
+          exit 1
+      - name: Build universal sysaudio (the release build script)
+        run: .github/scripts/build-sysaudio.sh
+      - name: Sign ad-hoc with the release's hardened runtime + entitlements
+        run: codesign --force --sign - --options runtime --entitlements swift/sysaudio.entitlements sysaudio
+      # Never captures. --try-install downloads and/or reserves the en-US model
+      # when this binary can't use it yet, so the real transcription path runs
+      # too (best effort).
+      - name: Smoke-test (capture CLI parsing, transcribe exit-code contract)
+        run: .github/scripts/sysaudio-smoke.sh ./sysaudio --try-install

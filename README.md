@@ -109,7 +109,7 @@ Note on echo: without headphones, your mic also picks up the other side from the
 - `~/.meeting-capture/paused` — pause sentinel
 - `~/.meeting-capture/audio/` — temporary chunk WAVs (deleted post-transcription); `audio/failed/` holds audio waiting for a retry, `audio/failed/quarantine/` files that failed three times
 - `~/Library/LaunchAgents/com.contorch.meeting-capture.plist` — launchd agent
-- `bin/sysaudio` — built audio-capture binary (gitignored)
+- `bin/sysaudio` — built audio-capture binary (gitignored). It also carries the on-device speech-to-text helper, `sysaudio transcribe` (`--help` lists its flags; macOS 26+ on Apple silicon). That helper is compiled in only when sysaudio is built with the macOS 26 SDK (Xcode or command-line tools 26+). An older toolchain still builds capture, and its `transcribe` reports "unavailable".
 
 ## Transcription
 
