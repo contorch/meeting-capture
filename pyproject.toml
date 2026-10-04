@@ -1,14 +1,15 @@
 [project]
 name = "meeting-capture"
 version = "0.6.0"
-description = "Always-on audio capture daemon — system audio to transcripts on disk via hosted Gemini transcription."
+description = "Always-on meeting capture daemon — both sides of a call to transcripts, transcribed on-device (macOS 26+) or with Gemini."
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
     "soundfile>=0.12",
-    # Hosted Gemini audio transcription. Needs a Google API key from
-    # $GOOGLE_API_KEY, $GEMINI_API_KEY, or ~/.config/google/key (mode 600).
+    # Optional hosted Gemini transcription (and live mode). Only used with a
+    # Google API key from $GOOGLE_API_KEY, $GEMINI_API_KEY, or
+    # ~/.config/google/key (mode 600); on-device transcription needs neither.
     "google-genai>=2.0",
 ]
 

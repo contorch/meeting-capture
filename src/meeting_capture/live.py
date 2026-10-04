@@ -64,6 +64,37 @@ def live_mode_enabled() -> bool:
     return os.environ.get("MEETING_CAPTURE_MODE", "batch").strip().lower() == "live"
 
 
+LIVE_NEVER_UPLOADS = "transcription is set to on this Mac only (stt apple), which never uploads"
+LIVE_NEEDS_KEY = "live mode streams to Gemini and no Google API key is set"
+LIVE_FIXES = {
+    LIVE_NEVER_UPLOADS: "`meeting-capture stt auto` (or `stt gemini`) allows live mode",
+    LIVE_NEEDS_KEY: ("write one to ~/.config/google/key (mode 600) — the recorder runs under launchd "
+                     "and never sees GOOGLE_API_KEY from your shell"),
+}
+
+
+def live_blocker(env=None) -> Optional[str]:
+    """Why MEETING_CAPTURE_MODE=live runs batch instead, or None when it can
+    stream. `env` is the daemon's configuration (its launchd plist env;
+    os.environ inside the daemon).
+
+    Live mode is the user's explicit choice to stream the call to Gemini, so it
+    runs with stt=auto too, even when batch would transcribe on this Mac. It is
+    refused only with stt=apple (on this Mac only: never uploads) and without
+    a Google API key (it could not connect; batch keeps the audio). The daemon,
+    `status`, `doctor`, `stt`, `mode` and the settings page all use this rule;
+    pipeline-monitor reads the outcome from `meeting-capture stt --json`
+    ("live"), never a copy of it."""
+    from .transcriber import gemini_key_present, stt_choice
+
+    env = os.environ if env is None else env
+    if stt_choice(env) == "apple":
+        return LIVE_NEVER_UPLOADS
+    if not gemini_key_present(env):
+        return LIVE_NEEDS_KEY
+    return None
+
+
 def feed_path(session_stem: str) -> Path:
     return LIVE_DIR / f"{session_stem}.jsonl"
 
