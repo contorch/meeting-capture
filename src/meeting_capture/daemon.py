@@ -52,7 +52,7 @@ from .paths import (
     PID_FILE,
     ensure_dirs,
 )
-from . import meetings, store
+from . import meetings, state, store
 from .recorder import (
     Chunk,
     find_sysaudio,
@@ -77,6 +77,19 @@ from .transcriber import (
 from .watchdog import check_and_maybe_exit
 
 SESSION_GAP_SECONDS = 15 * 60
+# After SIGTERM (Quit, an update, launchd stopping the job) capture is asked to
+# stop, which flushes the chunk being recorded and hands it to the worker; if
+# the capture loop doesn't come back within this, the main thread is
+# interrupted (that chunk's audio is then lost). Within the agent's
+# ExitTimeOut (15 s) together with sysaudio's exit and STOP_GRACE_S.
+STOP_FLUSH_S = 3.0
+# Bundle-gone guard (Contorch.app moved to the Trash): how often sys.executable
+# is checked, and how many misses in a row mean it is really gone.
+BUNDLE_CHECK_S = 2.0
+BUNDLE_MISSES = 3
+# Line-in listens all the time; it counts as recording while there was sound
+# on an input within this many seconds (state.json).
+LINEIN_ACTIVE_S = 60.0
 # Line-in mode: how long to wait before retrying when the USB interface can't be
 # opened (unplugged, wrong name), so a missing device doesn't crash-loop launchd.
 LINEIN_RETRY_SECONDS = 30.0
@@ -112,8 +125,10 @@ log = logging.getLogger("meeting-capture")
 
 
 def _setup_logging() -> None:
-    # Log to stderr only. launchd routes our stderr → LOG_FILE via StandardErrorPath,
-    # so adding a FileHandler here would double-write every line.
+    # Log to stderr only: under launchd, _own_log() points it at LOG_FILE (as
+    # the legacy plist's StandardErrorPath does), so a FileHandler here would
+    # double-write every line.
+    _own_log()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -878,6 +893,90 @@ def _log_engine() -> None:
                     FAILED_AUDIO_DIR)
 
 
+_stopping = threading.Event()
+_stop_reason: list[str] = []
+
+
+def request_stop(reason: str) -> None:
+    """Stop capture cleanly: should_record() turns False, the capture loop
+    flushes the chunk in hand and hands it to the worker, the worker parks
+    whatever it can't finish (STOP_GRACE_S), and run() returns. If capture is
+    stuck, the main thread is interrupted after STOP_FLUSH_S."""
+    if _stopping.is_set():
+        return
+    _stop_reason.append(reason)
+    _stopping.set()
+    import _thread
+    timer = threading.Timer(STOP_FLUSH_S, _thread.interrupt_main)
+    timer.daemon = True
+    timer.start()
+    _stop_timers.append(timer)
+
+
+_stop_timers: list[threading.Timer] = []
+
+
+class BundleGuard:
+    """Contorch.app moved to the Trash: the recorder must not keep running
+    from a deleted bundle (or be restarted at login). Only in the app channel:
+    a Homebrew venv disappears for a while on every `brew upgrade` (the
+    wrapper rebuilds it) and comes back. gone() is cheap to call often."""
+
+    def __init__(self, executable: str | None = None, enabled: bool | None = None, clock=time.monotonic):
+        from .channel_guard import channel
+        self.executable = executable or sys.executable
+        self.enabled = (channel() == "app") if enabled is None else enabled
+        self.clock = clock
+        self.misses = 0
+        self.checked_at = float("-inf")
+
+    def gone(self) -> bool:
+        if not self.enabled:
+            return False
+        now = self.clock()
+        if now - self.checked_at >= BUNDLE_CHECK_S:
+            self.checked_at = now
+            self.misses = 0 if os.path.exists(self.executable) else self.misses + 1
+        return self.misses >= BUNDLE_MISSES
+
+
+def _own_label() -> str:
+    """Our launchd job's label: launchd puts it in XPC_SERVICE_NAME (a lab
+    build's agent is <id>.meeting-capture, not the default)."""
+    from .paths import LAUNCHD_LABEL
+    name = os.environ.get("XPC_SERVICE_NAME") or ""
+    return name if name.endswith("meeting-capture") else LAUNCHD_LABEL
+
+
+def _bootout_self() -> None:
+    """Unload our own job so launchd doesn't start a deleted program again
+    (at login, or through KeepAlive). It sends us SIGTERM; we are exiting."""
+    import subprocess
+    try:
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{_own_label()}"],
+                       capture_output=True, timeout=10)
+    except Exception as exc:
+        log.warning("could not unload the recorder job: %s", exc)
+
+
+def _own_log() -> None:
+    """Under launchd (parent pid 1), write stdout/stderr — ours and sysaudio's,
+    which inherits them — to LOG_FILE ourselves: a bundled SMAppService agent
+    has no StandardErrorPath (its plist can't say `~`). The legacy plist
+    points at the same file, opened for append, so nothing is written twice."""
+    if os.getppid() != 1 or sys.stderr.isatty():
+        return
+    try:
+        fd = os.open(LOG_FILE, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    except OSError:
+        return
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    os.close(fd)
+
+
 def _write_pid() -> None:
     PID_FILE.write_text(str(os.getpid()))
 
@@ -952,11 +1051,18 @@ def run() -> None:
     other_daemon = _another_daemon_running()
     _write_pid()
 
+    _stopping.clear()
+    _stop_reason.clear()
+    _stop_timers.clear()
+
     def _shutdown(signum, frame):
         # The pid file stays until the worker has had its grace period (the
         # finally below): until then this daemon still owns AUDIO_DIR.
+        if _stopping.is_set():
+            log.info("received signal %s again, exiting now", signum)
+            sys.exit(0)
         log.info("received signal %s, shutting down", signum)
-        sys.exit(0)
+        request_stop(f"signal {signum}")
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
@@ -977,6 +1083,10 @@ def run() -> None:
         log.info("mic capture (own voice): disabled — needs macOS 15+ (system audio only)")
     else:
         log.info("mic capture (own voice): disabled via MEETING_CAPTURE_MIC (system audio only)")
+
+    st = state.Recorder(source="linein" if linein else "sck")
+    st.set("paused" if _is_paused() else "idle")
+    bundle = BundleGuard()
 
     current_session: str | None = None
     last_chunk_end: float = 0.0
@@ -1026,9 +1136,17 @@ def run() -> None:
     def _is_mic_still_active_for_backoff() -> bool:
         # Only worth waiting while the mic is still held (the storm condition);
         # if the call ended, drop back to the idle poll immediately.
-        return is_mic_active() and not _is_paused()
+        return is_mic_active() and not _is_paused() and not _stopping.is_set()
 
     def _should_record() -> bool:
+        if _stopping.is_set():
+            return False
+        if bundle.gone():
+            log.warning("Contorch.app is gone (%s no longer exists) — stopping the recorder; "
+                        "the chunk being recorded is kept", bundle.executable)
+            request_stop("bundle_gone")
+            return False
+        st.heartbeat()
         # Log default-device changes (input + output). The mic poll runs
         # ~once per second; this is the same cadence so we catch a Bluetooth
         # disconnect / output reroute within a second of it happening.
@@ -1047,7 +1165,12 @@ def run() -> None:
         if linein:
             # Not a call participant, so there is no "mic in use" to wait for:
             # read continuously; the chunker only emits on actual speech.
-            return not _is_paused()
+            if _is_paused():
+                return False
+            from . import recorder as _rec
+            st.set("recording" if time.time() - _rec.last_voice_at < LINEIN_ACTIVE_S else "idle",
+                   current_session)
+            return True
         return is_mic_active() and not _is_paused()
 
     def _linein_chunks():
@@ -1056,17 +1179,24 @@ def run() -> None:
         except RuntimeError as exc:
             log.error("line-in capture unavailable: %s — retrying in %.0fs",
                       exc, LINEIN_RETRY_SECONDS)
-            time.sleep(LINEIN_RETRY_SECONDS)
+            _stopping.wait(LINEIN_RETRY_SECONDS)
 
     try:
-        while True:
+        while not _stopping.is_set():
             # Outer loop: idle until the mic is in use by another app (= we're in a call).
             while not _should_record():
+                if _stopping.is_set():
+                    break
+                st.set("paused" if _is_paused() else "idle")
                 _watchdog_tick()
-                time.sleep(MIC_POLL_INTERVAL)
+                _stopping.wait(MIC_POLL_INTERVAL)
+            if _stopping.is_set():
+                break
 
             log.info("line-in: listening on the interface" if linein
                      else "mic active — starting recording session")
+            if not linein:
+                st.set("recording")      # the meeting is known at the first chunk
             session_started = time.time()
             worker.begin_session()
 
@@ -1076,6 +1206,7 @@ def run() -> None:
                 started = time.time()
                 current_session = _next_session(current_session, started, last_chunk_end)
                 sess = current_session
+                st.meeting(sess)
                 session_chunks = 0
                 live_session = {"id": sess}
 
@@ -1084,6 +1215,7 @@ def run() -> None:
                     session_chunks += 1
                     # "Start new meeting" mid-call: a gap never happens here.
                     _h["id"] = _next_session(_h["id"], time.time(), time.time())
+                    st.meeting(_h["id"])
                     _append_text(_h["id"], role, text)
 
                 try:
@@ -1093,6 +1225,9 @@ def run() -> None:
                 current_session = live_session["id"]
                 last_chunk_end = time.time()
                 log.info("mic inactive — session ended")
+                st.set("paused" if _is_paused() else "idle")
+                if _stopping.is_set():
+                    break
                 _after_session(started, session_chunks)
                 continue
 
@@ -1105,16 +1240,29 @@ def run() -> None:
                 session_chunks += 1
                 current_session = _next_session(current_session, chunk.started_at, last_chunk_end)
                 last_chunk_end = chunk.started_at + chunk.duration_seconds
+                st.meeting(current_session)
                 worker.submit(chunk, current_session)
                 _watchdog_tick()
 
             worker.end_session()   # logs "mic inactive — session ended" after the last chunk
+            st.set("paused" if _is_paused() else "idle")
+            if _stopping.is_set():
+                break
             _after_session(session_started, session_chunks)
     except KeyboardInterrupt:
         log.info("interrupted")
     finally:
+        for t in _stop_timers:
+            t.cancel()
+        try:
+            st.set("idle")
+        except Exception:
+            pass
         worker.stop()
         _clear_pid()
+    if "bundle_gone" in _stop_reason:
+        log.info("recorder stopped: Contorch.app was removed; unloading its job")
+        _bootout_self()
 
 
 def main() -> None:

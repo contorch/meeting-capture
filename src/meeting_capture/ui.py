@@ -334,6 +334,15 @@ def make_handler(token: str, meter: Meter, apply_source=None, activity: "Activit
     return Handler
 
 
+def orphaned(start_ppid: int, getppid=None) -> bool:
+    """The process that opened the page (the menu bar, a terminal) is gone:
+    we were re-parented to launchd. A page opened BY launchd (parent 1 from
+    the start) never counts. An app update swaps the bundle under us, so an
+    orphaned settings server must not linger on old code."""
+    import os
+    return start_ppid != 1 and (getppid or os.getppid)() == 1
+
+
 def serve(port: int = 0, open_browser: bool = True, idle_exit_s: float = IDLE_EXIT_S) -> None:
     import os
     from .mic import _excluded_pids
@@ -348,6 +357,7 @@ def serve(port: int = 0, open_browser: bool = True, idle_exit_s: float = IDLE_EX
             subprocess.run(["open", existing], check=False)
         return
     UI_PID_FILE.write_text(str(os.getpid()))
+    start_ppid = os.getppid()
     token = secrets.token_urlsafe(18)
     meter = Meter()
     activity = Activity()
@@ -363,6 +373,11 @@ def serve(port: int = 0, open_browser: bool = True, idle_exit_s: float = IDLE_EX
             if activity.idle_for() > idle_exit_s:
                 print("no page open for a while — settings server exiting", flush=True)
                 httpd.shutdown()   # serve_forever returns; cleanup runs below
+                return
+            if orphaned(start_ppid):
+                print("the program that opened the settings page is gone — settings server exiting",
+                      flush=True)
+                httpd.shutdown()
                 return
             try:
                 UI_PID_FILE.touch()   # keeps the mic-gate exclusion fresh

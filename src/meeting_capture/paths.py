@@ -13,6 +13,8 @@ LOG_FILE = STATE_DIR / "daemon.log"
 ENV_FILE = STATE_DIR / "env"
 ENV_LOCK = STATE_DIR / "env.lock"
 PID_FILE = STATE_DIR / "daemon.pid"
+# The daemon's state for other programs (state.py; `meeting-capture status --json`).
+STATE_FILE = STATE_DIR / "state.json"
 PAUSE_FILE = STATE_DIR / "paused"
 # "Start a new meeting from now" request (meetings.py) — holds a timestamp.
 NEW_MEETING_FILE = STATE_DIR / "new-meeting"

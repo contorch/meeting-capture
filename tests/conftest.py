@@ -124,9 +124,11 @@ def key_file():
 
 @pytest.fixture(autouse=True)
 def _isolated_transcript_db(tmp_path, monkeypatch):
-    """Never touch the real ~/.context-orchestrator/context.db from tests."""
-    from meeting_capture import store
+    """Never touch the real ~/.context-orchestrator/context.db (or the
+    daemon's state.json) from tests."""
+    from meeting_capture import paths, store
     monkeypatch.setenv("CO_DB_PATH", str(tmp_path / "context.db"))
+    monkeypatch.setattr(paths, "STATE_FILE", tmp_path / "state.json")
     monkeypatch.setattr(store, "PENDING_FILE", tmp_path / "unsaved-lines.jsonl")
 
 

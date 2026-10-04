@@ -106,7 +106,8 @@ Note on echo: without headphones, your mic also picks up the other side from the
 ## Files
 
 - `~/.context-orchestrator/context.db` — transcripts (`meeting-capture last` prints the latest; contorch's `get_transcript` / `contorch-transcripts show` any)
-- `~/.meeting-capture/daemon.log` — daemon log (rotated by macOS)
+- `~/.meeting-capture/daemon.log` — daemon log (rotated by macOS); under launchd the daemon opens it itself, so sysaudio's lines land there too
+- `~/.meeting-capture/state.json` — what the recorder is doing (idle / recording / paused), for `meeting-capture status --json`
 - `~/.meeting-capture/paused` — pause sentinel
 - `~/.meeting-capture/audio/` — temporary chunk WAVs (deleted post-transcription); `audio/failed/` holds audio waiting for a retry, `audio/failed/quarantine/` files that failed three times
 - `~/.meeting-capture/env` — the recorder's settings (`KEY=VALUE`, see [Settings](#settings))
@@ -191,6 +192,12 @@ Only needed for Gemini (chosen, or the fallback of `auto` when on-device isn't a
 ### Memory guardrail
 
 The daemon self-exits (and launchd respawns it) if its `phys_footprint` exceeds `MEETING_CAPTURE_MAX_FOOTPRINT_MB` (default 2048) — a backstop against any runaway-memory regression. The check uses `phys_footprint`, not RSS, because leaked memory is often compressed/swapped and invisible to RSS.
+
+### Stopping, and a removed app
+
+The recorder stops cleanly on SIGTERM (Quit, an update, `meeting-capture stop`, launchd): capture stops, the chunk being recorded is flushed and handed to transcription, and whatever can't be transcribed within a few seconds is kept with its meeting and transcribed at the next start. A second SIGTERM exits at once. Inside Contorch.app, the recorder also watches its own program: if the app is moved to the Trash (gone for three checks in a row, ~6 s), it keeps the chunk in hand, exits and unloads its launchd job, idle or mid-call. A Homebrew recorder doesn't do this (its venv is rebuilt on every `brew upgrade`).
+
+**`meeting-capture status --json`** (schema `meeting-capture.status/1`) is the one answer to "is a meeting being recorded right now?" — the menu bar's ● REC, the update gate (never install while recording, nor while it can't tell), adopt and heal read it; nobody parses the log to decide. The daemon writes `~/.meeting-capture/state.json` (`meeting-capture.state/1`: `pid`, `state` idle|recording|paused, `since`, `meeting_id`, `source`, `updated_at`) at every transition and every 30 s while recording. One document on stdout, exit 0 always: `{schema, ok, recording: true|false|null, state, since, meeting_id, pid, stale, reason?}`. `recording` is `null` (can't tell) with `reason` `no_state` (no daemon has run since 0.8), `daemon_not_running`, or `stale_heartbeat` (says recording, but its heartbeat is over 90 s old). Line-in listens all the time; it counts as recording while an input carried sound in the last minute.
 
 ## Contract
 

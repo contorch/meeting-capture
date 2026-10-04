@@ -71,7 +71,19 @@ def _last_chunk_log_line() -> str | None:
     return None
 
 
-def cmd_status(_args) -> int:
+def cmd_status(args) -> int:
+    if getattr(args, "json", False):
+        # The one answer to "is a meeting being recorded right now?"
+        # (state.py; README "Contract"). Read-only, exit 0 in every case.
+        from . import jsonout, state
+        with jsonout.reserved_stdout() as out:
+            try:
+                doc = state.status()
+            except Exception as exc:   # a bug, not a state: still one document, recording unknown
+                doc = {"schema": state.STATUS_SCHEMA, "ok": False, "recording": None,
+                       "error": jsonout.error("internal", f"{type(exc).__name__}: {exc}")}
+            jsonout.emit(doc, out)
+        return 0
     ensure_dirs()
     pid = _read_pid()
     running = pid is not None and _is_running(pid)
@@ -1209,6 +1221,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("last", help="print the most recent transcript").set_defaults(func=cmd_last)
     sub.add_parser("tail", help="follow the daemon log").set_defaults(func=cmd_tail)
     sub.add_parser("doctor", help="full health check (binaries, permissions, daemon)").set_defaults(func=cmd_doctor)
+    sub.choices["status"].add_argument(
+        "--json", action="store_true",
+        help="is a meeting being recorded right now? one JSON document (meeting-capture.status/1; README: Contract)")
     vocab = sub.add_parser("vocab", help="show or edit the transcription vocabulary (proper nouns; Gemini only)")
     vocab.add_argument("action", nargs="?", choices=["show", "edit"], default="show")
     vocab.set_defaults(func=cmd_vocab)

@@ -970,3 +970,213 @@ def test_a_note_survives_parking_straight_from_the_queue(dirs):
     assert w.submit(b, "meeting-b") is False                   # full: parked at once
     assert daemon._read_meta(failed / b.path.name)["meeting_id"] == "meeting-b"
     assert not (audio / b.path.with_suffix(".json").name).exists()
+
+
+# ---- stopping: SIGTERM, the bundle-gone guard, state.json ----------------------------------
+
+LIFECYCLE_RUN = r'''
+import os, sys, time, wave
+from pathlib import Path
+from meeting_capture import daemon
+from meeting_capture.recorder import Chunk
+
+ctl = Path(sys.argv[1])            # files the test drops here steer the fake call
+daemon.STOP_GRACE_S = 0.5
+daemon.BUNDLE_CHECK_S = 0.05
+if os.environ.get("FAKE_EXECUTABLE"):
+    sys.executable = os.environ["FAKE_EXECUTABLE"]
+daemon._bootout_self = lambda: (ctl / "booted-out").write_text("1")   # never the real launchctl
+
+def _wav(p, seconds=1.0):
+    with wave.open(str(p), "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+        w.writeframes(b"\x00\x01" * int(16000 * seconds))
+
+def fake_stream(out_dir, should_record):
+    """Like recorder.stream_chunks: buffers the chunk in hand until
+    should_record() goes False, then flushes it as a final chunk."""
+    started = time.time()
+    (ctl / "recording").write_text("1")
+    while should_record():
+        time.sleep(0.02)
+    p = out_dir / f"chunk-{int(started)}-them.wav"
+    _wav(p)
+    yield Chunk(path=p, started_at=started, duration_seconds=1.0, role="them")
+
+# No capture of any kind; the mic gate is a file.
+daemon.stream_chunks = fake_stream
+daemon.is_mic_active = lambda: (ctl / "mic-on").exists()
+daemon.default_devices_snapshot = lambda: {}
+daemon.mic_name = lambda: "test mic"
+daemon.mic_capture_enabled = lambda: False
+daemon.check_and_maybe_exit = lambda: None
+daemon.MIC_POLL_INTERVAL = 0.05
+daemon.run()
+'''
+
+
+@pytest.fixture
+def lifecycle(tmp_path, fake_helper):
+    import os, subprocess, sys
+    home = tmp_path / "home"
+    home.mkdir()
+    ctl = tmp_path / "ctl"
+    ctl.mkdir()
+    script = tmp_path / "run_daemon.py"
+    script.write_text(LIFECYCLE_RUN)
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("MEETING_CAPTURE_", "CONTORCH_"))}
+    env.update(HOME=str(home), CO_DB_PATH=str(tmp_path / "context.db"),
+               MEETING_CAPTURE_TRANSCRIBE_BIN=str(fake_helper.path), MEETING_CAPTURE_LOCALE="en-US",
+               MEETING_CAPTURE_STT="apple", MEETING_CAPTURE_MIC="0")
+    procs = []
+
+    def start(log="run.log", **extra):
+        e = dict(env, **extra)
+        with open(tmp_path / log, "w") as err:
+            p = subprocess.Popen([sys.executable, str(script), str(ctl)], env=e, stderr=err,
+                                 stdout=subprocess.DEVNULL)
+        procs.append(p)
+        return p
+
+    def status():
+        r = subprocess.run([sys.executable, "-m", "meeting_capture.cli", "status", "--json"],
+                           capture_output=True, text=True, env=env, timeout=60)
+        return __import__("json").loads(r.stdout)
+
+    class L:
+        pass
+    lc = L()
+    lc.home, lc.ctl, lc.start, lc.status, lc.tmp = home, ctl, start, status, tmp_path
+    lc.audio = home / ".meeting-capture" / "audio"
+    lc.failed = lc.audio / "failed"
+    lc.log = lambda name="run.log": (tmp_path / name).read_text()
+    yield lc
+    for p in procs:
+        p.kill()
+
+
+def test_state_json_follows_the_call_and_status_answers(lifecycle):
+    import signal
+    lc = lifecycle
+    p = lc.start()
+    _wait(lambda: lc.status()["recording"] is False, timeout=20)
+    (lc.ctl / "mic-on").write_text("1")
+    _wait(lambda: lc.status()["recording"] is True, timeout=20)
+    (lc.ctl / "mic-on").unlink()
+    _wait(lambda: lc.status()["recording"] is False, timeout=20)
+    s = lc.status()
+    assert s["state"] == "idle" and s["pid"] == p.pid
+    p.send_signal(signal.SIGTERM)
+    assert p.wait(10) == 0
+    assert lc.status()["recording"] is None                       # the daemon is gone: can't tell
+
+
+def test_sigterm_mid_chunk_parks_the_chunk_in_hand_and_the_next_run_transcribes_it(lifecycle, fake_helper):
+    import json, signal, time
+    lc = lifecycle
+    fake_helper.configure(sleep=30)                                 # the flushed chunk can't finish in time
+    (lc.ctl / "mic-on").write_text("1")
+    p = lc.start()
+    _wait(lambda: (lc.ctl / "recording").exists(), timeout=20)
+    t0 = time.time()
+    p.send_signal(signal.SIGTERM)
+    assert p.wait(15) == 0
+    assert time.time() - t0 < 10                                    # inside the agent's ExitTimeOut
+    log = lc.log()
+    assert "received signal" in log and "stopping mid-transcription" in log, log
+    kept = list(lc.audio.glob("chunk-*-them.wav")) + list(lc.failed.glob("chunk-*-them.wav"))
+    assert len(kept) == 1, log                                      # the chunk in hand was not lost
+    note = json.loads(kept[0].with_suffix(".json").read_text())
+    assert note["meeting_id"].startswith("meeting-")
+
+    (lc.ctl / "mic-on").unlink()
+    (lc.ctl / "recording").unlink()
+    fake_helper.configure(sleep=0, text="FLUSHED-ON-SIGTERM")
+    q = lc.start("run2.log")
+    try:
+        _wait(lambda: any("FLUSHED-ON-SIGTERM" in (r["body"] or "")
+                          for r in store.recent(5, path=lc.tmp / "context.db"))
+              if (lc.tmp / "context.db").exists() else False, timeout=30)
+    finally:
+        q.send_signal(signal.SIGTERM)
+        q.wait(10)
+
+
+def test_a_second_sigterm_exits_at_once(lifecycle, fake_helper):
+    import signal, time
+    lc = lifecycle
+    fake_helper.configure(sleep=30)
+    (lc.ctl / "mic-on").write_text("1")
+    p = lc.start()
+    _wait(lambda: (lc.ctl / "recording").exists(), timeout=20)
+    p.send_signal(signal.SIGTERM)
+    time.sleep(0.3)
+    p.send_signal(signal.SIGTERM)
+    assert p.wait(5) == 0
+    assert "again, exiting now" in lc.log()
+
+
+def _fake_bundle(tmp_path):
+    exe = tmp_path / "Contorch.app" / "Contents" / "MacOS" / "Contorch Recorder"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("")
+    return exe
+
+
+def test_the_bundle_gone_guard_stops_an_idle_recorder_and_unloads_its_job(lifecycle):
+    lc = lifecycle
+    exe = _fake_bundle(lc.tmp)
+    p = lc.start(CONTORCH_CHANNEL="app", FAKE_EXECUTABLE=str(exe))
+    _wait(lambda: lc.status()["recording"] is False, timeout=20)
+    exe.unlink()                                                    # the app went to the Trash
+    assert p.wait(15) == 0
+    assert "Contorch.app is gone" in lc.log() and (lc.ctl / "booted-out").exists()
+
+
+def test_the_bundle_gone_guard_mid_recording_keeps_the_chunk(lifecycle, fake_helper):
+    lc = lifecycle
+    fake_helper.configure(sleep=30)
+    exe = _fake_bundle(lc.tmp)
+    (lc.ctl / "mic-on").write_text("1")
+    p = lc.start(CONTORCH_CHANNEL="app", FAKE_EXECUTABLE=str(exe))
+    _wait(lambda: (lc.ctl / "recording").exists(), timeout=20)
+    exe.unlink()
+    assert p.wait(15) == 0
+    kept = list(lc.audio.glob("chunk-*-them.wav")) + list(lc.failed.glob("chunk-*-them.wav"))
+    assert len(kept) == 1 and (lc.ctl / "booted-out").exists(), lc.log()
+
+
+def test_the_bundle_gone_guard_ignores_a_transient_miss_and_other_channels():
+    clock = [0.0]
+    exists = {"v": True}
+    import os
+    real = os.path.exists
+    g = daemon.BundleGuard("/x/Contorch.app/Contents/MacOS/Contorch Recorder", enabled=True,
+                           clock=lambda: clock[0])
+    try:
+        os.path.exists = lambda p: exists["v"] if p.startswith("/x/") else real(p)
+        for miss in (False, True, True, False, True, True):      # never three in a row
+            exists["v"] = not miss
+            clock[0] += daemon.BUNDLE_CHECK_S
+            assert g.gone() is False
+        for _ in range(3):
+            exists["v"] = False
+            clock[0] += daemon.BUNDLE_CHECK_S
+        assert g.gone() is True
+        calls_before = g.misses
+        assert g.gone() is True and g.misses == calls_before       # throttled: no extra check
+    finally:
+        os.path.exists = real
+    assert daemon.BundleGuard("/gone", enabled=False).gone() is False
+    assert daemon.BundleGuard("/gone").enabled is False             # not the app channel (conftest: unset)
+
+
+@pytest.mark.parametrize("xpc,expect", [(None, "com.contorch.meeting-capture"),
+                                        ("com.contorch.labtest.meeting-capture", "com.contorch.labtest.meeting-capture"),
+                                        ("com.apple.Terminal", "com.contorch.meeting-capture")])
+def test_the_guard_unloads_its_own_label(monkeypatch, xpc, expect):
+    if xpc:
+        monkeypatch.setenv("XPC_SERVICE_NAME", xpc)
+    else:
+        monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
+    assert daemon._own_label() == expect
