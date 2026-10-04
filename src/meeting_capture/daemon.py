@@ -124,8 +124,10 @@ log = logging.getLogger("meeting-capture")
 
 
 def _setup_logging() -> None:
-    # Log to stderr only. launchd routes our stderr → LOG_FILE via StandardErrorPath,
-    # so adding a FileHandler here would double-write every line.
+    # Log to stderr only: under launchd, _own_log() points it at LOG_FILE (as
+    # the legacy plist's StandardErrorPath does), so a FileHandler here would
+    # double-write every line.
+    _own_log()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -890,51 +892,6 @@ def _log_engine() -> None:
                     FAILED_AUDIO_DIR)
 
 
-def _write_pid() -> None:
-    PID_FILE.write_text(str(os.getpid()))
-
-
-def _another_daemon_running() -> bool:
-    """Is the pid in PID_FILE — before this run writes its own — a live
-    process other than this one? (Two daemons at once, e.g. `meeting-capture
-    run` beside the launchd agent: the other one's queue is not ours to take.)"""
-    try:
-        pid = int(PID_FILE.read_text().strip())
-    except (OSError, ValueError):
-        return False
-    if pid == os.getpid():
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True              # exists, owned by someone else
-    return True
-
-
-def adopt_at_start(other_daemon: bool) -> int:
-    """Before capture starts: everything in AUDIO_DIR was left by the
-    previous run (nothing is in flight in a fresh process), so park it all now,
-    whatever its age — status counts it and the startup retry transcribes it
-    into its meeting. If another daemon is running, only take what is old
-    enough to be abandoned."""
-    return adopt_orphans(min_age_s=ORPHAN_MIN_AGE_S if other_daemon else 0.0)
-
-
-def _clear_pid() -> None:
-    """Remove the pid file — only if it is still ours: a daemon finishing its
-    grace period must not delete the pid file of the one that replaced it."""
-    try:
-        if PID_FILE.read_text().strip() not in (str(os.getpid()), ""):
-            return
-        PID_FILE.unlink()
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        log.warning("could not remove %s: %s", PID_FILE, exc)
-
-
 _stopping = threading.Event()
 _stop_reason: list[str] = []
 
@@ -1012,15 +969,60 @@ def _own_log() -> None:
     os.close(fd)
 
 
+def _write_pid() -> None:
+    PID_FILE.write_text(str(os.getpid()))
+
+
+def _another_daemon_running() -> bool:
+    """Is the pid in PID_FILE — before this run writes its own — a live
+    process other than this one? (Two daemons at once, e.g. `meeting-capture
+    run` beside the launchd agent: the other one's queue is not ours to take.)"""
+    try:
+        pid = int(PID_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    if pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True              # exists, owned by someone else
+    return True
+
+
+def adopt_at_start(other_daemon: bool) -> int:
+    """Before capture starts: everything in AUDIO_DIR was left by the
+    previous run (nothing is in flight in a fresh process), so park it all now,
+    whatever its age — status counts it and the startup retry transcribes it
+    into its meeting. If another daemon is running, only take what is old
+    enough to be abandoned."""
+    return adopt_orphans(min_age_s=ORPHAN_MIN_AGE_S if other_daemon else 0.0)
+
+
+def _clear_pid() -> None:
+    """Remove the pid file — only if it is still ours: a daemon finishing its
+    grace period must not delete the pid file of the one that replaced it."""
+    try:
+        if PID_FILE.read_text().strip() not in (str(os.getpid()), ""):
+            return
+        PID_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log.warning("could not remove %s: %s", PID_FILE, exc)
+
+
 def run() -> None:
-    _stopping.clear()
-    _stop_reason.clear()
-    _stop_timers.clear()
     ensure_dirs()
-    _own_log()
     _setup_logging()
     other_daemon = _another_daemon_running()
     _write_pid()
+
+    _stopping.clear()
+    _stop_reason.clear()
+    _stop_timers.clear()
 
     def _shutdown(signum, frame):
         # The pid file stays until the worker has had its grace period (the

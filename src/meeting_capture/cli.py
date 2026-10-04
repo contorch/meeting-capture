@@ -1101,11 +1101,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="meeting-capture")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    status = sub.add_parser("status", help="show daemon status")
-    status.add_argument("--json", action="store_true",
-                        help="is a meeting being recorded right now? one JSON document "
-                             "(meeting-capture.status/1; README: Contract)")
-    status.set_defaults(func=cmd_status)
+    sub.add_parser("status", help="show daemon status").set_defaults(func=cmd_status)
     sub.add_parser("start", help="start the daemon").set_defaults(func=cmd_start)
     sub.add_parser("stop", help="stop the daemon").set_defaults(func=cmd_stop)
     sub.add_parser("pause", help="pause capture (creates pause file)").set_defaults(func=cmd_pause)
@@ -1119,6 +1115,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("last", help="print the most recent transcript").set_defaults(func=cmd_last)
     sub.add_parser("tail", help="follow the daemon log").set_defaults(func=cmd_tail)
     sub.add_parser("doctor", help="full health check (binaries, permissions, daemon)").set_defaults(func=cmd_doctor)
+    sub.choices["status"].add_argument(
+        "--json", action="store_true",
+        help="is a meeting being recorded right now? one JSON document (meeting-capture.status/1; README: Contract)")
     vocab = sub.add_parser("vocab", help="show or edit the transcription vocabulary (proper nouns; Gemini only)")
     vocab.add_argument("action", nargs="?", choices=["show", "edit"], default="show")
     vocab.set_defaults(func=cmd_vocab)
