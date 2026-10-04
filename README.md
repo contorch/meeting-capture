@@ -58,9 +58,9 @@ CLI commands for inspection and control:
 | `meeting-capture stt [auto\|apple\|gemini] [--language L]` | Show the transcription engine in use and why, or switch it (restarts the daemon); `--json` prints the state for other programs (see [Contract](#contract)) |
 | `meeting-capture language [LOCALE]` | Show or set the on-device language (installs its model first) |
 | `meeting-capture ui` | Settings page: audio source, interface inputs and levels, transcription engine and language |
-| `meeting-capture install` | Install the launchd auto-start agent |
-| `meeting-capture uninstall` | Remove the launchd auto-start agent |
-| `meeting-capture start` / `stop` | Manual daemon control |
+| `meeting-capture config [set\|unset KEY VALUE]` | The recorder's settings (`~/.meeting-capture/env`) and where each comes from; `--json` for other programs |
+| `meeting-capture install` / `uninstall` | Install / remove the recorder's launchd agent (starts at login) |
+| `meeting-capture start` / `stop` / `restart` | Start the recorder (and at login), stop it (stays stopped at login), restart it to apply a hand edit of the settings; `--json` for other programs |
 | `meeting-capture run` | Run daemon in the foreground (for debugging) |
 
 ## Architecture
@@ -109,12 +109,13 @@ Note on echo: without headphones, your mic also picks up the other side from the
 - `~/.meeting-capture/daemon.log` — daemon log (rotated by macOS)
 - `~/.meeting-capture/paused` — pause sentinel
 - `~/.meeting-capture/audio/` — temporary chunk WAVs (deleted post-transcription); `audio/failed/` holds audio waiting for a retry, `audio/failed/quarantine/` files that failed three times
-- `~/Library/LaunchAgents/com.contorch.meeting-capture.plist` — launchd agent
+- `~/.meeting-capture/env` — the recorder's settings (`KEY=VALUE`, see [Settings](#settings))
+- `~/Library/LaunchAgents/com.contorch.meeting-capture.plist` — launchd agent (no settings: the program, `PATH`, the pinned sysaudio and `CONTORCH_CHANNEL`)
 - `bin/sysaudio` — built audio-capture binary (gitignored). It also carries the on-device speech-to-text helper, `sysaudio transcribe` (`--help` lists its flags; macOS 26+ on Apple silicon). That helper is compiled in only when sysaudio is built with the macOS 26 SDK (Xcode or command-line tools 26+). An older toolchain still builds capture, and its `transcribe` reports "unavailable".
 
 ## Transcription
 
-Two engines, chosen with `meeting-capture stt` (or the settings page) and stored in the launchd plist as `MEETING_CAPTURE_STT`:
+Two engines, chosen with `meeting-capture stt` (or the settings page) and stored in `~/.meeting-capture/env` as `MEETING_CAPTURE_STT`:
 
 | Setting | What happens |
 |---|---|
@@ -143,12 +144,12 @@ A chunk keeps a small note naming its meeting (`chunk-….json`, beside the audi
 
 ### Live mode & the in-meeting copilot
 
-By default the daemon runs in **batch** mode: it chunks audio and transcribes after each pause (cheapest, most robust). Live mode streams the call to Gemini, so it needs a Google API key, and choosing it is choosing to upload: it runs with `stt auto` (the default) too, even where batch would transcribe on this Mac. Only `stt apple` (on this Mac only, never uploads) refuses it — `mode live` says so, and a live plist then runs batch, which `status`, `doctor`, `stt` and the settings page all show. Run `meeting-capture mode live` once and the launchd daemon streams to `gemini-3.5-transcribe-live` instead — ~1-second interim hypotheses and finalized utterances — which is what the in-meeting copilot needs. Finals still land in the meeting's transcript row exactly as in batch mode; live *additionally* writes a per-session feed under `~/.meeting-capture/live/`.
+By default the daemon runs in **batch** mode: it chunks audio and transcribes after each pause (cheapest, most robust). Live mode streams the call to Gemini, so it needs a Google API key, and choosing it is choosing to upload: it runs with `stt auto` (the default) too, even where batch would transcribe on this Mac. Only `stt apple` (on this Mac only, never uploads) refuses it — `mode live` says so, and a live setting then runs batch, which `status`, `doctor`, `stt` and the settings page all show. Run `meeting-capture mode live` once and the launchd daemon streams to `gemini-3.5-transcribe-live` instead — ~1-second interim hypotheses and finalized utterances — which is what the in-meeting copilot needs. Finals still land in the meeting's transcript row exactly as in batch mode; live *additionally* writes a per-session feed under `~/.meeting-capture/live/`.
 
 Switch once, then one pane during a meeting:
 
 ```bash
-meeting-capture mode live        # persists into the launchd plist and restarts the daemon
+meeting-capture mode live        # saves the setting and restarts the recorder
 meeting-capture copilot          # during the call: whispers from your memory
 meeting-capture mode batch       # back to chunked transcription
 ```
@@ -160,6 +161,16 @@ Keep using the launchd daemon for live mode rather than `MEETING_CAPTURE_MODE=li
 ### Settings page
 
 `meeting-capture ui` — or **Recording settings…** in the Contorch menu bar ([pipeline-monitor](https://github.com/contorch/pipeline-monitor)) — opens a settings page in the browser (served from this Mac on 127.0.0.1 only; nothing to install). Choose where audio comes from — this Mac's call audio, or a USB interface such as a Behringer UMC202HD/UMC404HD — pick the device and which input is the host ("Me") and which the guests ("Them"), and watch live level meters for every input while you set the interface's gain knobs (aim for peaks between −18 and −6 dBFS; a CLIP flag means turn down or press PAD). Save restarts the recorder with the new settings — the same thing `meeting-capture source linein --device … --me … --them …` does. The **Transcription** section shows the engine in use and why, switches between On this Mac / Gemini / Automatic, and picks the on-device language from the ones this Mac supports (a language whose model isn't installed is downloaded from Apple first; the page shows the download while it runs) — the same as `meeting-capture stt` / `language`. The page also pauses/resumes recording and shows the latest transcript lines as they arrive. Metering from the page never counts as "a call started".
+
+### Settings
+
+The recorder's settings live in `~/.meeting-capture/env`: one `MEETING_CAPTURE_*=value` per line, `#` comments, the format of `~/.context-orchestrator/env`. `mode`, `source`, `stt`, `language`, the settings page and `meeting-capture config set` write it (locked and atomic, so they can't lose each other's changes) and restart the recorder; after a hand edit, run `meeting-capture restart`. Precedence is the same in every meeting-capture process: **the process's own environment > the file > the default** — so `MEETING_CAPTURE_MODE=live meeting-capture run` still works, while a value exported in your shell never reaches the launchd recorder (`meeting-capture config` shows where each value comes from, and which ones your shell sets differently).
+
+Paths to binaries are not settings: `MEETING_CAPTURE_SYSAUDIO` (exported by the Homebrew wrapper on every call), `_AUDIOTEE`, `_TRANSCRIBE_BIN` and `_VENV` are never stored in the file. `install` pins the recorder's sysaudio in its plist, and every command uses that copy — one binary, one Screen Recording grant.
+
+Before 0.8 the settings lived in the launchd plist's `EnvironmentVariables`. The recorder (at start), `install` and every writer move them into the file once, keeping a copy of the old plist as `~/.meeting-capture/com.contorch.meeting-capture.plist.before-env-file`. Going back to an older meeting-capture: copy that file back to `~/Library/LaunchAgents/` (an old version reads only the plist and would otherwise run with defaults).
+
+Restarts never start a recorder you stopped (`meeting-capture stop`, or "Stop everything" in the menu bar): a setting saved while it is stopped applies when it starts. A legacy launchd restart is `bootout` + `bootstrap` (never `launchctl kickstart -k`, which restarts from launchd's cached copy of the plist), and the agent's `ExitTimeOut` (15 s) lets the recorder finish the chunk in hand.
 
 ### Vocabulary
 
@@ -175,7 +186,7 @@ Only needed for Gemini (chosen, or the fallback of `auto` when on-device isn't a
 2. `$GEMINI_API_KEY`
 3. `~/.config/google/key` (mode 600)
 
-`meeting-capture doctor` reports whether a key is found — one the recorder will see. It runs under launchd, so `$GOOGLE_API_KEY` exported in your shell never reaches it (only one in its plist env would); the key file is the place for it.
+`meeting-capture doctor` reports whether a key is found — one the recorder will see. It runs under launchd, so `$GOOGLE_API_KEY` exported in your shell never reaches it; the key file is the place for it.
 
 ### Memory guardrail
 
@@ -183,7 +194,13 @@ The daemon self-exits (and launchd respawns it) if its `phys_footprint` exceeds 
 
 ## Contract
 
-**`meeting-capture stt --json`** is how other programs learn how meetings get transcribed. pipeline-monitor (the Contorch menu bar, `contorch setup`, `status`, `doctor`) runs it instead of re-implementing the rules in `transcriber.py` — this repo is the only implementation; change the fields here and in pipeline-monitor's `transcription.py` together (its README has the same section). It prints one JSON object on stdout (diagnostics go to stderr) describing what the recorder's configuration — the launchd plist env, or this shell's when no agent is installed; a key only in the caller's shell doesn't count for an installed agent — resolves to, and exits 0 whenever it could answer (1: it couldn't, nothing on stdout; 2: usage — a meeting-capture without `stt --json` also exits 2, which callers read as "too old"). It runs the helper's read-only probe once per language (≈ 0.1–0.2 s in all). `"schema": 1`; adding a field keeps the schema, removing or redefining one bumps it.
+**`meeting-capture config --json`** (schema `meeting-capture.config/1`): `{schema, ok, file, watch_paths[], restart_pending, agent{backend, installed, sysaudio, plist}, settings{name: {value, source: agent|file|default, shell?}}, overridden[]}`. `name` is the key without `MEETING_CAPTURE_`, lower-case (`mode`, `source`, `stt`, …). A caller caches it until one of `watch_paths` changes (a `stat`, never a read). `overridden` lists file settings that the agent's own environment still overrides (an old plist that hasn't been migrated).
+
+**`meeting-capture start|stop|restart|install|uninstall --json`** (schema `meeting-capture.agent/1`) is the one way other programs drive the recorder agent (`stop` also takes `--reason user|quit|update`, echoed back): `{schema, ok, action, backend: launchctl|none, label, program, loaded, performed, why?, reason?, error?{code, message}}`. Exit 0 done or nothing to do (`performed: false` + `why`), 1 failed, **3 refused**: `channel_conflict` (another install owns Contorch on this Mac — the marker `~/.contorch/channel.json`, or an SMAppService job that holds the label) or `agent_elsewhere` (`install` over an agent that runs another install's existing Python). `restart` never starts a stopped recorder.
+
+**Channel.** Every process learns its install channel from `$CONTORCH_CHANNEL` only (`app`, `brew`; unset or anything else = `dev`). The legacy plist carries `brew` or `dev`. Before it changes the recorder agent, meeting-capture asks the marker that pipeline-monitor alone writes (`~/.contorch/channel.json`, `contorch.channel/1`): no marker, or this channel in its `writers` (and the operation token `$CONTORCH_OP` when it names one) — otherwise it prints the marker's `blocked_message` and exits 3. The fixtures are pipeline-monitor's `contract/channel_guard/`, vendored in `tests/fixtures/channel_guard` with their sha256.
+
+**`meeting-capture stt --json`** is how other programs learn how meetings get transcribed. pipeline-monitor (the Contorch menu bar, `contorch setup`, `status`, `doctor`) runs it instead of re-implementing the rules in `transcriber.py` — this repo is the only implementation; change the fields here and in pipeline-monitor's `transcription.py` together (its README has the same section). It prints one JSON object on stdout (diagnostics go to stderr) describing what the recorder's configuration — `~/.meeting-capture/env` under what its agent injects, or under this shell's environment when no agent is installed; a key only in the caller's shell doesn't count for an installed agent — resolves to, and exits 0 whenever it could answer (1: it couldn't, nothing on stdout; 2: usage — a meeting-capture without `stt --json` also exits 2, which callers read as "too old"). It runs the helper's read-only probe once per language (≈ 0.1–0.2 s in all). `"schema": 1`; adding a field keeps the schema, removing or redefining one bumps it.
 
 | Field | Meaning |
 |---|---|

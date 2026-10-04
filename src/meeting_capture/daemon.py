@@ -102,7 +102,8 @@ ENGINE_RECHECK_S = 60.0        # how often a blocked worker asks whether an engi
 MODEL_INSTALL_RETRY_S = 3600.0 # at most one automatic on-device model download per hour
 ORPHAN_MIN_AGE_S = 120.0       # chunk files left in AUDIO_DIR by a killed daemon
 # On SIGTERM, how long the worker gets to finish the chunk in hand. launchd
-# sends SIGKILL after its ExitTimeOut (20 s); sysaudio's own shutdown takes up
+# sends SIGKILL after the agent's ExitTimeOut (15 s, supervisor.EXIT_TIMEOUT_S;
+# the system default is ~5 s); sysaudio's own shutdown takes up
 # to 5 s of that. A chunk not finished in time keeps its note and is retried
 # into its meeting at the next start.
 STOP_GRACE_S = 10.0
@@ -922,9 +923,32 @@ def _clear_pid() -> None:
         log.warning("could not remove %s: %s", PID_FILE, exc)
 
 
+def load_settings() -> list[str]:
+    """First thing at start: move any settings an old agent plist still
+    carries into ~/.meeting-capture/env (once), then load the file under this
+    process's environment (config.apply: process env > file > default).
+    Returns the keys moved. A legacy launchd job that still had them in its
+    environment keeps them until it is loaded again (supervisor.restart)."""
+    from . import config
+    try:
+        moved = config.migrate_from_plist()
+    except Exception as exc:   # never keep the recorder from starting over it
+        log.warning("could not move settings out of the agent plist: %s", exc)
+        moved = []
+    config.apply()
+    return moved
+
+
 def run() -> None:
+    from . import config, paths
+    moved = load_settings()
     ensure_dirs()
     _setup_logging()
+    if moved:
+        log.info("settings moved from the agent plist into %s: %s", paths.ENV_FILE, ", ".join(moved))
+    over = config.overridden()
+    if over:
+        log.warning("settings in %s overridden by this process's environment: %s", paths.ENV_FILE, ", ".join(over))
     other_daemon = _another_daemon_running()
     _write_pid()
 

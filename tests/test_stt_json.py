@@ -34,11 +34,13 @@ def _write_plist(path: Path, env: dict) -> None:
 
 @pytest.fixture
 def agent(tmp_path, monkeypatch):
-    """An installed agent whose plist env the test sets: agent({...})."""
+    """An installed agent whose plist env the test sets: agent({...}) — an
+    install from before the settings file, whose settings are still in its
+    plist (each writer moves them into ~/.meeting-capture/env first)."""
     plist = tmp_path / "agent.plist"
-    monkeypatch.setattr(cli, "LAUNCHD_PLIST", plist)
+    monkeypatch.setattr("meeting_capture.paths.LAUNCHD_PLIST", plist)
     relaunches = []
-    monkeypatch.setattr(cli, "_relaunch", lambda: relaunches.append(1))
+    monkeypatch.setattr(cli, "_restart", lambda: relaunches.append(1) or "recorder restarted")
 
     def _set(env: dict | None = None):
         _write_plist(plist, {"PATH": "/usr/bin", **(env or {})})
@@ -323,8 +325,10 @@ def test_the_json_is_ascii(fake_helper, agent, mac, key_file, capsys):
 def test_stt_with_a_language_sets_both_in_one_restart(fake_helper, agent, capsys):
     relaunches = agent({"MEETING_CAPTURE_STT": "gemini"})
     assert cli.main(["stt", "auto", "--language", "hi"]) == 0
-    env = plistlib.loads(cli.LAUNCHD_PLIST.read_bytes())["EnvironmentVariables"]
+    from meeting_capture import config
+    env = config.daemon_env()
     assert (env["MEETING_CAPTURE_STT"], env["MEETING_CAPTURE_LOCALE"]) == ("auto", "hi-IN")
+    assert config.read()["MEETING_CAPTURE_STT"] == "auto"           # stored in the settings file
     assert relaunches == [1]
 
 
@@ -344,13 +348,14 @@ def test_download_progress_streams_as_stdout_lines(fake_helper, agent, capsys):
     assert out[7].startswith("transcription: Automatic (stt=auto), language de-DE")
 
 
-def test_refusals_are_exit_1_on_stderr_with_the_plist_untouched(fake_helper, agent, capsys):
+def test_refusals_are_exit_1_on_stderr_with_the_settings_untouched(fake_helper, agent, capsys):
+    from meeting_capture import paths
     agent()
-    before = cli.LAUNCHD_PLIST.read_bytes()
+    before = paths.LAUNCHD_PLIST.read_bytes()
     assert cli.main(["language", "klingon"]) == 1
     captured = capsys.readouterr()
     assert captured.out == "" and "unsupported language" in captured.err
-    assert cli.LAUNCHD_PLIST.read_bytes() == before
+    assert paths.LAUNCHD_PLIST.read_bytes() == before and not paths.ENV_FILE.exists()
 
 
 def test_as_a_separate_process(fake_helper, tmp_path):

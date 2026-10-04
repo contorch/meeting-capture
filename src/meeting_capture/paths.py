@@ -8,6 +8,10 @@ AUDIO_DIR = STATE_DIR / "audio"
 # is otherwise gone for good.
 FAILED_AUDIO_DIR = AUDIO_DIR / "failed"
 LOG_FILE = STATE_DIR / "daemon.log"
+# The recorder's settings (config.py): KEY=VALUE, the ~/.context-orchestrator/env
+# format. Writers lock ENV_LOCK around a read-modify-write.
+ENV_FILE = STATE_DIR / "env"
+ENV_LOCK = STATE_DIR / "env.lock"
 PID_FILE = STATE_DIR / "daemon.pid"
 PAUSE_FILE = STATE_DIR / "paused"
 # "Start a new meeting from now" request (meetings.py) — holds a timestamp.

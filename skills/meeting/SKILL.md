@@ -49,6 +49,7 @@ Keep it tight. The user is mid-conversation and reading fast.
   `meeting-capture copilot` (which uses Gemini + transcript keyword search). Prefer
   this inside a Claude Code session; the standalone is for non-Claude-Code users.
 - If `feed status` shows no feed or the daemon isn't running in live mode, tell the
-  user to start it: `MEETING_CAPTURE_MODE=live meeting-capture run`.
+  user to switch the recorder to live mode: `meeting-capture mode live` (saved in
+  `~/.meeting-capture/env`; it restarts the recorder).
 - Ground every claim in `search` results or the live transcript. Do not use general
   knowledge to answer meeting-specific questions.
