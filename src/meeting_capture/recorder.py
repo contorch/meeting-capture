@@ -134,8 +134,10 @@ def find_sysaudio() -> Path | None:
     """Locate the sysaudio (ScreenCaptureKit) binary.
 
     Resolution order: the copy the installed recorder agent pins
-    (supervisor.pinned_sysaudio), then MEETING_CAPTURE_SYSAUDIO from the
-    environment, then bin/sysaudio beside the package, then PATH.
+    (supervisor.pinned_sysaudio: Contorch.app's agent.json, then a legacy
+    plist's pin), then MEETING_CAPTURE_SYSAUDIO from the environment, then
+    Contents/Helpers/sysaudio of the app this process runs from, then
+    bin/sysaudio beside the package, then PATH.
 
     macOS keys the Screen Recording grant of an unbundled executable to its
     path. The daemon, `run` in a terminal, `check`, `doctor` and the brew
@@ -153,6 +155,10 @@ def find_sysaudio() -> Path | None:
     env = os.environ.get(SYSAUDIO_ENV_VAR)
     if env and Path(env).is_file():
         return Path(env)
+
+    root = supervisor.bundle_root()
+    if root is not None and supervisor.bundle_sysaudio(root).is_file():
+        return supervisor.bundle_sysaudio(root)
 
     pkg_dir = Path(__file__).resolve().parent
     for ancestor in [pkg_dir, *pkg_dir.parents]:

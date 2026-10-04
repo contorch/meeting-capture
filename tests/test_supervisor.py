@@ -310,4 +310,5 @@ def test_the_old_plist_config_store_stays_deleted():
         # daemon.py may only unload its own job (the bundle-gone guard)
         if py.name not in ("supervisor.py", "daemon.py"):
             assert '"launchctl"' not in text, f"{py.name} runs launchctl itself"
-        assert '"kickstart", "-k"' not in text, py.name
+        # kickstart -k only restarts the app's sealed agent, never a legacy plist
+        assert text.count('"kickstart", "-k"') == (1 if py.name == "supervisor.py" else 0), py.name

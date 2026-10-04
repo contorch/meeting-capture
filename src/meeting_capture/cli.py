@@ -522,6 +522,7 @@ def cmd_stop(args) -> int:
 
 
 AGENT_TEXT = {
+    "heal": "re-registered the recorder agent",
     "start": "recorder started (and starts at login)",
     "stop": "recorder stopped (stays stopped at login; `meeting-capture start` resumes it)",
     "restart": "recorder restarted",
@@ -1041,14 +1042,26 @@ def _install_sysaudio() -> str | None:
 
 def cmd_install(args) -> int:
     ensure_dirs()
+
+    def go():
+        return supervisor.install(sys.executable, _install_sysaudio(), adopt=args.adopt,
+                                  load=not args.no_load, backup_dir=args.backup_dir)
     if args.json:
-        return _agent_cmd(args, "install", lambda: supervisor.install(sys.executable, _install_sysaudio()))
+        return _agent_cmd(args, "install", go)
     shell = sorted(k for k in config.SETTINGS if k in os.environ and k not in config._injected)
-    res = supervisor.install(sys.executable, _install_sysaudio())
+    res = go()
     if not res.get("ok"):
         return _agent_cmd(args, "install", lambda: res)
-    print(f"installed the recorder agent at {res['plist']}")
-    print("it starts at login.")
+    if res["backend"] == "app":
+        print("registered Contorch.app's recorder agent" if res.get("loaded") or not args.no_load
+              else "Contorch.app takes the recorder over; `meeting-capture start` starts it")
+        if res.get("approval_required"):
+            print("macOS wants it allowed: System Settings › General › Login Items & Extensions")
+    else:
+        print(f"installed the recorder agent at {res['plist']}")
+        print("it starts at login." if not args.no_load else "not started (--no-load): `meeting-capture start`")
+    if res.get("moved_aside"):
+        print(f"the previous recorder agent was moved aside to {res['moved_aside']}")
     if res.get("moved"):
         print(f"settings moved from the plist into {paths.ENV_FILE}: "
               + ", ".join(k.removeprefix(config.PREFIX).lower() for k in res["moved"]))
@@ -1063,7 +1076,98 @@ def cmd_install(args) -> int:
 
 
 def cmd_uninstall(args) -> int:
-    return _agent_cmd(args, "uninstall", supervisor.uninstall)
+    return _agent_cmd(args, "uninstall", lambda: supervisor.uninstall(adopt=args.adopt))
+
+
+def cmd_heal(args) -> int:
+    """Re-register Contorch.app's recorder agent if its registration is stale
+    (the app moved or was reinstalled, a launch constraint, a spawn failure)."""
+    return _agent_cmd(args, "heal", supervisor.heal)
+
+
+def cmd_plist(args) -> int:
+    """Print an agent plist. --bundled: the one Contorch.app carries in
+    Contents/Library/LaunchAgents, for the contorch-macos build (never
+    hand-written there)."""
+    if not args.bundled:
+        print("usage: meeting-capture plist --bundled --bundle-id ID [--program P] [--label L]",
+              file=sys.stderr)
+        return 2
+    sys.stdout.write(supervisor.bundled_plist_payload(args.bundle_id, args.program, args.label).decode())
+    return 0
+
+
+WHERE_SCHEMA = "meeting-capture.where/1"
+
+
+def where_document() -> dict:
+    """Where this install's files are (`meeting-capture where --json`): the
+    recorder's sysaudio (its TCC identity) as find_sysaudio resolves it, the
+    agent, the settings and the skill. pipeline-monitor's adopt and doctor
+    read it instead of guessing paths."""
+    from . import channel_guard, skill
+    from .recorder import find_sysaudio
+    agent = supervisor.current()
+    root = supervisor.bundle_root()
+    sysaudio = find_sysaudio()
+    cli_path = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else None
+    if root is not None:
+        cli_path = str(root / "Contents" / "Resources" / "bin" / "meeting-capture")
+    return {"schema": WHERE_SCHEMA, "ok": True, "channel": channel_guard.channel(),
+            "version": __version__,
+            "bin": {"meeting_capture": cli_path, "python": sys.executable},
+            "bundle": str(root) if root else None,
+            "sysaudio": os.path.abspath(sysaudio) if sysaudio else None,
+            "agent": {"backend": agent.backend, "label": agent.label, "plist": agent.plist,
+                      "app": agent.app, "record": str(paths.AGENT_RECORD)},
+            "plist": agent.plist,
+            "settings": str(paths.ENV_FILE), "log": str(LOG_FILE),
+            "state": str(getattr(paths, "STATE_FILE", paths.STATE_DIR / "state.json")),
+            "skills": {"meeting": {"source": str(skill.source()), "installed": str(skill.target())}}}
+
+
+def cmd_where(args) -> int:
+    from . import jsonout
+    if args.json:
+        with jsonout.reserved_stdout() as out:
+            jsonout.emit(where_document(), out)
+        return 0
+    doc = where_document()
+    print(f"channel:   {doc['channel']}")
+    print(f"cli:       {doc['bin']['meeting_capture']}")
+    print(f"python:    {doc['bin']['python']}")
+    print(f"sysaudio:  {doc['sysaudio'] or '(not found)'}")
+    print(f"agent:     {doc['agent']['backend']} {doc['agent']['plist'] or ''}".rstrip())
+    print(f"settings:  {doc['settings']}")
+    print(f"log:       {doc['log']}")
+    print(f"skill:     {doc['skills']['meeting']['source']}")
+    return 0
+
+
+def cmd_skill(args) -> int:
+    """Install or remove the /meeting Claude Code skill (~/.claude/skills/meeting)."""
+    from . import jsonout, skill
+    fn = {"install": skill.install, "uninstall": skill.uninstall}.get(args.action)
+    if fn is None:
+        st = skill.status()
+        if args.json:
+            with jsonout.reserved_stdout() as out:
+                jsonout.emit({"schema": skill.SCHEMA, "ok": True, **st}, out)
+        else:
+            print(f"{st['path']}: {st['state'].replace('_', ' ')}")
+        return 0
+    if args.json:
+        with jsonout.reserved_stdout() as out:
+            res = fn()
+            jsonout.emit(res, out)
+    else:
+        res = fn()
+        words = {"linked": f"linked {res['path']}", "removed": f"removed {res['path']}",
+                 "kept_user_copy": f"{res['path']} is your own copy; left as it is",
+                 "none": "nothing to do"}
+        print(res["error"]["message"] if res.get("error") else words[res["action"]],
+              file=sys.stderr if res.get("error") else sys.stdout)
+    return 0 if res["ok"] else 1
 
 
 def cmd_restart(args) -> int:
@@ -1280,7 +1384,30 @@ def main(argv: list[str] | None = None) -> int:
     copilot.set_defaults(func=cmd_copilot)
 
     for name in ("install", "uninstall"):      # the recorder agent's verbs all take --json
-        _agent_flags(sub.choices[name])
+        p = _agent_flags(sub.choices[name])
+        p.add_argument("--adopt", action="store_true",
+                       help="pipeline-monitor's adopt/rollback: take the recorder over from the other "
+                            "install (with its operation token; never past the channel guard)")
+    sub.choices["install"].add_argument("--no-load", action="store_true",
+                                        help="install without starting it (`meeting-capture start` later)")
+    sub.choices["install"].add_argument("--backup-dir", metavar="DIR",
+                                        help="with --adopt: keep a copy of the replaced agent plist here")
+    _agent_parser(sub, "heal", "re-register Contorch.app's recorder agent if its registration is stale",
+                  cmd_heal)
+    pl = sub.add_parser("plist", help="print an agent plist (--bundled: Contorch.app's, for its build)")
+    pl.add_argument("--bundled", action="store_true")
+    pl.add_argument("--bundle-id", default="com.contorch.app",
+                    help="the app's bundle id (AssociatedBundleIdentifiers)")
+    pl.add_argument("--program", default=supervisor.BUNDLE_PROGRAM, help="BundleProgram, relative to the bundle")
+    pl.add_argument("--label", default=None, help="the job label (default com.contorch.meeting-capture)")
+    pl.set_defaults(func=cmd_plist)
+    wh = sub.add_parser("where", help="where this install's files are (sysaudio, agent, settings, skill)")
+    wh.add_argument("--json", action="store_true", help="one JSON document (meeting-capture.where/1)")
+    wh.set_defaults(func=cmd_where)
+    sk = sub.add_parser("skill", help="install or remove the /meeting Claude Code skill")
+    sk.add_argument("action", nargs="?", choices=["install", "uninstall", "status"])
+    sk.add_argument("--json", action="store_true", help="one JSON document (meeting-capture.skill/1)")
+    sk.set_defaults(func=cmd_skill)
 
     args = parser.parse_args(argv)
     return args.func(args)

@@ -17,8 +17,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - name: Install (with the line-in extra, so its real imports are exercised)
-        run: python -m pip install -q -e '.[dev,linein]'
+      - name: Install (with the line-in and app extras, so their real imports are exercised)
+        run: python -m pip install -q -e '.[dev,linein,app]'
       - name: pytest
         run: python -m pytest -q tests
       - name: channel guard fixtures are pipeline-monitor's, at the pinned commit
@@ -37,6 +37,15 @@ jobs:
           from meeting_capture import linein
           devs = linein.list_input_devices()   # real PortAudio, no hardware assumed
           print(f"sounddevice OK; {len(devs)} input device(s) on the runner")
+          PY
+      - name: app extra — the real SMAppService API the registrar calls (read-only, nothing registered)
+        run: |
+          python - <<'PY'
+          from meeting_capture import registrar
+          assert registrar.available()
+          svc = registrar._service("com.contorch.labtest.ci-nonexistent")
+          assert hasattr(svc, "registerAndReturnError_") and hasattr(svc, "unregisterAndReturnError_")
+          print("SMAppService status of a label nobody registered:", registrar.status("com.contorch.labtest.ci-nonexistent"))
           PY
 
   # Builds sysaudio with the release toolchain on every PR. Swift breakage,

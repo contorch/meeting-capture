@@ -25,6 +25,10 @@ UI_URL_FILE = STATE_DIR / "ui.url"   # the running page's URL (0600: carries its
 
 LAUNCHD_LABEL = "com.contorch.meeting-capture"
 LAUNCHD_PLIST = HOME / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+# Written by registrar.py when Contorch.app registers its bundled agent:
+# tells every install on this Mac that the app runs the recorder, and which
+# sysaudio it pins.
+AGENT_RECORD = STATE_DIR / "agent.json"
 
 
 def ensure_dirs() -> None:

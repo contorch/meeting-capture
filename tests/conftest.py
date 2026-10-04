@@ -158,6 +158,7 @@ def _isolated_settings(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "ENV_LOCK", state / "env.lock")
     monkeypatch.setattr(paths, "PID_FILE", state / "daemon.pid")
     monkeypatch.setattr(paths, "LAUNCHD_PLIST", tmp_path / "no-agent.plist")
+    monkeypatch.setattr(paths, "AGENT_RECORD", state / "agent.json")
     monkeypatch.setattr(paths, "HOME", tmp_path / "home")
     monkeypatch.setattr(supervisor, "_launchctl", _no_launchctl)
     config._injected.clear()
