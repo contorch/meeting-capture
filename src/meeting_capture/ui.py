@@ -611,7 +611,10 @@ function renderStt(first){
   const t = S.transcription;
   if (!t || t.error) { $("sttnow").textContent = t && t.error ? "Can't read the transcription settings: " + t.error : ""; return; }
   const a = t.apple || {};
-  const tag = t.engine === "apple" && t.ready ? '<span class="tag local">nothing uploaded</span>'
+  // Where audio goes: may_upload (README "Contract") decides "nothing uploaded".
+  const tag = t.live && t.live.active ? '<span class="tag cloud">live: calls stream to Google</span>'
+            : t.engine === "apple" && t.ready && !t.may_upload ? '<span class="tag local">nothing uploaded</span>'
+            : t.engine === "apple" && t.ready ? '<span class="tag local">on this Mac — Gemini (uploads) only if it stops working</span>'
             : t.engine === "gemini" && t.ready ? '<span class="tag cloud">uploads to Google</span>'
             : '<span class="tag off">not transcribing — audio is kept</span>';
   const engine = t.engine === "apple" ? "On this Mac" + (t.ready ? " (" + langName(t.locale) + ")" : "")

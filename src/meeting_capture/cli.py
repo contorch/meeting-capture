@@ -749,6 +749,7 @@ def transcription_summary() -> dict:
     s = engine_summary(_daemon_env())
     requested = _plist_mode() == "live"
     blocker = live_mode_blocker() if requested else None
+    active = requested and blocker is None
     return {
         "schema": STT_JSON_SCHEMA,
         "version": __version__,
@@ -756,7 +757,14 @@ def transcription_summary() -> dict:
         **s,
         # Live mode streams every call to Gemini as it happens, whatever the
         # batch engine above is: active means audio leaves the Mac.
-        "live": {"requested": requested, "active": requested and blocker is None, "blocker": blocker},
+        "live": {"requested": requested, "active": active, "blocker": blocker},
+        # The privacy answer: can meeting audio reach Google with nobody
+        # changing a setting? Now (uploads, live) or as soon as on-device
+        # transcription fails under auto with a key (gemini_fallback:
+        # transcriber.transcribe() then sends the chunk to Gemini — after a
+        # macOS update, a removed model, or one failed helper run). False
+        # only when audio stays on this Mac whatever happens.
+        "may_upload": bool(s["uploads"] or active or s["gemini_fallback"]),
     }
 
 
@@ -765,6 +773,16 @@ ENGINE_DESCRIPTIONS = {
     "gemini": "Gemini — each chunk is uploaded to Google",
     "none": "none — audio is kept until an engine can run",
 }
+
+
+def engine_description(s: dict) -> str:
+    """ENGINE_DESCRIPTIONS for a transcription_summary(), hedged when on this
+    Mac is not the whole story (gemini_fallback: auto with a key hands a chunk
+    to Gemini when on-device fails)."""
+    text = ENGINE_DESCRIPTIONS[s["engine"]]
+    if s["engine"] == "apple" and s.get("gemini_fallback"):
+        text = "On this Mac — uploaded to Gemini only if on-device transcription stops working"
+    return text
 
 
 def _notice(s: dict) -> str:
@@ -853,7 +871,7 @@ def apply_transcription(stt: str | None = None, locale: str | None = None, progr
 
     s = transcription_summary()
     lines = [f"transcription: {CHOICE_LABELS[new_stt]} (stt={new_stt}), language {new_locale} — "
-             f"now {ENGINE_DESCRIPTIONS[s['engine']]}; daemon restarted"]
+             f"now {engine_description(s)}; daemon restarted"]
     lines += notes
     if new_stt == "gemini" and not s["gemini_key"]:
         lines.append("no Google API key the recorder can see — write it to ~/.config/google/key "
@@ -876,7 +894,7 @@ def stt_lines(s: dict) -> list[str]:
     live = s["live"]
     key_needed = s["engine"] == "gemini" or s["choice"] == "gemini" or live["requested"]
     lines = [
-        f"engine:    {ENGINE_DESCRIPTIONS[s['engine']]}{'' if s['ready'] else ' (not ready)'}",
+        f"engine:    {engine_description(s)}{'' if s['ready'] else ' (not ready)'}",
         f"why:       {s['reason']}",
         f"setting:   {s['choice']}   (meeting-capture stt auto|apple|gemini)",
         f"language:  {s['locale']}   ({s['locale_why']}; meeting-capture language LOCALE; on this Mac only)",

@@ -191,14 +191,16 @@ The daemon self-exits (and launchd respawns it) if its `phys_footprint` exceeds 
 | `engine`, `engine_label`, `ready`, `reason` | what transcribes batch chunks now: `apple` (on this Mac) \| `gemini` \| `none` (audio kept until one can), whether it can run, and why |
 | `uploads` | batch chunks go to Google (engine `gemini`; when not ready, once a key exists) |
 | `live.requested`, `live.active`, `live.blocker` | live mode asked for; actually streaming every call to Gemini (**also uploads**); why it runs batch instead |
-| `gemini_fallback` | `auto` with a key: if on-device transcription stops working, chunks fall back to Gemini |
+| `gemini_fallback` | `auto` with a key: if on-device transcription stops working (a macOS update, a removed model, one failed helper run), chunks fall back to Gemini — with no user action |
+| `may_upload` | **the privacy answer**: meeting audio can reach Google without anyone changing a setting — `uploads` or `live.active` or `gemini_fallback`. `false` only when audio stays on this Mac whatever happens |
 | `locale`, `locale_source`, `locale_why`, `locale_guessed`, `mac_language` | on-device language, where it comes from (`setting` \| `mac` \| `default`), whether en-US is only a guess because the Mac's language can't be done on-device |
 | `apple` | the helper's probe: `available`, `usable`, `installable`, `installed`, `reason`, `supported`, `installed_locales`, `exit_code`, … |
 | `needs_model`, `install_hint` | on-device would run but its language's model isn't installed/reserved yet; the exact command that fixes it (else `null`) |
-| `on_device_hint` | the exact command that makes batch transcription run on this Mac (installing the model if needed), or `null` when it already does or can't |
+| `on_device_hint` | the exact command that makes batch transcription run on this Mac under `auto` (installing the model if needed) — with a key, Gemini stays its backup (`gemini_fallback`); `null` when it already does or can't |
+| `on_device_only_hint` | the exact command that makes it run on this Mac **and never upload** (`meeting-capture stt apple`, which installs the model if needed); `null` when it already does or can't |
 | `gemini_key`, `notice` | a key the recorder will see; the upgrade note (`null` when none) |
 
-Privacy wording belongs to these fields only: audio leaves the Mac when `uploads` or `live.active` is true. `meeting-capture stt auto|apple|gemini [--language L]` and `meeting-capture language L` are safe to run from another program: no prompts, progress as lines on stdout (model download percentages included), errors on stderr, exit 0 when applied (then ask `stt --json` for the result), 1 when refused with the plist untouched, 2 for usage errors.
+Privacy wording belongs to these fields only: audio leaves the Mac now when `uploads` or `live.active` is true, and may leave it when `may_upload` is true; say "never leaves this Mac" only when `may_upload` is false. A caller that asks in the background (a menu bar timer) should run the venv's own `~/.meeting-capture/venv/bin/meeting-capture` — the code the recorder runs — not the Homebrew wrapper: after a `brew upgrade` the wrapper deletes and rebuilds that venv, under the running recorder. `meeting-capture stt auto|apple|gemini [--language L]` and `meeting-capture language L` are safe to run from another program: no prompts, progress as lines on stdout (model download percentages included), errors on stderr, exit 0 when applied (then ask `stt --json` for the result), 1 when refused with the plist untouched, 2 for usage errors.
 
 ## Tests
 

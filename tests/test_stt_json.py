@@ -22,7 +22,7 @@ SCHEMA_1 = {
     "choice", "choice_label", "engine", "engine_label", "ready", "reason",
     "locale", "locale_source", "locale_why", "locale_guessed", "mac_language",
     "uploads", "gemini_fallback", "gemini_key", "notice", "live", "apple",
-    "needs_model", "install_hint", "on_device_hint",
+    "needs_model", "install_hint", "on_device_hint", "on_device_only_hint", "may_upload",
 }
 APPLE_FIELDS = {"available", "usable", "installable", "installed", "reason", "locale", "supported",
                 "installed_locales", "exit_code", "os", "arch", "helper"}
@@ -96,7 +96,7 @@ def test_a_dutch_mac_with_a_key_uploads_and_says_so(fake_helper, agent, mac, key
 
 def test_the_on_device_hint_does_what_it_says(fake_helper, agent, mac, key_file, capsys):
     mac("nl-NL", region="nl_NL")
-    for env in ({}, {"MEETING_CAPTURE_STT": "gemini"}):
+    for env in ({}, {"MEETING_CAPTURE_STT": "gemini"}, {"MEETING_CAPTURE_STT": "apple"}):
         relaunches = agent(env)
         hint = stt_json(capsys)["on_device_hint"]
         argv = shlex.split(hint)
@@ -153,6 +153,80 @@ def test_with_a_key_auto_says_gemini_may_take_over(fake_helper, agent, key_file,
     assert (s["engine"], s["uploads"], s["gemini_fallback"]) == ("apple", False, True)
     agent({"MEETING_CAPTURE_STT": "apple"})
     assert stt_json(capsys)["gemini_fallback"] is False
+
+
+def test_may_upload_is_the_privacy_answer(fake_helper, agent, key_file, capsys):
+    """The review's case: stt unset, a key in the key file, an English Mac,
+    on-device ready. Nothing uploads now, but transcribe() hands a chunk to
+    Gemini the moment on-device fails, so it is not "never leaves this Mac"."""
+    s = stt_json(capsys)
+    assert (s["engine"], s["uploads"], s["live"]["active"]) == ("apple", False, False)
+    assert s["gemini_fallback"] is True and s["may_upload"] is True
+    assert s["on_device_hint"] is None and s["on_device_only_hint"] == "meeting-capture stt apple"
+    agent({"MEETING_CAPTURE_STT": "apple"})                     # on this Mac only
+    s = stt_json(capsys)
+    assert (s["gemini_fallback"], s["may_upload"], s["on_device_only_hint"]) == (False, False, None)
+    assert s["on_device_hint"] == "meeting-capture stt auto"   # on this Mac, Gemini as backup
+    agent({"MEETING_CAPTURE_STT": "apple", "MEETING_CAPTURE_MODE": "live"})
+    assert stt_json(capsys)["may_upload"] is False             # apple refuses live
+    agent({"MEETING_CAPTURE_MODE": "live"})
+    assert stt_json(capsys)["may_upload"] is True
+
+
+def test_may_upload_without_a_key_is_false(fake_helper, agent, capsys):
+    s = stt_json(capsys)
+    assert (s["engine"], s["gemini_fallback"], s["may_upload"]) == ("apple", False, False)
+    agent({"MEETING_CAPTURE_STT": "gemini"})                   # gemini, no key: would upload once one exists
+    assert stt_json(capsys)["may_upload"] is True
+
+
+@pytest.mark.parametrize("env, uploads", [({"MEETING_CAPTURE_STT": "apple"}, False), ({}, True)])
+def test_may_upload_matches_what_transcribe_does(fake_helper, agent, key_file, monkeypatch, capsys,
+                                                 env, uploads):
+    """Pin the field to the daemon's behaviour, not to a formula: on-device
+    ready, then the helper breaks (a macOS update, a removed model, a failed
+    fork). With may_upload false transcribe() keeps the chunk; with it true
+    the chunk goes to Gemini with nobody changing a setting."""
+    agent(env)
+    s = stt_json(capsys)
+    assert (s["engine"], s["ready"], s["uploads"], s["may_upload"]) == ("apple", True, False, uploads)
+    for k, v in env.items():                       # the daemon runs with its plist env
+        monkeypatch.setenv(k, v)
+    sent = []
+    monkeypatch.setattr(t, "_gemini", lambda *a, **k: sent.append(1) or "gemini text")
+
+    def broken(*a, **k):
+        fake_helper.configure(old=True)            # the re-probe fails too
+        t.clear_apple_status_cache()
+        raise t.AppleUnavailable("helper vanished")
+    monkeypatch.setattr(t, "_transcribe_apple", broken)
+    t.clear_apple_status_cache()
+    try:
+        t.transcribe(Path("/nonexistent.wav"))
+    except (t.AppleUnavailable, t.TranscriptionUnavailable):
+        pass
+    assert bool(sent) is uploads
+
+
+def test_the_on_device_only_hint_does_what_it_says(fake_helper, agent, key_file, capsys):
+    for env, installed in (({}, ["en-US"]), ({"MEETING_CAPTURE_STT": "gemini"}, []), ({}, [])):
+        fake_helper.configure(installed=installed)
+        relaunches = agent(env)
+        argv = shlex.split(stt_json(capsys)["on_device_only_hint"])
+        assert argv[:3] == ["meeting-capture", "stt", "apple"]
+        assert cli.main(argv[1:]) == 0 and relaunches == [1]
+        capsys.readouterr()
+        s = stt_json(capsys)
+        assert (s["engine"], s["ready"], s["may_upload"], s["on_device_only_hint"]) == ("apple", True, False, None)
+
+
+def test_the_text_hedges_like_the_json(fake_helper, agent, key_file, capsys):
+    assert cli.main(["stt"]) == 0
+    text = capsys.readouterr().out
+    assert "nothing is uploaded" not in text and "only if on-device transcription stops working" in text
+    agent({"MEETING_CAPTURE_STT": "apple"})
+    assert cli.main(["stt"]) == 0
+    assert "On this Mac — nothing is uploaded" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("env, active, blocker", [

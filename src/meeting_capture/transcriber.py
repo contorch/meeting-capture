@@ -743,16 +743,28 @@ def model_needed(b: Backend, lc: Optional[LocaleChoice] = None,
 
 
 def on_device_hint(b: Backend, lc: LocaleChoice, st: AppleStatus, key: bool) -> Optional[str]:
-    """The one command that makes batch transcription run on this Mac (it
-    installs the language's model first when needed), or None when it already
-    does or this Mac can't. Keeps auto's Gemini fallback (not `stt apple`)."""
-    if (b.engine == "apple" and b.ready) or not (st.usable or st.installable):
+    """The one command that makes batch transcription run on this Mac under
+    `auto` — with Gemini as its backup when a key exists — installing the
+    language's model first when needed; None when it already does or this Mac
+    can't. on_device_only_hint() is the never-uploads alternative."""
+    if (b.choice == "auto" and b.engine == "apple" and b.ready) or not (st.usable or st.installable):
         return None
-    if b.choice == "gemini":
+    if b.choice in ("gemini", "apple"):
         if lc.guessed and key:     # auto alone would keep Gemini for this Mac's language
             return f"meeting-capture stt auto --language {lc.locale}"
         return "meeting-capture stt auto"
     return f"meeting-capture language {lc.locale}"
+
+
+def on_device_only_hint(b: Backend, st: AppleStatus) -> Optional[str]:
+    """The one command that makes batch transcription run on this Mac and
+    never upload — `stt apple`, which also installs the language's model when
+    needed — or None when it already does or this Mac can't. Unlike
+    on_device_hint() it drops auto's Gemini fallback (transcribe() hands a
+    chunk to Gemini when on-device fails under auto with a key)."""
+    if (b.choice == "apple" and b.engine == "apple" and b.ready) or not (st.usable or st.installable):
+        return None
+    return "meeting-capture stt apple"
 
 
 def engine_summary(env=None) -> dict:
@@ -776,6 +788,7 @@ def engine_summary(env=None) -> dict:
         "needs_model": needs_model,
         "install_hint": f"meeting-capture language {locale}" if needs_model else None,
         "on_device_hint": on_device_hint(b, lc, st, key),
+        "on_device_only_hint": on_device_only_hint(b, st),
         "notice": upgrade_notice(env, b),
     }
 
