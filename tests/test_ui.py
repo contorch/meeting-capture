@@ -265,3 +265,9 @@ def test_state_says_when_live_mode_is_requested_but_runs_batch(fake_helper, key_
     plist.write_bytes(plistlib.dumps({"EnvironmentVariables": {"MEETING_CAPTURE_MODE": "live",
                                                                "MEETING_CAPTURE_STT": "apple"}}))
     assert "never uploads" in ui._daemon_state()["live_blocked"]
+
+
+def test_the_settings_page_exits_when_whoever_opened_it_is_gone():
+    assert ui.orphaned(4242, getppid=lambda: 1) is True            # the menu bar quit (or updated)
+    assert ui.orphaned(4242, getppid=lambda: 4242) is False
+    assert ui.orphaned(1, getppid=lambda: 1) is False               # opened by launchd itself

@@ -21,6 +21,16 @@ jobs:
         run: python -m pip install -q -e '.[dev,linein]'
       - name: pytest
         run: python -m pytest -q tests
+      - name: channel guard fixtures are pipeline-monitor's, at the pinned commit
+        run: |
+          set -euo pipefail
+          pin=tests/fixtures/channel_guard/PIN
+          commit=$(awk '/^commit /{print $2}' "$pin")
+          d=$(mktemp -d)
+          for f in $(awk 'NF==2 && $2 ~ /\.json$/ {print $2}' "$pin"); do
+            curl -fsSL "https://raw.githubusercontent.com/contorch/pipeline-monitor/$commit/contract/channel_guard/$f" -o "$d/$f"
+          done
+          (cd "$d" && grep -v '^#\|^commit' "$GITHUB_WORKSPACE/$pin" | shasum -a 256 -c -)
       - name: line-in extra imports and lists devices on a real macOS runner
         run: |
           python - <<'PY'

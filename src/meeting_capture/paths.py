@@ -9,6 +9,8 @@ AUDIO_DIR = STATE_DIR / "audio"
 FAILED_AUDIO_DIR = AUDIO_DIR / "failed"
 LOG_FILE = STATE_DIR / "daemon.log"
 PID_FILE = STATE_DIR / "daemon.pid"
+# The daemon's state for other programs (state.py; `meeting-capture status --json`).
+STATE_FILE = STATE_DIR / "state.json"
 PAUSE_FILE = STATE_DIR / "paused"
 # "Start a new meeting from now" request (meetings.py) — holds a timestamp.
 NEW_MEETING_FILE = STATE_DIR / "new-meeting"

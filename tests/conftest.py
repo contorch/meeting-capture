@@ -124,9 +124,11 @@ def key_file():
 
 @pytest.fixture(autouse=True)
 def _isolated_transcript_db(tmp_path, monkeypatch):
-    """Never touch the real ~/.context-orchestrator/context.db from tests."""
-    from meeting_capture import store
+    """Never touch the real ~/.context-orchestrator/context.db (or the
+    daemon's state.json) from tests."""
+    from meeting_capture import paths, store
     monkeypatch.setenv("CO_DB_PATH", str(tmp_path / "context.db"))
+    monkeypatch.setattr(paths, "STATE_FILE", tmp_path / "state.json")
     monkeypatch.setattr(store, "PENDING_FILE", tmp_path / "unsaved-lines.jsonl")
 
 
@@ -150,3 +152,19 @@ def _isolated_transcription(tmp_path, monkeypatch):
     transcriber.clear_apple_status_cache()
     yield
     transcriber.clear_apple_status_cache()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sysaudio(monkeypatch):
+    """Never find (and so never run) an installed sysaudio — e.g. Homebrew's on
+    PATH — or one a developer's shell points at. Tests that need one set
+    MEETING_CAPTURE_SYSAUDIO to a fake."""
+    import shutil
+    from meeting_capture import recorder
+    monkeypatch.delenv(recorder.SYSAUDIO_ENV_VAR, raising=False)
+    monkeypatch.delenv(recorder.AUDIOTEE_ENV_VAR, raising=False)
+    monkeypatch.delenv("CONTORCH_CHANNEL", raising=False)
+    monkeypatch.delenv("CONTORCH_OP", raising=False)
+    real_which = shutil.which
+    monkeypatch.setattr(recorder.shutil, "which",
+                        lambda name, *a, **k: None if name in ("sysaudio", "audiotee") else real_which(name, *a, **k))

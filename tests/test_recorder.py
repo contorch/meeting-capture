@@ -311,3 +311,13 @@ def test_chunk_default_role_is_them():
 
     chunk = recorder.Chunk(path=Path("/tmp/x.wav"), started_at=0.0, duration_seconds=1.0)
     assert chunk.role == "them"
+
+
+def test_voice_activity_is_noted_for_the_line_in_state(tmp_path, monkeypatch):
+    import numpy as np
+    monkeypatch.setattr(recorder, "last_voice_at", 0.0)
+    c = recorder._ChannelChunker("me", tmp_path, 16000)
+    c._feed_block(np.zeros(4000, dtype="<i2"))
+    assert recorder.last_voice_at == 0.0
+    c._feed_block((np.ones(4000) * 3000).astype("<i2"))
+    assert recorder.last_voice_at > 0

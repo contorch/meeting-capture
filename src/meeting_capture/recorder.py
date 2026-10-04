@@ -106,6 +106,11 @@ ROLE_MIC = "me"
 
 FLUSH_MIN_SECONDS = 3.0
 
+# When any channel last carried sound above SILENCE_RMS (time.time()). The
+# daemon reads it to tell a line-in recorder that is only listening from one
+# that is recording speech (state.json).
+last_voice_at = 0.0
+
 
 def find_audiotee() -> Path | None:
     """Locate the audiotee binary. Kept for back-compat / fallback only."""
@@ -370,8 +375,10 @@ class _ChannelChunker:
         return chunks
 
     def _feed_block(self, block: np.ndarray) -> Chunk | None:
+        global last_voice_at
         level = _rms_int16(block)
         if level >= SILENCE_RMS:
+            last_voice_at = time.time()
             self.silent_audio_s = 0.0
             if self.chunk_started is None:
                 self.chunk_started = time.time()
