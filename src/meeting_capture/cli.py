@@ -1138,13 +1138,17 @@ def cmd_check(_args) -> int:
     return 0
 
 
-def _agent_parser(sub, name: str, help_: str, func, reason: bool = False):
-    p = sub.add_parser(name, help=help_)
+def _agent_flags(p, reason: bool = False):
     p.add_argument("--json", action="store_true",
                    help="one JSON document on stdout (meeting-capture.agent/1; README: Contract)")
     if reason:
         p.add_argument("--reason", choices=["user", "quit", "update"],
                        help="why (recorded in the --json result for the caller)")
+    return p
+
+
+def _agent_parser(sub, name: str, help_: str, func, reason: bool = False):
+    p = _agent_flags(sub.add_parser(name, help=help_), reason)
     p.set_defaults(func=func)
     return p
 
@@ -1164,8 +1168,6 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("resume", help="resume capture (starts a new transcript)").set_defaults(func=cmd_resume)
     sub.add_parser("new", help="start a new meeting: speech from now on goes into a new transcript").set_defaults(func=cmd_new)
     sub.add_parser("run", help="run daemon in foreground").set_defaults(func=cmd_run)
-    _agent_parser(sub, "install", "install the recorder agent (starts at login)", cmd_install)
-    _agent_parser(sub, "uninstall", "remove the recorder agent", cmd_uninstall)
     cfg = sub.add_parser("config", help="show the recorder's settings (~/.meeting-capture/env) and where "
                                         "each comes from; set or unset advanced ones")
     cfg.add_argument("action", nargs="?", choices=["show", "set", "unset"])
@@ -1174,6 +1176,8 @@ def main(argv: list[str] | None = None) -> int:
     cfg.add_argument("--json", action="store_true",
                      help="print the settings as one JSON document (meeting-capture.config/1)")
     cfg.set_defaults(func=cmd_config)
+    sub.add_parser("install", help="install launchd auto-start agent").set_defaults(func=cmd_install)
+    sub.add_parser("uninstall", help="remove launchd agent").set_defaults(func=cmd_uninstall)
     sub.add_parser("check", help="verify audiotee is built and prompt audio-capture permission").set_defaults(func=cmd_check)
     sub.add_parser("mic", help="show current mic-activity state (the gate that triggers recording)").set_defaults(func=cmd_mic)
     sub.add_parser("last", help="print the most recent transcript").set_defaults(func=cmd_last)
@@ -1216,6 +1220,9 @@ def main(argv: list[str] | None = None) -> int:
     copilot.add_argument("--session", help="feed stem to watch (default: newest)")
     copilot.add_argument("--model", default=os.environ.get("MEETING_CAPTURE_COPILOT_MODEL", "gemini-2.5-flash"))
     copilot.set_defaults(func=cmd_copilot)
+
+    for name in ("install", "uninstall"):      # the recorder agent's verbs all take --json
+        _agent_flags(sub.choices[name])
 
     args = parser.parse_args(argv)
     return args.func(args)
