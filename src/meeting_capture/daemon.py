@@ -939,13 +939,20 @@ class BundleGuard:
         return self.misses >= BUNDLE_MISSES
 
 
+def _own_label() -> str:
+    """Our launchd job's label: launchd puts it in XPC_SERVICE_NAME (a lab
+    build's agent is <id>.meeting-capture, not the default)."""
+    from .paths import LAUNCHD_LABEL
+    name = os.environ.get("XPC_SERVICE_NAME") or ""
+    return name if name.endswith("meeting-capture") else LAUNCHD_LABEL
+
+
 def _bootout_self() -> None:
     """Unload our own job so launchd doesn't start a deleted program again
     (at login, or through KeepAlive). It sends us SIGTERM; we are exiting."""
     import subprocess
-    from .paths import LAUNCHD_LABEL
     try:
-        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"],
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{_own_label()}"],
                        capture_output=True, timeout=10)
     except Exception as exc:
         log.warning("could not unload the recorder job: %s", exc)

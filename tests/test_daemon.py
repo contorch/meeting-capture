@@ -1169,3 +1169,14 @@ def test_the_bundle_gone_guard_ignores_a_transient_miss_and_other_channels():
         os.path.exists = real
     assert daemon.BundleGuard("/gone", enabled=False).gone() is False
     assert daemon.BundleGuard("/gone").enabled is False             # not the app channel (conftest: unset)
+
+
+@pytest.mark.parametrize("xpc,expect", [(None, "com.contorch.meeting-capture"),
+                                        ("com.contorch.labtest.meeting-capture", "com.contorch.labtest.meeting-capture"),
+                                        ("com.apple.Terminal", "com.contorch.meeting-capture")])
+def test_the_guard_unloads_its_own_label(monkeypatch, xpc, expect):
+    if xpc:
+        monkeypatch.setenv("XPC_SERVICE_NAME", xpc)
+    else:
+        monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
+    assert daemon._own_label() == expect
