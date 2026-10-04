@@ -10,7 +10,7 @@ Pairs with [context-orchestrator](https://github.com/contorch/context-orchestrat
 
 ## Requirements
 
-- macOS 13.0 or later (ScreenCaptureKit); macOS 15.0+ for own-voice ("me") capture
+- macOS 15.0 or later (ScreenCaptureKit with the microphone, for both sides of a call)
 - Python 3.10+
 - Xcode command-line tools (`xcode-select --install`)
 - For on-device transcription: macOS 26+ on Apple silicon (nothing else — no key, no account)
@@ -28,7 +28,7 @@ cd meeting-capture
 
 After setup:
 
-1. Open **System Settings → Privacy & Security → Screen & System Audio Recording**, click **+**, and add `bin/sysaudio` from the repo (⌘⇧G in the file dialog to type the path). Make sure it's enabled under the **System Audio Recording Only** list in the same pane too — system audio captures as silence until that grant lands. The daemon spawns sysaudio with TCC responsibility disclaimed, so permissions attach to the `sysaudio` binary itself — the same grant works under your terminal and under launchd, with no terminal-restart dance.
+1. Open **System Settings → Privacy & Security → Screen & System Audio Recording**, click **+**, and add `bin/sysaudio` from the repo (⌘⇧G in the file dialog to type the path). Make sure it's enabled under the **System Audio Recording Only** list in the same pane too — system audio captures as silence until that grant lands. Every sysaudio run (capture, `transcribe`, `check`) is started with TCC responsibility disclaimed, so permissions attach to the `sysaudio` binary itself — the same grant works under your terminal and under launchd, with no terminal-restart dance. `meeting-capture check` shows both permissions as sysaudio sees them.
 2. The first recording session pops a **Microphone** permission prompt titled "sysaudio" (for own-voice capture) — click Allow. Deny it (or skip it) and you get system-audio-only transcripts.
 3. After rebuilding sysaudio (`setup.sh` or `swift build`), re-add it in step 1 — the ad-hoc code signature changes with each build, which invalidates the previous grant.
 
@@ -48,6 +48,7 @@ CLI commands for inspection and control:
 |---|---|
 | `meeting-capture status` | Daemon state, mic state, last transcript, last log line |
 | `meeting-capture doctor` | Full health check of all prerequisites and components |
+| `meeting-capture check [--request screen_audio\|microphone]` | The recorder's two permissions as sysaudio sees them, and how to fix each; `--json` for other programs (see [Contract](#contract)) |
 | `meeting-capture mic` | Show current microphone-activity state |
 | `meeting-capture last` | Print the path of the most recent transcript |
 | `meeting-capture tail` | Follow the daemon log |
@@ -201,6 +202,16 @@ The daemon self-exits (and launchd respawns it) if its `phys_footprint` exceeds 
 | `gemini_key`, `notice` | a key the recorder will see; the upgrade note (`null` when none) |
 
 Privacy wording belongs to these fields only: audio leaves the Mac now when `uploads` or `live.active` is true, and may leave it when `may_upload` is true; say "never leaves this Mac" only when `may_upload` is false. A caller that asks in the background (a menu bar timer) should run the venv's own `~/.meeting-capture/venv/bin/meeting-capture` — the code the recorder runs — not the Homebrew wrapper: after a `brew upgrade` the wrapper deletes and rebuilds that venv, under the running recorder. `meeting-capture stt auto|apple|gemini [--language L]` and `meeting-capture language L` are safe to run from another program: no prompts, progress as lines on stdout (model download percentages included), errors on stderr, exit 0 when applied (then ask `stt --json` for the result), 1 when refused with the plist untouched, 2 for usage errors.
+
+**`meeting-capture check --json`** (schema `meeting-capture.permissions/1`) is the recorder's permission state: pipeline-monitor's menu, doctor and setup show its rows as they are instead of writing their own hints. It runs `sysaudio check --json` (schema `sysaudio.check/1`, read-only: `CGPreflightScreenCaptureAccess` and `AVCaptureDevice.authorizationStatus`) as its own responsible process, the identity it captures as. `--request screen_audio|microphone` asks macOS first (`CGRequestScreenCaptureAccess` / `requestAccess`; macOS shows its prompt once). One document on stdout, exit 0:
+
+| Field | Meaning |
+|---|---|
+| `schema`, `ok`, `error{code,message}` | `ok: false` when the state couldn't be read: `no_helper`, `helper_too_old` (a sysaudio without `check`), `helper_failed`, `helper_timeout` |
+| `channel` | `$CONTORCH_CHANNEL`: `app` \| `brew` \| `dev` (unset) |
+| `identity.helper`, `identity.subject` | the sysaudio the recorder runs, and who macOS asks about: the outermost app bundle's id (Contorch.app), else the binary's real path |
+| `permissions[]` | one row each for `screen_audio` and `microphone` (line-in included): `status` (`granted` \| `not_granted` \| `denied` \| `not_determined` \| `restricted` \| `unknown`), `required` (with the current source and mic setting), `can_request`, `hint` (what to do, worded for the channel; `null` when granted), `settings_url` (the Privacy pane) |
+| `requested` | the `--request` given, else `null` |
 
 ## Tests
 

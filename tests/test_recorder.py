@@ -273,37 +273,22 @@ def test_chunker_partial_blocks_accumulate(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Disclaimed spawn (TCC responsibility handoff to sysaudio)
+# Capture spawn: always its own responsible process (tccspawn)
 
 
-def test_disclaimed_proc_runs_and_pipes_stdout():
-    p = recorder._DisclaimedProc(["/bin/echo", "hello-disclaimed"])
-    out = p.stdout.read()
-    assert out == b"hello-disclaimed\n"
+def test_spawn_capture_is_disclaimed_and_pipes_stdout(monkeypatch):
+    seen = {}
+    real = recorder.tccspawn.spawn
+
+    def spy(cmd, **kw):
+        seen.update(kw, cmd=cmd)
+        return real(cmd, **kw)
+
+    monkeypatch.setattr(recorder.tccspawn, "spawn", spy)
+    p = recorder._spawn_capture(["/bin/echo", "hello"])
+    assert p.stdout.read() == b"hello\n"
     assert p.wait(timeout=5) == 0
-
-
-def test_disclaimed_proc_terminate():
-    import subprocess
-
-    p = recorder._DisclaimedProc(["/bin/sleep", "30"])
-    p.terminate()
-    try:
-        rc = p.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        p.kill()
-        raise
-    assert rc != 0  # killed by signal
-
-
-def test_spawn_capture_falls_back_on_failure(monkeypatch):
-    def boom(cmd):
-        raise OSError("nope")
-
-    monkeypatch.setattr(recorder, "_DisclaimedProc", boom)
-    p = recorder._spawn_capture(["/bin/echo", "fallback"], disclaim=True)
-    assert p.stdout.read() == b"fallback\n"
-    p.wait(timeout=5)
+    assert seen["stdout"] == recorder.tccspawn.PIPE and seen["stderr"] is None
 
 
 def test_chunk_default_role_is_them():

@@ -3,6 +3,7 @@
 # capture path, which would need Screen Recording and the mic. It checks:
 #   - the capture CLI still parses as before (--help; an unknown flag exits 1
 #     with "unknown arg"),
+#   - `check --json` (sysaudio.check/1) reads both permissions without asking,
 #   - the `transcribe` exit-code contract that meeting_capture relies on
 #     (see swift/Sources/sysaudio/Transcribe.swift),
 #   - that a ready probe means this binary's bundle id holds a reservation for
@@ -168,6 +169,26 @@ check "sysaudio --help keeps its usage line" grep -q "Usage: sysaudio \[--sample
 run 30 "$TMP/out" "$TMP/err" "$BIN" --no-such-flag
 expect "sysaudio --no-such-flag" 1
 check "capture arg parser still says 'unknown arg'" grep -q "unknown arg: --no-such-flag" "$TMP/err"
+
+# --- check (reads the two permissions; never --request: no prompt in CI) ---
+run 30 "$TMP/out" "$TMP/err" "$BIN" check --help
+expect "check --help" 0
+run 30 "$TMP/out" "$TMP/err" "$BIN" check --bogus
+expect "check usage error" 1
+check "check usage errors don't say 'unknown arg'" not_in_file "unknown arg" "$TMP/err"
+run 60 "$TMP/check.json" "$TMP/err" "$BIN" check --json
+expect "check --json" 0
+cat "$TMP/check.json"
+check "check JSON has every contract key" \
+    json_keys "$TMP/check.json" schema screen_capture microphone os arch requested
+check "check JSON words are the contract's" python3 - "$TMP/check.json" <<'PY'
+import json, sys
+d = json.loads(open(sys.argv[1], encoding="utf-8").read())
+assert d["schema"] == "sysaudio.check/1", d
+assert d["screen_capture"] in ("granted", "not_granted"), d
+assert d["microphone"] in ("granted", "denied", "not_determined", "restricted"), d
+assert d["requested"] is None, d
+PY
 
 # --- transcribe ---
 run 30 "$TMP/out" "$TMP/err" "$BIN" transcribe --help

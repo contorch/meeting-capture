@@ -247,7 +247,7 @@ async def _run(should_record: Callable[[], bool], session_stem: str, append: Cal
         raise RuntimeError("no audio-capture binary (sysaudio) found")
     want_mic = binary.name == "sysaudio" and mic_capture_enabled()
     cmd = [str(binary), "--sample-rate", str(SAMPLE_RATE)] + (["--mic"] if want_mic else [])
-    proc = _spawn_capture(cmd, disclaim=want_mic)
+    proc = _spawn_capture(cmd)
 
     client = genai.Client(api_key=api_key, http_options=_http_options(types))
     feed = _FeedWriter(session_stem)
