@@ -187,7 +187,7 @@ The daemon self-exits (and launchd respawns it) if its `phys_footprint` exceeds 
 
 | Field | Meaning |
 |---|---|
-| `schema`, `ok`, `error{code,message}` | `ok: false` when the state couldn't be read: `no_helper`, `helper_too_old` (a sysaudio before 0.7), `helper_failed`, `helper_timeout` |
+| `schema`, `ok`, `error{code,message}` | `ok: false` when the state couldn't be read: `no_helper`, `helper_too_old` (a sysaudio without `check`), `helper_failed`, `helper_timeout` |
 | `channel` | `$CONTORCH_CHANNEL`: `app` \| `brew` \| `dev` (unset) |
 | `identity.helper`, `identity.subject` | the sysaudio the recorder runs, and who macOS asks about: the outermost app bundle's id (Contorch.app), else the binary's real path |
 | `permissions[]` | one row each for `screen_audio` and `microphone` (line-in included): `status` (`granted` \| `not_granted` \| `denied` \| `not_determined` \| `restricted` \| `unknown`), `required` (with the current source and mic setting), `can_request`, `hint` (what to do, worded for the channel; `null` when granted), `settings_url` (the Privacy pane) |

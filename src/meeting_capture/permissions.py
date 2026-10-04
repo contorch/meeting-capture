@@ -62,7 +62,7 @@ def _sysaudio_check(binary, request: str | None) -> tuple[dict | None, dict | No
         return None, {"code": "helper_failed", "message": f"could not run {binary}: {exc}"}
     if r.returncode != 0 and "unknown arg" in (r.stderr or ""):
         return None, {"code": "helper_too_old",
-                      "message": f"{binary} predates `sysaudio check` (meeting-capture 0.7 ships one that has it)"}
+                      "message": f"{binary} predates `sysaudio check` (upgrade meeting-capture for one that has it)"}
     lines = [l for l in (r.stdout or "").splitlines() if l.strip()]
     try:
         doc = json.loads(lines[-1])
