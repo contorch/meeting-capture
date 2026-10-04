@@ -139,7 +139,8 @@ class Meter:
 
 
 def _daemon_state() -> dict:
-    from .cli import LAUNCHD_PLIST, _is_running, _plist_mode, _read_pid, live_mode_blocker
+    from . import supervisor
+    from .cli import _is_running, _read_pid, daemon_mode, live_mode_blocker
 
     from .mic import is_mic_active
 
@@ -148,13 +149,14 @@ def _daemon_state() -> dict:
         in_call = is_mic_active()
     except Exception:
         in_call = False
-    mode = _plist_mode() if LAUNCHD_PLIST.exists() else "batch"
+    installed = supervisor.current().installed
+    mode = daemon_mode()
     try:
         live_blocked = (live_mode_blocker() or "") if mode == "live" else ""
     except Exception:   # never break the page over it
         live_blocked = ""
     return {
-        "installed": LAUNCHD_PLIST.exists(),
+        "installed": installed,
         "running": bool(pid and _is_running(pid)),
         "paused": PAUSE_FILE.exists(),
         "in_call": in_call,
@@ -200,8 +202,7 @@ def state(meter: "Meter | None" = None) -> dict:
     return {
         "version": __version__,
         "daemon": daemon,
-        "source": current_source() if daemon["installed"] else
-                  {"source": "sck", "device": "", "me": 0, "them": 1},
+        "source": current_source(),
         "devices": list_input_devices(),
         "transcription": _transcription_state(),
         "transcript": _latest_transcript(),

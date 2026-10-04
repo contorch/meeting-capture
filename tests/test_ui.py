@@ -115,7 +115,7 @@ def test_levels_report_per_input_dbfs_and_clipping(server):
 def test_state_shape_with_real_helpers(monkeypatch, tmp_path):
     from meeting_capture import cli, linein
     monkeypatch.setattr(linein, "_import_sounddevice", lambda: FakeSD())
-    monkeypatch.setattr(cli, "LAUNCHD_PLIST", tmp_path / "none.plist")
+    monkeypatch.setattr("meeting_capture.paths.LAUNCHD_PLIST", tmp_path / "none.plist")
     store.append("meeting-2026-09-29T10-00-00", "[10:00:01] **Them:** hello from the guest\n\n")
     st = ui.state()
     assert st["daemon"]["installed"] is False
@@ -220,7 +220,7 @@ def test_transcription_endpoint_reports_errors(stt_server):
 def test_state_carries_the_transcription_settings(fake_helper, monkeypatch, tmp_path):
     from meeting_capture import cli, linein
     monkeypatch.setattr(linein, "_import_sounddevice", lambda: FakeSD())
-    monkeypatch.setattr(cli, "LAUNCHD_PLIST", tmp_path / "none.plist")
+    monkeypatch.setattr("meeting_capture.paths.LAUNCHD_PLIST", tmp_path / "none.plist")
     t = ui.state()["transcription"]
     assert (t["engine"], t["choice"], t["locale"], t["ready"]) == ("apple", "auto", "en-US", True)
     assert "hi-IN" in t["apple"]["supported"] and "en-US" in t["apple"]["installed_locales"]
@@ -231,7 +231,7 @@ def test_state_carries_the_transcription_settings(fake_helper, monkeypatch, tmp_
 def test_state_carries_the_upgrade_note(fake_helper, gemini_key, monkeypatch, tmp_path):
     from meeting_capture import cli, linein
     monkeypatch.setattr(linein, "_import_sounddevice", lambda: FakeSD())
-    monkeypatch.setattr(cli, "LAUNCHD_PLIST", tmp_path / "none.plist")
+    monkeypatch.setattr("meeting_capture.paths.LAUNCHD_PLIST", tmp_path / "none.plist")
     t = ui.state()["transcription"]
     assert t["engine"] == "apple" and "instead of Gemini" in t["notice"]
 
@@ -258,7 +258,7 @@ def test_state_says_when_live_mode_is_requested_but_runs_batch(fake_helper, key_
     import plistlib
     from meeting_capture import cli
     plist = tmp_path / "agent.plist"
-    monkeypatch.setattr(cli, "LAUNCHD_PLIST", plist)
+    monkeypatch.setattr("meeting_capture.paths.LAUNCHD_PLIST", plist)
     plist.write_bytes(plistlib.dumps({"EnvironmentVariables": {"MEETING_CAPTURE_MODE": "live"}}))
     d = ui._daemon_state()
     assert d["mode"] == "live" and d["live_blocked"] == ""          # auto + key: live streams

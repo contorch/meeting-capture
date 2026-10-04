@@ -64,7 +64,7 @@ def test_last_chunk_log_line_skips_non_chunk_lines(tmp_path, monkeypatch):
     assert cli._last_chunk_log_line() is None
 
 
-# --- mode: live/batch persisted in the launchd plist -------------------------------
+# --- mode: live/batch, a setting (~/.meeting-capture/env) -------------------------------
 
 def _write_plist(path: Path, env: dict) -> None:
     import plistlib
@@ -72,54 +72,70 @@ def _write_plist(path: Path, env: dict) -> None:
 
 
 def _read_env(path: Path) -> dict:
+    """The recorder's settings as it will run: ~/.meeting-capture/env under
+    its agent's injected environment (the plist at `path`)."""
+    from meeting_capture import config
+    return config.daemon_env()
+
+
+def _snap(plist: Path):
+    """The plist and the env file, to prove a refused change touched neither."""
+    from meeting_capture import paths
+    env = paths.ENV_FILE.read_bytes() if paths.ENV_FILE.exists() else None
+    return plist.read_bytes(), env
+
+
+def _add_plist_env(plist: Path, extra: dict) -> None:
     import plistlib
-    return dict(plistlib.loads(path.read_bytes())["EnvironmentVariables"])
+    payload = plistlib.loads(plist.read_bytes())
+    payload["EnvironmentVariables"] = {**payload.get("EnvironmentVariables", {}), **extra}
+    plist.write_bytes(plistlib.dumps(payload))
 
 
-def test_plist_mode_defaults_to_batch_without_plist(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "LAUNCHD_PLIST", tmp_path / "missing.plist")
-    assert cli._plist_mode() == "batch"
+def test_daemon_mode_defaults_to_batch_without_plist(tmp_path, monkeypatch):
+    monkeypatch.setattr("meeting_capture.paths.LAUNCHD_PLIST", tmp_path / "missing.plist")
+    assert cli.daemon_mode() == "batch"
 
 
-def test_plist_mode_reads_live_from_plist(tmp_path, monkeypatch):
+def test_daemon_mode_reads_live_from_an_old_plist(tmp_path, monkeypatch):
     plist = tmp_path / "agent.plist"
     _write_plist(plist, {"PATH": "/usr/bin", "MEETING_CAPTURE_MODE": "live"})
-    monkeypatch.setattr(cli, "LAUNCHD_PLIST", plist)
-    assert cli._plist_mode() == "live"
+    monkeypatch.setattr("meeting_capture.paths.LAUNCHD_PLIST", plist)
+    assert cli.daemon_mode() == "live"
 
 
-def test_plist_mode_ignores_garbage_value(tmp_path, monkeypatch):
+def test_daemon_mode_ignores_garbage_value(tmp_path, monkeypatch):
     plist = tmp_path / "agent.plist"
     _write_plist(plist, {"MEETING_CAPTURE_MODE": "turbo"})
-    monkeypatch.setattr(cli, "LAUNCHD_PLIST", plist)
-    assert cli._plist_mode() == "batch"
+    monkeypatch.setattr("meeting_capture.paths.LAUNCHD_PLIST", plist)
+    assert cli.daemon_mode() == "batch"
 
 
-def test_set_plist_mode_live_keeps_other_env(tmp_path, monkeypatch):
+def test_set_mode_live_keeps_other_env(tmp_path, monkeypatch):
     plist = tmp_path / "agent.plist"
     _write_plist(plist, {"PATH": "/usr/bin", "MEETING_CAPTURE_SYSAUDIO": "/x/sysaudio"})
-    monkeypatch.setattr(cli, "LAUNCHD_PLIST", plist)
-    cli._set_plist_mode("live")
+    monkeypatch.setattr("meeting_capture.paths.LAUNCHD_PLIST", plist)
+    cli._set_mode("live")
     env = _read_env(plist)
     assert env["MEETING_CAPTURE_MODE"] == "live"
     assert env["MEETING_CAPTURE_SYSAUDIO"] == "/x/sysaudio"  # the TCC-granted path must survive
     assert env["PATH"] == "/usr/bin"
 
 
-def test_set_plist_mode_batch_removes_key(tmp_path, monkeypatch):
+def test_set_mode_batch_removes_key(tmp_path, monkeypatch):
     plist = tmp_path / "agent.plist"
     _write_plist(plist, {"MEETING_CAPTURE_MODE": "live"})
-    monkeypatch.setattr(cli, "LAUNCHD_PLIST", plist)
-    cli._set_plist_mode("batch")
+    monkeypatch.setattr("meeting_capture.paths.LAUNCHD_PLIST", plist)
+    cli._set_mode("batch")
     assert "MEETING_CAPTURE_MODE" not in _read_env(plist)
 
 
 def test_cmd_mode_switch_relaunches(tmp_path, monkeypatch, capsys, key_file):
     plist = tmp_path / "agent.plist"
     _write_plist(plist, {})
-    monkeypatch.setattr(cli, "LAUNCHD_PLIST", plist)
+    monkeypatch.setattr("meeting_capture.paths.LAUNCHD_PLIST", plist)
     calls = []
-    monkeypatch.setattr(cli, "_relaunch", lambda: calls.append("relaunch"))
+    monkeypatch.setattr(cli, "_restart", lambda: calls.append("relaunch") or "recorder restarted")
     assert cli.main(["mode", "live"]) == 0
     assert calls == ["relaunch"]
     assert _read_env(plist)["MEETING_CAPTURE_MODE"] == "live"
@@ -129,73 +145,83 @@ def test_cmd_mode_switch_relaunches(tmp_path, monkeypatch, capsys, key_file):
 def test_cmd_mode_noop_when_already_set(tmp_path, monkeypatch, capsys, key_file):
     plist = tmp_path / "agent.plist"
     _write_plist(plist, {"MEETING_CAPTURE_MODE": "live"})
-    monkeypatch.setattr(cli, "LAUNCHD_PLIST", plist)
-    monkeypatch.setattr(cli, "_relaunch", lambda: pytest.fail("must not restart the daemon"))
+    monkeypatch.setattr("meeting_capture.paths.LAUNCHD_PLIST", plist)
+    monkeypatch.setattr(cli, "_restart", lambda: pytest.fail("must not restart the daemon"))
     assert cli.main(["mode", "live"]) == 0
     assert "already in live" in capsys.readouterr().out
 
 
 def test_cmd_mode_prints_current(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(cli, "LAUNCHD_PLIST", tmp_path / "missing.plist")
+    monkeypatch.setattr("meeting_capture.paths.LAUNCHD_PLIST", tmp_path / "missing.plist")
     assert cli.main(["mode"]) == 0
     assert capsys.readouterr().out.strip() == "batch"
 
 
-def test_cmd_mode_requires_install(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(cli, "LAUNCHD_PLIST", tmp_path / "missing.plist")
-    assert cli.main(["mode", "live"]) == 1
-    assert "install" in capsys.readouterr().err
+def test_cmd_mode_without_an_agent_saves_and_says_so(tmp_path, monkeypatch, capsys, gemini_key):
+    """Onboarding picks settings before the recorder agent exists."""
+    from meeting_capture import config
+    monkeypatch.setattr("meeting_capture.paths.LAUNCHD_PLIST", tmp_path / "missing.plist")
+    assert cli.main(["mode", "live"]) == 0
+    assert config.read()["MEETING_CAPTURE_MODE"] == "live"
+    assert "no recorder agent is installed yet" in capsys.readouterr().out
 
 
-# --- install pins the sysaudio path into the plist ----------------------------------
+# --- install pins the sysaudio path into the plist (a locator, never a setting) ----------
 
-def test_resolved_sysaudio_env_keeps_explicit_existing_path(tmp_path):
+def test_install_sysaudio_takes_an_explicit_existing_path(tmp_path, monkeypatch):
     binary = tmp_path / "sysaudio"
     binary.write_text("")
-    env = cli._resolved_sysaudio_env({"MEETING_CAPTURE_SYSAUDIO": str(binary), "PATH": "/usr/bin"})
-    assert env["MEETING_CAPTURE_SYSAUDIO"] == os.path.abspath(binary)
-    assert env["PATH"] == "/usr/bin"
+    monkeypatch.setenv("MEETING_CAPTURE_SYSAUDIO", str(binary))
+    assert cli._install_sysaudio() == os.path.abspath(binary)
 
 
-def test_resolved_sysaudio_env_replaces_dangling_path(tmp_path, monkeypatch):
+def test_install_sysaudio_keeps_the_agents_pin_over_a_search(tmp_path, monkeypatch):
+    from meeting_capture import recorder
+    pinned = tmp_path / "pinned" / "sysaudio"; pinned.parent.mkdir(); pinned.write_text("")
+    plist = tmp_path / "agent.plist"
+    _write_plist(plist, {"MEETING_CAPTURE_SYSAUDIO": str(pinned)})
+    monkeypatch.setattr("meeting_capture.paths.LAUNCHD_PLIST", plist)
+    monkeypatch.setattr(recorder, "find_sysaudio", lambda: pytest.fail("must not search"))
+    assert cli._install_sysaudio() == os.path.abspath(pinned)
+
+
+def test_install_sysaudio_replaces_a_dangling_path(tmp_path, monkeypatch):
     from meeting_capture import recorder
     found = tmp_path / "found" / "sysaudio"
     found.parent.mkdir()
     found.write_text("")
+    monkeypatch.setenv("MEETING_CAPTURE_SYSAUDIO", str(tmp_path / "gone"))
     monkeypatch.setattr(recorder, "find_sysaudio", lambda: found)
-    env = cli._resolved_sysaudio_env({"MEETING_CAPTURE_SYSAUDIO": str(tmp_path / "gone")})
-    assert env["MEETING_CAPTURE_SYSAUDIO"] == os.path.abspath(found)
+    assert cli._install_sysaudio() == os.path.abspath(found)
 
 
-def test_resolved_sysaudio_env_drops_key_when_nothing_found(tmp_path, monkeypatch):
+def test_install_sysaudio_none_when_nothing_found(tmp_path, monkeypatch):
     from meeting_capture import recorder
     monkeypatch.setattr(recorder, "find_sysaudio", lambda: None)
-    env = cli._resolved_sysaudio_env({"MEETING_CAPTURE_SYSAUDIO": str(tmp_path / "gone")})
-    assert "MEETING_CAPTURE_SYSAUDIO" not in env
+    assert cli._install_sysaudio() is None
 
 
-def test_plist_payload_pins_sysaudio(tmp_path, monkeypatch):
+def test_plist_payload_pins_sysaudio_and_carries_no_settings(tmp_path, monkeypatch):
     import plistlib
-    from meeting_capture import recorder
-    binary = tmp_path / "sysaudio"
-    binary.write_text("")
-    monkeypatch.setattr(cli, "LAUNCHD_PLIST", tmp_path / "no-agent.plist")
-    monkeypatch.delenv("MEETING_CAPTURE_SYSAUDIO", raising=False)
-    monkeypatch.setattr(recorder, "find_sysaudio", lambda: binary)
-    payload = plistlib.loads(cli._plist_payload("/usr/bin/python3"))
-    assert payload["EnvironmentVariables"]["MEETING_CAPTURE_SYSAUDIO"] == os.path.abspath(binary)
+    from meeting_capture import supervisor
+    monkeypatch.setenv("MEETING_CAPTURE_MODE", "live")          # a shell setting: never baked in
+    payload = plistlib.loads(supervisor.plist_payload("/usr/bin/python3", "/x/sysaudio", "brew"))
+    env = payload["EnvironmentVariables"]
+    assert env["MEETING_CAPTURE_SYSAUDIO"] == "/x/sysaudio"
+    assert set(env) == {"PATH", "MEETING_CAPTURE_SYSAUDIO", "CONTORCH_CHANNEL"}
+    assert env["CONTORCH_CHANNEL"] == "brew"
+    assert payload["ExitTimeOut"] == supervisor.EXIT_TIMEOUT_S
 
 
-def test_resolved_sysaudio_env_keeps_symlink_path(tmp_path):
+def test_install_sysaudio_keeps_symlink_path(tmp_path, monkeypatch):
     """A brew-style opt/ symlink must be pinned as given, not followed into
     Cellar/<version>/ — that path dangles on the next upgrade."""
     real = tmp_path / "Cellar" / "0.3.0" / "bin"; real.mkdir(parents=True)
     (real / "sysaudio").write_bytes(b"")
     (tmp_path / "opt").symlink_to(tmp_path / "Cellar" / "0.3.0")
     given = tmp_path / "opt" / "bin" / "sysaudio"
-    env = cli._resolved_sysaudio_env({"MEETING_CAPTURE_SYSAUDIO": str(given)})
-    assert env["MEETING_CAPTURE_SYSAUDIO"] == str(given)
-    assert "Cellar" not in env["MEETING_CAPTURE_SYSAUDIO"]
+    monkeypatch.setenv("MEETING_CAPTURE_SYSAUDIO", str(given))
+    assert cli._install_sysaudio() == str(given)
 
 
 # ---- `meeting-capture source` (line-in) — against a temp plist, fake audio devices
@@ -220,9 +246,9 @@ def linein_env(tmp_path, monkeypatch):
     monkeypatch.setattr(linein, "_import_sounddevice", lambda: _FakeSD())
     plist = tmp_path / "agent.plist"
     _write_plist(plist, {"PATH": "/usr/bin", "MEETING_CAPTURE_SYSAUDIO": "/x/sysaudio"})
-    monkeypatch.setattr(cli, "LAUNCHD_PLIST", plist)
+    monkeypatch.setattr("meeting_capture.paths.LAUNCHD_PLIST", plist)
     calls = []
-    monkeypatch.setattr(cli, "_relaunch", lambda: calls.append("relaunch"))
+    monkeypatch.setattr(cli, "_restart", lambda: calls.append("relaunch") or "recorder restarted")
     return plist, calls
 
 
@@ -240,9 +266,9 @@ def test_source_linein_writes_env_and_relaunches(linein_env, capsys):
 
 def test_source_linein_rejects_bad_device_without_touching_plist(linein_env, capsys):
     plist, calls = linein_env
-    before = plist.read_bytes()
+    before = _snap(plist)
     assert cli.main(["source", "linein", "--device", "focusrite"]) == 1
-    assert plist.read_bytes() == before and calls == []
+    assert _snap(plist) == before and calls == []
     assert "can't use that input" in capsys.readouterr().err
 
 
@@ -278,16 +304,16 @@ def test_source_shows_current_mapping(linein_env, capsys):
     assert out.startswith("linein") and "umc202" in out and "me = channel 1, them = channel 0" in out
 
 
-# ---- `meeting-capture stt` / `language` (plist env, like mode/source) --------------
+# ---- `meeting-capture stt` / `language` (settings, like mode/source) --------------
 
 @pytest.fixture
 def agent(tmp_path, monkeypatch):
     plist = tmp_path / "agent.plist"
     _write_plist(plist, {"PATH": "/usr/bin", "MEETING_CAPTURE_SYSAUDIO": "/x/sysaudio",
                          "MEETING_CAPTURE_TRANSCRIBER": "gemini"})
-    monkeypatch.setattr(cli, "LAUNCHD_PLIST", plist)
+    monkeypatch.setattr("meeting_capture.paths.LAUNCHD_PLIST", plist)
     calls = []
-    monkeypatch.setattr(cli, "_relaunch", lambda: calls.append("relaunch"))
+    monkeypatch.setattr(cli, "_restart", lambda: calls.append("relaunch") or "recorder restarted")
     return plist, calls
 
 
@@ -330,9 +356,9 @@ def test_stt_apple_installs_a_missing_model_first(fake_helper, agent, capsys):
 def test_stt_apple_refused_where_it_cannot_run(fake_helper, agent, capsys):
     plist, calls = agent
     fake_helper.configure(probe_rc=69, reason="needs macOS 26 or later on Apple silicon", supported=[])
-    before = plist.read_bytes()
+    before = _snap(plist)
     assert cli.main(["stt", "apple"]) == 1
-    assert plist.read_bytes() == before and calls == []
+    assert _snap(plist) == before and calls == []
     assert "needs macOS 26" in capsys.readouterr().err
 
 
@@ -349,9 +375,11 @@ def test_stt_gemini_warns_without_a_key_and_auto_is_written_too(fake_helper, age
     assert calls == ["relaunch", "relaunch"]
 
 
-def test_stt_set_requires_install(fake_helper, capsys):
-    assert cli.main(["stt", "apple"]) == 1
-    assert "install" in capsys.readouterr().err
+def test_stt_set_without_an_agent_saves_and_says_so(fake_helper, capsys):
+    from meeting_capture import config
+    assert cli.main(["stt", "apple"]) == 0
+    assert config.read()["MEETING_CAPTURE_STT"] == "apple"
+    assert "no recorder agent is installed yet" in capsys.readouterr().out
 
 
 def test_language_installs_then_switches(fake_helper, agent, capsys):
@@ -375,11 +403,11 @@ def test_language_bare_code_and_back_to_english(fake_helper, agent):
 
 def test_language_bad_input_lists_the_supported_ones(fake_helper, agent, capsys):
     plist, calls = agent
-    before = plist.read_bytes()
+    before = _snap(plist)
     assert cli.main(["language", "klingon"]) == 1
     err = capsys.readouterr().err
     assert "unsupported language 'klingon'" in err and "hi-IN" in err and "en-GB" in err
-    assert plist.read_bytes() == before and calls == []
+    assert _snap(plist) == before and calls == []
     assert not any("--install" in c for c in fake_helper.calls())
 
 
@@ -392,9 +420,9 @@ def test_language_where_on_device_is_unavailable(fake_helper, agent, capsys):
 def test_language_install_failure_leaves_the_plist_alone(fake_helper, agent, capsys):
     plist, calls = agent
     fake_helper.configure(install_rc=1)
-    before = plist.read_bytes()
+    before = _snap(plist)
     assert cli.main(["language", "hi-IN"]) == 1
-    assert plist.read_bytes() == before and calls == []
+    assert _snap(plist) == before and calls == []
 
 
 def test_language_show(fake_helper, agent, capsys):
@@ -415,37 +443,37 @@ def test_mode_live_allowed_in_auto_even_when_batch_runs_on_this_mac(fake_helper,
 
 def test_mode_live_refused_when_on_device_only(fake_helper, agent, gemini_key, capsys):
     plist, calls = agent
-    cli._update_plist_env({"MEETING_CAPTURE_STT": "apple"})
-    before = plist.read_bytes()
+    cli._save_settings({"MEETING_CAPTURE_STT": "apple"})
+    before = _snap(plist)
     assert cli.main(["mode", "live"]) == 1
     err = capsys.readouterr().err
     assert "never uploads" in err and "stt auto" in err
-    assert plist.read_bytes() == before and calls == []
+    assert _snap(plist) == before and calls == []
 
 
 def test_mode_live_refused_without_a_key(fake_helper, agent, capsys):
     plist, calls = agent
-    before = plist.read_bytes()
+    before = _snap(plist)
     assert cli.main(["mode", "live"]) == 1
     assert "no Google API key" in capsys.readouterr().err
-    assert plist.read_bytes() == before and calls == []
+    assert _snap(plist) == before and calls == []
 
 
 def test_mode_live_counts_a_key_in_the_daemon_env(fake_helper, agent):
     plist, calls = agent
-    cli._update_plist_env({"GOOGLE_API_KEY": "from-the-plist"})
+    _add_plist_env(plist, {"GOOGLE_API_KEY": "from-the-plist"})
     assert cli.main(["mode", "live"]) == 0 and calls == ["relaunch"]
 
 
 def test_mode_live_allowed_with_gemini(fake_helper, agent, key_file):
     plist, calls = agent
-    cli._update_plist_env({"MEETING_CAPTURE_STT": "gemini"})
+    cli._save_settings({"MEETING_CAPTURE_STT": "gemini"})
     assert cli.main(["mode", "live"]) == 0
     assert _read_env(plist)["MEETING_CAPTURE_MODE"] == "live" and calls == ["relaunch"]
 
 
 def test_stt_apple_while_live_says_it_runs_batch(fake_helper, agent, capsys):
-    cli._update_plist_env({"MEETING_CAPTURE_MODE": "live"})
+    cli._save_settings({"MEETING_CAPTURE_MODE": "live"})
     assert cli.main(["stt", "apple"]) == 0
     assert "runs batch" in capsys.readouterr().out
 
@@ -491,7 +519,7 @@ def test_status_and_doctor_show_the_engine(fake_helper, agent, monkeypatch, caps
 def test_status_doctor_and_stt_say_when_live_is_requested_but_runs_batch(fake_helper, agent, gemini_key,
                                                                          monkeypatch, capsys, tmp_path):
     _quiet_system(monkeypatch, tmp_path)
-    cli._update_plist_env({"MEETING_CAPTURE_MODE": "live", "MEETING_CAPTURE_STT": "apple"})
+    cli._save_settings({"MEETING_CAPTURE_MODE": "live", "MEETING_CAPTURE_STT": "apple"})
     cli.main(["status"])
     out = capsys.readouterr().out
     assert "mode:             live requested — running batch: transcription is set to on this Mac only" in out
@@ -508,7 +536,7 @@ def test_status_doctor_and_stt_say_when_live_is_requested_but_runs_batch(fake_he
 
 def test_status_doctor_and_stt_when_live_runs(fake_helper, agent, key_file, monkeypatch, capsys, tmp_path):
     _quiet_system(monkeypatch, tmp_path)
-    cli._update_plist_env({"MEETING_CAPTURE_MODE": "live"})
+    cli._save_settings({"MEETING_CAPTURE_MODE": "live"})
     cli.main(["status"])
     out = capsys.readouterr().out
     assert "mode:             live — calls stream to Gemini" in out
@@ -521,7 +549,7 @@ def test_status_doctor_and_stt_when_live_runs(fake_helper, agent, key_file, monk
 
 def test_live_on_line_in_is_reported_as_batch(fake_helper, agent, gemini_key, monkeypatch, capsys, tmp_path):
     _quiet_system(monkeypatch, tmp_path)
-    cli._update_plist_env({"MEETING_CAPTURE_MODE": "live", "MEETING_CAPTURE_SOURCE": "linein"})
+    cli._save_settings({"MEETING_CAPTURE_MODE": "live", "MEETING_CAPTURE_SOURCE": "linein"})
     cli.main(["status"])
     assert "live requested — running batch: the audio source is line-in" in capsys.readouterr().out
 
@@ -575,7 +603,7 @@ def test_no_note_without_a_key_or_once_gemini_is_chosen(fake_helper, agent, monk
     cli.main(["status"])                                  # never had Gemini: nothing changed for them
     assert "note:" not in capsys.readouterr().out
     monkeypatch.setenv("GOOGLE_API_KEY", "k")
-    cli._update_plist_env({"MEETING_CAPTURE_STT": "gemini"})
+    cli._save_settings({"MEETING_CAPTURE_STT": "gemini"})
     cli.main(["status"])
     assert "note:" not in capsys.readouterr().out
 

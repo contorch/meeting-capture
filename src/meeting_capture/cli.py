@@ -5,19 +5,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import plistlib
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from . import __version__, store
+from . import __version__, config, paths, store, supervisor
 from .mic import active_mic_name, is_mic_active, mic_name
 from .paths import (
     AUDIO_DIR,
-    LAUNCHD_LABEL,
-    LAUNCHD_PLIST,
     LOG_FILE,
     PAUSE_FILE,
     PID_FILE,
@@ -111,10 +108,12 @@ def cmd_status(_args) -> int:
 
     print(f"  transcripts db:   {store.db_path()}")
     print(f"  log file:         {LOG_FILE}")
-    print(f"  launchd:          {'installed' if LAUNCHD_PLIST.exists() else 'not installed'}")
+    agent = supervisor.current()
+    print(f"  recorder agent:   {agent.backend if agent.installed else 'not installed'}")
+    print(f"  settings:         {paths.ENV_FILE}"
+          f"{' (changed since the recorder started: meeting-capture restart)' if config.restart_pending() else ''}")
     s = transcription_summary()
-    print(f"  mode:             {_mode_line(s['live'])} "
-          f"({'launchd plist' if LAUNCHD_PLIST.exists() else 'default'})")
+    print(f"  mode:             {_mode_line(s['live'])} ({config.sources()[MODE_ENV_VAR]['source']})")
     print(f"  transcription:    {_engine_line(s)}")
     print(f"  language:         {s['locale']} ({s['locale_why']})")
     if s.get("notice"):
@@ -251,17 +250,22 @@ def cmd_doctor(_args) -> int:
         _ok(f"daemon running (pid {pid})")
     else:
         _fail("daemon not running", "meeting-capture install   OR   meeting-capture start")
-    if LAUNCHD_PLIST.exists():
-        _ok(f"launchd plist installed", str(LAUNCHD_PLIST))
-        result = subprocess.run(
-            ["launchctl", "list", LAUNCHD_LABEL], capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            _ok("launchd service loaded")
+    agent = supervisor.status()
+    if agent["installed"]:
+        _ok(f"recorder agent installed ({agent['backend']})", agent["plist"] or "")
+        if agent["loaded"]:
+            _ok("recorder agent loaded", f"state {agent['state'] or '?'}")
         else:
-            _fail("launchd service not loaded", f"launchctl load -w {LAUNCHD_PLIST}")
+            _fail("recorder agent not loaded (stopped)", "meeting-capture start")
     else:
-        _fail("launchd plist not installed", "meeting-capture install")
+        _fail("recorder agent not installed", "meeting-capture install")
+    print(f"  · settings: {paths.ENV_FILE}")
+    if config.restart_pending():
+        _fail("settings changed since the recorder started", "meeting-capture restart")
+    over = config.overridden(config.daemon_env()) if agent["installed"] else []
+    if over:
+        _fail(f"the recorder's agent overrides settings in {paths.ENV_FILE}: {', '.join(over)}",
+              "meeting-capture install (moves them into the settings file)")
 
     print("\nPaths & data:")
     try:
@@ -309,7 +313,7 @@ def cmd_doctor(_args) -> int:
     if gemini_needed:
         model = resolve_model()
         backend = "Interactions API (speech-to-text)" if is_transcribe_model(model) else "generate_content (prompted)"
-        _ok("Gemini model", model + (f" (via {ENV_GEMINI_MODEL})" if ENV_GEMINI_MODEL in os.environ else "")
+        _ok("Gemini model", model + (f" (via {ENV_GEMINI_MODEL})" if ENV_GEMINI_MODEL in config.daemon_env() else "")
             + f" — {backend}")
         vocab = load_vocabulary()
         if vocab:
@@ -463,10 +467,8 @@ def cmd_run(_args) -> int:
 
 
 def cmd_start(args) -> int:
-    if LAUNCHD_PLIST.exists():
-        subprocess.run(["launchctl", "load", "-w", str(LAUNCHD_PLIST)], check=False)
-        print("started via launchd")
-        return 0
+    if supervisor.current().installed or getattr(args, "json", False):
+        return _agent_cmd(args, "start", supervisor.start)
     pid = _read_pid()
     if pid and _is_running(pid):
         print(f"already running (pid {pid})")
@@ -482,11 +484,9 @@ def cmd_start(args) -> int:
     return 0
 
 
-def cmd_stop(_args) -> int:
-    if LAUNCHD_PLIST.exists():
-        subprocess.run(["launchctl", "unload", "-w", str(LAUNCHD_PLIST)], check=False)
-        print("stopped via launchd")
-        return 0
+def cmd_stop(args) -> int:
+    if supervisor.current().installed or getattr(args, "json", False):
+        return _agent_cmd(args, "stop", lambda: supervisor.stop(reason=getattr(args, "reason", None)))
     pid = _read_pid()
     if not pid or not _is_running(pid):
         print("not running")
@@ -496,47 +496,68 @@ def cmd_stop(_args) -> int:
     return 0
 
 
-def _preserved_env() -> dict:
-    """Collect MEETING_CAPTURE_* config to carry into the plist.
+AGENT_TEXT = {
+    "start": "recorder started (and starts at login)",
+    "stop": "recorder stopped (stays stopped at login; `meeting-capture start` resumes it)",
+    "restart": "recorder restarted",
+    "install": "recorder agent installed",
+    "uninstall": "recorder agent removed",
+}
 
-    Reinstalling regenerates the plist; without this, any backend choice (e.g.
-    MEETING_CAPTURE_TRANSCRIBER=gemini) is silently dropped and the daemon falls
-    back to the local-whisper default. That regression once put a daemon on the
-    GPU for 16 days and leaked 24.5 GB of Metal buffers. Preserve such vars from
-    (1) the existing plist and (2) the current environment (env wins).
-    """
-    env: dict[str, str] = {}
-    if LAUNCHD_PLIST.exists():
-        try:
-            existing = plistlib.loads(LAUNCHD_PLIST.read_bytes())
-            for k, v in (existing.get("EnvironmentVariables") or {}).items():
-                if k.startswith("MEETING_CAPTURE_"):
-                    env[k] = v
-        except Exception:
-            pass
-    for k, v in os.environ.items():
-        if k.startswith("MEETING_CAPTURE_"):
-            env[k] = v
-    return env
+
+def _agent_cmd(args, action: str, fn) -> int:
+    """Run a supervisor operation; --json prints its meeting-capture.agent/1
+    document. Exit 0 done (or nothing to do), 3 refused (another install owns
+    the recorder: channel guard), 1 failed."""
+    from . import jsonout
+    as_json = getattr(args, "json", False)
+    if as_json:
+        with jsonout.reserved_stdout() as out:
+            res = fn()
+            jsonout.emit(res, out)
+    else:
+        res = fn()
+    err = res.get("error")
+    code = 0 if res.get("ok") else (supervisor.EXIT_REFUSED if err and err["code"] in
+                                    ("channel_conflict", "agent_elsewhere", "interrupted") else 1)
+    if not as_json:
+        if err:
+            print(err["message"] if code == supervisor.EXIT_REFUSED else
+                  f"can't {action} the recorder: {err['message']}", file=sys.stderr)
+        elif res.get("performed"):
+            print(AGENT_TEXT[action])
+        else:
+            print(res.get("why") or f"nothing to {action}")
+    return code
+
+
+def _restart() -> str:
+    """Restart the recorder after a settings change; a short phrase for the
+    caller's summary. Never starts a stopped recorder."""
+    res = supervisor.restart()
+    if res.get("performed"):
+        return "recorder restarted"
+    if res.get("error"):
+        return f"saved; the recorder wasn't restarted: {res['error']['message']}"
+    if res.get("backend") == "none":
+        return "saved; no recorder agent is installed yet (meeting-capture install)"
+    return "saved; the recorder is stopped and uses it when it starts"
+
+
+def _save_settings(set_: dict, remove: tuple = ()) -> None:
+    """Write settings into ~/.meeting-capture/env (locked, atomic; an old
+    plist's settings are moved out first)."""
+    config.update(set_, remove)
 
 
 MODE_ENV_VAR = "MEETING_CAPTURE_MODE"
 MODES = ("batch", "live")
 
 
-def _plist_env() -> dict:
-    if not LAUNCHD_PLIST.exists():
-        return {}
-    try:
-        return dict(plistlib.loads(LAUNCHD_PLIST.read_bytes()).get("EnvironmentVariables") or {})
-    except Exception:
-        return {}
-
-
-def _plist_mode() -> str:
-    """Capture mode the launchd daemon is asked to run in ("batch" unless the
-    plist says live). Whether live can actually run: live_mode_blocker()."""
-    v = _plist_env().get(MODE_ENV_VAR, "batch").strip().lower()
+def daemon_mode() -> str:
+    """Capture mode the recorder is asked to run in ("batch" unless its
+    settings say live). Whether live can actually run: live_mode_blocker()."""
+    v = _daemon_env().get(MODE_ENV_VAR, "batch").strip().lower()
     return v if v in MODES else "batch"
 
 
@@ -569,42 +590,27 @@ def _mode_line(live: dict) -> str:
     return "live — calls stream to Gemini"
 
 
-def _set_plist_mode(mode: str) -> None:
-    """Persist MEETING_CAPTURE_MODE in the launchd plist, touching nothing else.
+def _set_mode(mode: str) -> None:
+    """Persist MEETING_CAPTURE_MODE in the recorder's settings.
 
     Live mode used to require `MEETING_CAPTURE_MODE=live meeting-capture run`
-    in a terminal. That spawns sysaudio from the terminal's environment — a
-    different binary path than the launchd daemon uses — so macOS treats it as
-    a second app and asks for Screen Recording again; declining that prompt
-    also revokes the grant the launchd daemon relies on. Switching the mode
-    inside the plist keeps one daemon, one sysaudio, one TCC grant.
+    in a terminal. That spawned sysaudio from the terminal's environment — a
+    different binary path than the agent uses — so macOS treated it as a
+    second app and asked for Screen Recording again; declining that prompt
+    also revoked the grant the agent relies on. A setting keeps one daemon,
+    one sysaudio, one TCC grant.
     """
-    payload = plistlib.loads(LAUNCHD_PLIST.read_bytes())
-    env = dict(payload.get("EnvironmentVariables") or {})
     if mode == "batch":
-        env.pop(MODE_ENV_VAR, None)
+        _save_settings({}, remove=(MODE_ENV_VAR,))
     else:
-        env[MODE_ENV_VAR] = mode
-    payload["EnvironmentVariables"] = env
-    LAUNCHD_PLIST.write_bytes(plistlib.dumps(payload))
-
-
-def _update_plist_env(set_: dict, remove: tuple = ()) -> None:
-    """Set/remove launchd env keys, touching nothing else in the plist."""
-    payload = plistlib.loads(LAUNCHD_PLIST.read_bytes())
-    env = dict(payload.get("EnvironmentVariables") or {})
-    for k in remove:
-        env.pop(k, None)
-    env.update(set_)
-    payload["EnvironmentVariables"] = env
-    LAUNCHD_PLIST.write_bytes(plistlib.dumps(payload))
+        _save_settings({MODE_ENV_VAR: mode})
 
 
 def current_source() -> dict:
-    """The launchd daemon's audio source settings, as the plist has them."""
+    """The recorder's audio source settings."""
     from .linein import DEVICE_ENV, ME_CHANNEL_ENV, SOURCE_ENV, THEM_CHANNEL_ENV
 
-    env = _plist_env()
+    env = _daemon_env()
     return {
         "source": "linein" if env.get(SOURCE_ENV, "").strip().lower() == "linein" else "sck",
         "device": env.get(DEVICE_ENV) or "",
@@ -615,19 +621,17 @@ def current_source() -> dict:
 
 def apply_source(source: str, device: str | None = None, me: int | None = None,
                  them: int | None = None) -> str:
-    """Switch the daemon's audio source and restart it. Validates the device
-    and channel map BEFORE touching the plist. Returns a one-line summary;
+    """Switch the recorder's audio source and restart it. Validates the device
+    and channel map BEFORE saving anything. Returns a one-line summary;
     raises RuntimeError with a user-facing message. Shared by `source` and
-    the settings page."""
+    the settings page. Saves even with no agent installed (onboarding picks a
+    source first)."""
     from .linein import DEVICE_ENV, ME_CHANNEL_ENV, SOURCE_ENV, THEM_CHANNEL_ENV, validate
 
-    if not LAUNCHD_PLIST.exists():
-        raise RuntimeError("no launchd agent installed — run `meeting-capture install` first")
     keys = (SOURCE_ENV, DEVICE_ENV, ME_CHANNEL_ENV, THEM_CHANNEL_ENV)
     if source == "sck":
-        _update_plist_env({}, remove=keys)
-        _relaunch()
-        return "source: sck (this Mac's own call audio); daemon restarted"
+        _save_settings({}, remove=keys)
+        return f"source: sck (this Mac's own call audio); {_restart()}"
     if source != "linein":
         raise RuntimeError(f"unknown source {source!r}")
     cur = current_source()
@@ -638,9 +642,10 @@ def apply_source(source: str, device: str | None = None, me: int | None = None,
     updates = {SOURCE_ENV: "linein", ME_CHANNEL_ENV: str(me), THEM_CHANNEL_ENV: str(them)}
     if device:
         updates[DEVICE_ENV] = device
-    _update_plist_env(updates, remove=() if device else (DEVICE_ENV,))
-    _relaunch()
-    return f"source: line-in from {info['name']!r} — me = input {me + 1}, them = input {them + 1}"
+    _save_settings(updates, remove=() if device else (DEVICE_ENV,))
+    restarted = _restart()
+    return (f"source: line-in from {info['name']!r} — me = input {me + 1}, them = input {them + 1}; "
+            f"{restarted}")
 
 
 def cmd_source(args) -> int:
@@ -657,12 +662,11 @@ def cmd_source(args) -> int:
         msg = apply_source(args.source, args.device, args.me, args.them)
     except RuntimeError as exc:
         print(f"can't use that input: {exc}", file=sys.stderr)
-        if LAUNCHD_PLIST.exists():
-            print("see the choices with `meeting-capture devices`", file=sys.stderr)
+        print("see the choices with `meeting-capture devices`", file=sys.stderr)
         return 1
     print(msg)
     if args.source == "linein":
-        print("daemon restarted. It records whenever either input carries speech.")
+        print("It records whenever either input carries speech.")
     return 0
 
 
@@ -686,22 +690,14 @@ def cmd_devices(_args) -> int:
     return 0
 
 
-def _relaunch() -> None:
-    subprocess.run(["launchctl", "unload", "-w", str(LAUNCHD_PLIST)], check=False, stderr=subprocess.DEVNULL)
-    subprocess.run(["launchctl", "load", "-w", str(LAUNCHD_PLIST)], check=False)
-
-
 def cmd_mode(args) -> int:
     if args.mode is None:
-        print(_plist_mode(), flush=True)   # stdout stays one word (scripts compare it)
-        if _plist_mode() == "live":
+        print(daemon_mode(), flush=True)   # stdout stays one word (scripts compare it)
+        if daemon_mode() == "live":
             why = live_mode_blocker()
             if why:
                 print(f"note: live mode is requested, but the recorder runs batch: {why}", file=sys.stderr)
         return 0
-    if not LAUNCHD_PLIST.exists():
-        print("no launchd agent installed — run `meeting-capture install` first", file=sys.stderr)
-        return 1
     if args.mode == "live":
         from .live import live_blocker
         why = live_blocker(_daemon_env())
@@ -709,13 +705,12 @@ def cmd_mode(args) -> int:
             print(f"can't switch to live mode: {why}.\n{_live_fix(why)}, then `meeting-capture mode live`.",
                   file=sys.stderr)
             return 1
-    current = _plist_mode()
+    current = daemon_mode()
     if args.mode == current:
         print(f"already in {current} mode")
         return 0
-    _set_plist_mode(args.mode)
-    _relaunch()
-    print(f"switched to {args.mode} mode; daemon restarted via launchd")
+    _set_mode(args.mode)
+    print(f"switched to {args.mode} mode; {_restart()}")
     if args.mode == "live":
         print("calls now stream to Gemini (uploaded), whatever `meeting-capture stt` picks for batch")
         if current_source()["source"] == "linein":
@@ -724,12 +719,13 @@ def cmd_mode(args) -> int:
     return 0
 
 
-# --- transcription engine + language (launchd plist env, like mode/source) ---------------
+# --- transcription engine + language (settings, like mode/source) ---------------
 
 def _daemon_env() -> dict:
-    """The configuration the launchd daemon runs with: its plist's environment
-    (meeting-capture's config store), or this shell's when no agent is installed."""
-    return _plist_env() if LAUNCHD_PLIST.exists() else dict(os.environ)
+    """The configuration the recorder runs with: ~/.meeting-capture/env under
+    what its agent injects, or under this shell's environment when no agent
+    is installed (config.daemon_env)."""
+    return config.daemon_env()
 
 
 # `meeting-capture stt --json` prints transcription_summary() as one JSON
@@ -747,13 +743,13 @@ def transcription_summary() -> dict:
     the settings page and, through `stt --json`, pipeline-monitor."""
     from .transcriber import engine_summary
     s = engine_summary(_daemon_env())
-    requested = _plist_mode() == "live"
+    requested = daemon_mode() == "live"
     blocker = live_mode_blocker() if requested else None
     active = requested and blocker is None
     return {
         "schema": STT_JSON_SCHEMA,
         "version": __version__,
-        "agent_installed": LAUNCHD_PLIST.exists(),
+        "agent_installed": supervisor.current().installed,
         **s,
         # Live mode streams every call to Gemini as it happens, whatever the
         # batch engine above is: active means audio leaves the Mac.
@@ -812,10 +808,10 @@ HINGLISH_NOTE = ("Indian languages come out romanized (Latin script): mixed Hind
 
 def apply_transcription(stt: str | None = None, locale: str | None = None, progress=None) -> str:
     """Set the transcription engine (auto|apple|gemini) and/or the on-device
-    language in the launchd plist, then restart the daemon. A language, or
+    language in the recorder's settings, then restart it. A language, or
     switching to on-device, first installs that language's model through the
     helper (`sysaudio transcribe --install`). Everything is validated before
-    the plist is touched; raises RuntimeError with a user-facing message.
+    anything is saved; raises RuntimeError with a user-facing message.
     Shared by `stt`, `language` and the settings page."""
     from .transcriber import (
         CHOICE_LABELS, ENV_LEGACY_TRANSCRIBER, ENV_LOCALE, ENV_STT,
@@ -824,9 +820,7 @@ def apply_transcription(stt: str | None = None, locale: str | None = None, progr
     )
 
     say = progress or (lambda _msg: None)
-    if not LAUNCHD_PLIST.exists():
-        raise RuntimeError("no launchd agent installed — run `meeting-capture install` first")
-    env = _plist_env()
+    env = _daemon_env()
     new_stt = stt_choice(env) if stt is None else str(stt).strip().lower()
     if new_stt not in STT_CHOICES:
         raise RuntimeError(f"unknown engine {stt!r} — choose auto, apple or gemini")
@@ -866,12 +860,12 @@ def apply_transcription(stt: str | None = None, locale: str | None = None, progr
     sets: dict = {ENV_STT: new_stt}
     if locale is not None:
         sets[ENV_LOCALE] = new_locale
-    _update_plist_env(sets, remove=(ENV_LEGACY_TRANSCRIBER,))
-    _relaunch()
+    _save_settings(sets, remove=(ENV_LEGACY_TRANSCRIBER,))
+    restarted = _restart()
 
     s = transcription_summary()
     lines = [f"transcription: {CHOICE_LABELS[new_stt]} (stt={new_stt}), language {new_locale} — "
-             f"now {engine_description(s)}; daemon restarted"]
+             f"now {engine_description(s)}; {restarted}"]
     lines += notes
     if new_stt == "gemini" and not s["gemini_key"]:
         lines.append("no Google API key the recorder can see — write it to ~/.config/google/key "
@@ -925,7 +919,7 @@ def cmd_stt(args) -> int:
     run: no prompts, progress as lines on stdout (flushed as they happen),
     errors on stderr; exit 0 = applied (the daemon restarted; the result may
     still not be ready — ask `stt --json`), 1 = refused or failed with the
-    plist untouched, 2 = usage error."""
+    settings untouched, 2 = usage error."""
     if args.json:
         if args.engine is not None or args.language is not None:
             print("--json only shows the current state; set it without --json", file=sys.stderr)
@@ -940,9 +934,6 @@ def cmd_stt(args) -> int:
     if args.engine is None and args.language is None:
         print("\n".join(stt_lines(transcription_summary())))
         return 0
-    if not LAUNCHD_PLIST.exists():
-        print("no launchd agent installed — run `meeting-capture install` first", file=sys.stderr)
-        return 1
     try:
         msg = apply_transcription(stt=args.engine, locale=args.language,
                                   progress=lambda m: print(m, flush=True))
@@ -973,9 +964,6 @@ def cmd_language(args) -> int:
         if _is_indic(s["locale"]):
             print(HINGLISH_NOTE)
         return 0
-    if not LAUNCHD_PLIST.exists():
-        print("no launchd agent installed — run `meeting-capture install` first", file=sys.stderr)
-        return 1
     try:
         msg = apply_transcription(locale=args.locale, progress=lambda m: print(m, flush=True))
     except RuntimeError as exc:
@@ -985,77 +973,142 @@ def cmd_language(args) -> int:
     return 0
 
 
-def _resolved_sysaudio_env(env: dict) -> dict:
-    """Pin the sysaudio path the agent will use, as an absolute path.
+def _install_sysaudio() -> str | None:
+    """The sysaudio path the agent will pin, absolute: the recorder's TCC
+    identity (recorder.find_sysaudio explains why there is one).
 
-    The plist is the single source of truth for which sysaudio binary runs
-    (recorder.plist_sysaudio explains why: one path, one Screen Recording
-    grant). An explicit MEETING_CAPTURE_SYSAUDIO — from the shell, the brew
-    wrapper, or a previous plist — is kept if it points at a real file;
-    otherwise the path is resolved now so it is never left to whatever the
-    daemon's environment happens to contain at launch.
-    """
+    An explicit MEETING_CAPTURE_SYSAUDIO that points at a real file wins (the
+    brew wrapper exports its own opt/ copy on every call; a developer may
+    point at a build), then the copy the installed agent already pins, then a
+    search. abspath, not resolve(): the brew wrapper hands us
+    /opt/homebrew/opt/meeting-capture/bin/sysaudio, and opt/ is a symlink into
+    Cellar/<version>/. Following it would pin a path that dangles on the next
+    `brew upgrade` — and opt/ is the stable path the grant lives on."""
     from .recorder import SYSAUDIO_ENV_VAR, find_sysaudio
-
-    env = dict(env)
-    given = env.get(SYSAUDIO_ENV_VAR)
-    # abspath, not resolve(): the brew wrapper hands us
-    # /opt/homebrew/opt/meeting-capture/bin/sysaudio, and opt/ is a symlink into
-    # Cellar/<version>/. Following it would pin a path that dangles on the next
-    # `brew upgrade` — and it is the stable opt/ path the TCC grant lives on.
+    given = os.environ.get(SYSAUDIO_ENV_VAR)
     if given and Path(given).is_file():
-        env[SYSAUDIO_ENV_VAR] = os.path.abspath(given)
-        return env
-    env.pop(SYSAUDIO_ENV_VAR, None)
+        return os.path.abspath(given)
+    pinned = supervisor.pinned_sysaudio()
+    if pinned is not None:
+        return os.path.abspath(pinned)
     found = find_sysaudio()
-    if found is not None:
-        env[SYSAUDIO_ENV_VAR] = os.path.abspath(found)
-    return env
+    return os.path.abspath(found) if found is not None else None
 
 
-def _plist_payload(python_exe: str) -> bytes:
-    env_vars = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
-    }
-    env_vars.update(_resolved_sysaudio_env(_preserved_env()))
-    payload = {
-        "Label": LAUNCHD_LABEL,
-        "ProgramArguments": [python_exe, "-m", "meeting_capture.daemon"],
-        "RunAtLoad": True,
-        "KeepAlive": {"SuccessfulExit": False, "Crashed": True},
-        "StandardOutPath": str(LOG_FILE),
-        "StandardErrorPath": str(LOG_FILE),
-        "WorkingDirectory": str(Path.home()),
-        "EnvironmentVariables": env_vars,
-        "ProcessType": "Background",
-    }
-    return plistlib.dumps(payload)
-
-
-def cmd_install(_args) -> int:
+def cmd_install(args) -> int:
     ensure_dirs()
-    LAUNCHD_PLIST.parent.mkdir(parents=True, exist_ok=True)
-    payload = _plist_payload(sys.executable)
-    LAUNCHD_PLIST.write_bytes(payload)
-    subprocess.run(["launchctl", "unload", str(LAUNCHD_PLIST)], check=False, stderr=subprocess.DEVNULL)
-    subprocess.run(["launchctl", "load", "-w", str(LAUNCHD_PLIST)], check=False)
-    print(f"installed launchd agent at {LAUNCHD_PLIST}")
-    print("daemon will auto-start at login.")
-    recorded = _plist_env().get("MEETING_CAPTURE_SYSAUDIO")
-    if recorded:
-        print(f"sysaudio pinned to {recorded} — grant Screen Recording to that path, once.")
+    if args.json:
+        return _agent_cmd(args, "install", lambda: supervisor.install(sys.executable, _install_sysaudio()))
+    shell = sorted(k for k in config.SETTINGS if k in os.environ and k not in config._injected)
+    res = supervisor.install(sys.executable, _install_sysaudio())
+    if not res.get("ok"):
+        return _agent_cmd(args, "install", lambda: res)
+    print(f"installed the recorder agent at {res['plist']}")
+    print("it starts at login.")
+    if res.get("moved"):
+        print(f"settings moved from the plist into {paths.ENV_FILE}: "
+              + ", ".join(k.removeprefix(config.PREFIX).lower() for k in res["moved"]))
+    if shell:
+        print(f"note: this shell sets {', '.join(shell)}; the recorder never sees your shell. "
+              "Keep a setting with `meeting-capture mode|source|stt|language` or `meeting-capture config set`.")
+    if res.get("sysaudio"):
+        print(f"sysaudio pinned to {res['sysaudio']} — grant Screen Recording to that path, once.")
     else:
         print("warning: no sysaudio binary found to pin; run `meeting-capture doctor`.", file=sys.stderr)
     return 0
 
 
-def cmd_uninstall(_args) -> int:
-    if not LAUNCHD_PLIST.exists():
-        print("launchd agent not installed")
+def cmd_uninstall(args) -> int:
+    return _agent_cmd(args, "uninstall", supervisor.uninstall)
+
+
+def cmd_restart(args) -> int:
+    """Restart the recorder so it reads its settings (after a hand edit of
+    ~/.meeting-capture/env). Never starts a stopped recorder."""
+    return _agent_cmd(args, "restart", supervisor.restart)
+
+
+CONFIG_SCHEMA = "meeting-capture.config/1"
+# Settings with a validated command; `config set` sends people there.
+CONFIG_VIA = {
+    "MEETING_CAPTURE_MODE": "meeting-capture mode batch|live",
+    "MEETING_CAPTURE_SOURCE": "meeting-capture source sck|linein",
+    "MEETING_CAPTURE_INPUT_DEVICE": "meeting-capture source linein --device NAME",
+    "MEETING_CAPTURE_ME_CHANNEL": "meeting-capture source linein --me N",
+    "MEETING_CAPTURE_THEM_CHANNEL": "meeting-capture source linein --them N",
+    "MEETING_CAPTURE_STT": "meeting-capture stt auto|apple|gemini",
+    "MEETING_CAPTURE_LOCALE": "meeting-capture language LOCALE",
+    "MEETING_CAPTURE_TRANSCRIBER": "meeting-capture stt auto|apple|gemini",
+}
+
+
+def _config_key(name: str) -> str:
+    name = name.strip().upper()
+    return name if name.startswith(config.PREFIX) else config.PREFIX + name
+
+
+def config_document() -> dict:
+    """`meeting-capture config --json` (meeting-capture.config/1): every
+    setting with its value for the recorder and where it comes from."""
+    agent = supervisor.current()
+    rows = {}
+    for key, row in config.sources().items():
+        rows[key.removeprefix(config.PREFIX).lower()] = row
+    over = config.overridden(config.daemon_env()) if agent.installed else []
+    return {"schema": CONFIG_SCHEMA, "ok": True, "file": str(paths.ENV_FILE),
+            "watch_paths": [str(paths.ENV_FILE), str(paths.LAUNCHD_PLIST)],
+            "restart_pending": config.restart_pending(),
+            "agent": {"backend": agent.backend, "installed": agent.installed,
+                      "sysaudio": agent.sysaudio, "plist": agent.plist},
+            "settings": rows,
+            "overridden": [k.removeprefix(config.PREFIX).lower() for k in over]}
+
+
+def cmd_config(args) -> int:
+    """Show the recorder's settings (and where each comes from), or set and
+    unset the advanced ones. Changes restart the recorder."""
+    from . import jsonout
+    if args.action in (None, "show"):
+        if args.json:
+            with jsonout.reserved_stdout() as out:
+                jsonout.emit(config_document(), out)
+            return 0
+        doc = config_document()
+        print(f"settings file: {doc['file']}"
+              + (" (changed since the recorder started: meeting-capture restart)" if doc["restart_pending"] else ""))
+        for name, row in doc["settings"].items():
+            shown = "(default)" if row["value"] is None else f"{row['value']}  ({row['source']})"
+            extra = f"  [your shell says {row['shell']}; the recorder doesn't see it]" if "shell" in row else ""
+            print(f"  {name:<18} {shown}{extra}")
         return 0
-    subprocess.run(["launchctl", "unload", "-w", str(LAUNCHD_PLIST)], check=False)
-    LAUNCHD_PLIST.unlink()
-    print(f"removed {LAUNCHD_PLIST}")
+    if args.json:
+        print("--json only shows the settings; set them without --json", file=sys.stderr)
+        return 2
+    if not args.key:
+        print(f"usage: meeting-capture config {args.action} KEY{' VALUE' if args.action == 'set' else ''}",
+              file=sys.stderr)
+        return 2
+    key = _config_key(args.key)
+    if key in CONFIG_VIA:
+        print(f"{key} is checked before it is saved: use `{CONFIG_VIA[key]}`", file=sys.stderr)
+        return 2
+    if key not in config.SETTINGS:
+        print(f"{key} is not a meeting-capture setting ({', '.join(k.removeprefix(config.PREFIX).lower() for k in config.SETTINGS if k not in CONFIG_VIA)})",
+              file=sys.stderr)
+        return 2
+    try:
+        if args.action == "set":
+            if args.value is None:
+                print("usage: meeting-capture config set KEY VALUE", file=sys.stderr)
+                return 2
+            _save_settings({key: args.value})
+        else:
+            _save_settings({}, remove=(key,))
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(f"{key.removeprefix(config.PREFIX).lower()}: "
+          f"{args.value if args.action == 'set' else '(default)'}; {_restart()}")
     return 0
 
 
@@ -1085,19 +1138,42 @@ def cmd_check(_args) -> int:
     return 0
 
 
+def _agent_parser(sub, name: str, help_: str, func, reason: bool = False):
+    p = sub.add_parser(name, help=help_)
+    p.add_argument("--json", action="store_true",
+                   help="one JSON document on stdout (meeting-capture.agent/1; README: Contract)")
+    if reason:
+        p.add_argument("--reason", choices=["user", "quit", "update"],
+                       help="why (recorded in the --json result for the caller)")
+    p.set_defaults(func=func)
+    return p
+
+
 def main(argv: list[str] | None = None) -> int:
+    # Settings: ~/.meeting-capture/env under this process's environment
+    # (process env > file > default), before anything reads them.
+    config.apply()
     parser = argparse.ArgumentParser(prog="meeting-capture")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("status", help="show daemon status").set_defaults(func=cmd_status)
-    sub.add_parser("start", help="start the daemon").set_defaults(func=cmd_start)
-    sub.add_parser("stop", help="stop the daemon").set_defaults(func=cmd_stop)
+    _agent_parser(sub, "start", "start the recorder (and at login)", cmd_start)
+    _agent_parser(sub, "stop", "stop the recorder (it stays stopped at login)", cmd_stop, reason=True)
+    _agent_parser(sub, "restart", "restart the recorder so it reads its settings", cmd_restart)
     sub.add_parser("pause", help="pause capture (creates pause file)").set_defaults(func=cmd_pause)
     sub.add_parser("resume", help="resume capture (starts a new transcript)").set_defaults(func=cmd_resume)
     sub.add_parser("new", help="start a new meeting: speech from now on goes into a new transcript").set_defaults(func=cmd_new)
     sub.add_parser("run", help="run daemon in foreground").set_defaults(func=cmd_run)
-    sub.add_parser("install", help="install launchd auto-start agent").set_defaults(func=cmd_install)
-    sub.add_parser("uninstall", help="remove launchd agent").set_defaults(func=cmd_uninstall)
+    _agent_parser(sub, "install", "install the recorder agent (starts at login)", cmd_install)
+    _agent_parser(sub, "uninstall", "remove the recorder agent", cmd_uninstall)
+    cfg = sub.add_parser("config", help="show the recorder's settings (~/.meeting-capture/env) and where "
+                                        "each comes from; set or unset advanced ones")
+    cfg.add_argument("action", nargs="?", choices=["show", "set", "unset"])
+    cfg.add_argument("key", nargs="?", help="e.g. mic, diarize, gemini_model, copilot_model, max_footprint_mb")
+    cfg.add_argument("value", nargs="?")
+    cfg.add_argument("--json", action="store_true",
+                     help="print the settings as one JSON document (meeting-capture.config/1)")
+    cfg.set_defaults(func=cmd_config)
     sub.add_parser("check", help="verify audiotee is built and prompt audio-capture permission").set_defaults(func=cmd_check)
     sub.add_parser("mic", help="show current mic-activity state (the gate that triggers recording)").set_defaults(func=cmd_mic)
     sub.add_parser("last", help="print the most recent transcript").set_defaults(func=cmd_last)
@@ -1106,7 +1182,7 @@ def main(argv: list[str] | None = None) -> int:
     vocab = sub.add_parser("vocab", help="show or edit the transcription vocabulary (proper nouns; Gemini only)")
     vocab.add_argument("action", nargs="?", choices=["show", "edit"], default="show")
     vocab.set_defaults(func=cmd_vocab)
-    mode = sub.add_parser("mode", help="show or switch the launchd daemon between batch and live capture")
+    mode = sub.add_parser("mode", help="show or switch the recorder between batch and live capture")
     mode.add_argument("mode", nargs="?", choices=list(MODES), help="omit to print the current mode")
     mode.set_defaults(func=cmd_mode)
     source = sub.add_parser("source", help="show or switch where audio comes from: sck (this Mac) or linein (USB interface)")

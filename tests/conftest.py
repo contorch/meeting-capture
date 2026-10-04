@@ -130,13 +130,47 @@ def _isolated_transcript_db(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "PENDING_FILE", tmp_path / "unsaved-lines.jsonl")
 
 
+def _no_launchctl(*args):
+    """Read-only questions answer "not loaded"; anything else fails the test."""
+    import subprocess
+    if args and args[0] in ("list", "print"):
+        return subprocess.CompletedProcess(["launchctl", *args], 113, "", "Could not find service")
+    pytest.fail(f"a test tried to run launchctl {' '.join(args)}")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_settings(tmp_path, monkeypatch):
+    """The recorder's settings and agent live in tmp_path: never the real
+    ~/.meeting-capture/env or ~/Library/LaunchAgents, never the real launchd.
+    No MEETING_CAPTURE_* / CONTORCH_* from the developer's shell, and
+    whatever a test's config.apply() puts into os.environ is undone."""
+    import os
+    from meeting_capture import config, paths, supervisor
+    saved = dict(os.environ)
+    for k in list(os.environ):
+        if k.startswith(("MEETING_CAPTURE_", "CONTORCH_")):
+            monkeypatch.delenv(k)
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(paths, "ENV_FILE", state / "env")
+    monkeypatch.setattr(paths, "ENV_LOCK", state / "env.lock")
+    monkeypatch.setattr(paths, "PID_FILE", state / "daemon.pid")
+    monkeypatch.setattr(paths, "LAUNCHD_PLIST", tmp_path / "no-agent.plist")
+    monkeypatch.setattr(paths, "HOME", tmp_path / "home")
+    monkeypatch.setattr(supervisor, "_launchctl", _no_launchctl)
+    config._injected.clear()
+    yield
+    config._injected.clear()
+    os.environ.clear()
+    os.environ.update(saved)
+
+
 @pytest.fixture(autouse=True)
 def _isolated_transcription(tmp_path, monkeypatch):
     """Never run the real sysaudio (or Apple's speech model), never see the
-    developer's Gemini key or transcription settings, and never restart the
-    real launchd agent. Tests that need a helper point
-    MEETING_CAPTURE_TRANSCRIBE_BIN at a fake one."""
-    from meeting_capture import cli, recorder, transcriber
+    developer's Gemini key or transcription settings. Tests that need a
+    helper point MEETING_CAPTURE_TRANSCRIBE_BIN at a fake one."""
+    from meeting_capture import transcriber
     monkeypatch.setenv(transcriber.ENV_TRANSCRIBE_BIN, str(tmp_path / "no-transcribe-helper"))
     for var in (transcriber.ENV_STT, transcriber.ENV_LOCALE, transcriber.ENV_LEGACY_TRANSCRIBER,
                 "GOOGLE_API_KEY", "GEMINI_API_KEY", "MEETING_CAPTURE_MODE"):
@@ -144,9 +178,22 @@ def _isolated_transcription(tmp_path, monkeypatch):
     monkeypatch.setattr(transcriber, "GEMINI_KEY_FILE", tmp_path / "no-gemini-key")
     # Nor the developer's Mac language (it picks the default on-device locale).
     monkeypatch.setattr(transcriber, "_mac_preferences", lambda: ((), ""))
-    monkeypatch.setattr(cli, "LAUNCHD_PLIST", tmp_path / "no-agent.plist")
-    monkeypatch.setattr(recorder, "LAUNCHD_PLIST", tmp_path / "no-agent.plist")
-    monkeypatch.setattr(cli, "_relaunch", lambda: pytest.fail("a test tried to restart the real launchd agent"))
     transcriber.clear_apple_status_cache()
     yield
     transcriber.clear_apple_status_cache()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sysaudio(monkeypatch):
+    """Never find (and so never run) an installed sysaudio — e.g. Homebrew's on
+    PATH — or one a developer's shell points at. Tests that need one set
+    MEETING_CAPTURE_SYSAUDIO to a fake."""
+    import shutil
+    from meeting_capture import recorder
+    monkeypatch.delenv(recorder.SYSAUDIO_ENV_VAR, raising=False)
+    monkeypatch.delenv(recorder.AUDIOTEE_ENV_VAR, raising=False)
+    monkeypatch.delenv("CONTORCH_CHANNEL", raising=False)
+    monkeypatch.delenv("CONTORCH_OP", raising=False)
+    real_which = shutil.which
+    monkeypatch.setattr(recorder.shutil, "which",
+                        lambda name, *a, **k: None if name in ("sysaudio", "audiotee") else real_which(name, *a, **k))

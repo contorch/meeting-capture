@@ -4,10 +4,15 @@ from meeting_capture import paths
 
 
 def test_paths_under_home():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("fresh_paths", paths.__file__)
+    fresh = importlib.util.module_from_spec(spec)   # conftest patches the live module
+    spec.loader.exec_module(fresh)
     home = Path.home()
-    assert paths.STATE_DIR == home / ".meeting-capture"
-    assert paths.PAUSE_FILE == paths.STATE_DIR / "paused"
-    assert paths.LAUNCHD_PLIST == home / "Library" / "LaunchAgents" / "com.contorch.meeting-capture.plist"
+    assert fresh.STATE_DIR == home / ".meeting-capture"
+    assert fresh.PAUSE_FILE == fresh.STATE_DIR / "paused"
+    assert fresh.ENV_FILE == home / ".meeting-capture" / "env"
+    assert fresh.LAUNCHD_PLIST == home / "Library" / "LaunchAgents" / "com.contorch.meeting-capture.plist"
 
 
 def test_ensure_dirs(tmp_path, monkeypatch):
