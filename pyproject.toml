@@ -20,6 +20,8 @@ meeting-capture = "meeting_capture.cli:main"
 dev = ["pytest>=7.0"]
 # Line-in capture from a USB audio interface (MEETING_CAPTURE_SOURCE=linein).
 linein = ["sounddevice>=0.4.6"]
+# Inside Contorch.app: the recorder's SMAppService agent (registrar.py).
+app = ["pyobjc-framework-ServiceManagement>=10; sys_platform == 'darwin'"]
 
 [build-system]
 requires = ["hatchling"]
