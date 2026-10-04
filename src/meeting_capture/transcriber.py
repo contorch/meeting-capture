@@ -769,6 +769,23 @@ def on_device_only_hint(b: Backend, st: AppleStatus) -> Optional[str]:
     return "meeting-capture stt apple"
 
 
+def on_device_line(lc: LocaleChoice, st) -> tuple[str, bool]:
+    """(one user-facing sentence about what this Mac can transcribe itself,
+    whether that covers the Mac's own language). Setup and the menu bar show
+    the sentence as it is, so it never says "this Mac can transcribe" when it
+    can only do a language the Mac doesn't speak (then auto keeps Gemini)."""
+    if not (st.usable or st.installable):
+        return f"On-device transcription isn't available on this Mac: {st.reason}", False
+    if lc.guessed:
+        return (f"This Mac can't transcribe its own language ({lc.mac}) on-device; it could only do "
+                f"{lc.locale} meetings (`meeting-capture language {lc.locale}`)."), False
+    if st.usable:
+        return (f"This Mac can transcribe meetings itself (Apple on-device speech, {lc.locale}) — "
+                "no API key needed."), True
+    return (f"This Mac can transcribe meetings itself (Apple on-device speech, {lc.locale}) once Apple's "
+            "speech model is downloaded — no API key needed."), True
+
+
 def engine_summary(env=None) -> dict:
     """Everything the CLI and the settings page show about transcription, for
     the configuration in `env` (the launchd plist's, normally). One helper
@@ -779,6 +796,7 @@ def engine_summary(env=None) -> dict:
     b = resolve_backend(choice, None, env)
     key = gemini_key_present(env)
     needs_model = model_needed(b, lc, st)
+    line, for_mac = on_device_line(lc, st)
     return {
         "choice": choice, "choice_label": CHOICE_LABELS[choice],
         "engine": b.engine, "engine_label": b.label, "reason": b.reason, "ready": b.ready,
@@ -792,7 +810,53 @@ def engine_summary(env=None) -> dict:
         "on_device_hint": on_device_hint(b, lc, st, key),
         "on_device_only_hint": on_device_only_hint(b, st),
         "notice": upgrade_notice(env, b),
+        "on_device_line": line,
+        "on_device_for_mac_language": for_mac,
     }
+
+
+# --- is the Gemini key accepted? (`meeting-capture stt --json --check-key`) ----------
+
+KEY_CHECK_MODEL = "gemini-2.5-flash"
+KEY_CHECK_TIMEOUT_MS = 15_000
+
+
+def check_gemini_key(env=None) -> dict:
+    """One tiny read-only API call (models.get: no tokens, no audio) with the
+    key the recorder would use. {"key": accepted|rejected|missing|unreachable,
+    "message"}. `env` as for gemini_key_present (the recorder's settings):
+    a key only in the caller's shell doesn't count for an installed agent."""
+    if env is None:
+        key = _resolve_gemini_api_key()
+    else:
+        key = next((str(env.get(v)).strip() for v in KEY_ENV_VARS if str(env.get(v) or "").strip()),
+                   None) or _key_file_value()
+    if not key:
+        return {"key": "missing", "message": _missing_key_message()}
+    try:
+        from google import genai
+        from google.genai import errors, types
+    except ImportError as exc:
+        return {"key": "unreachable", "message": f"google-genai is not installed: {exc}"}
+    client = genai.Client(api_key=key, http_options=types.HttpOptions(
+        timeout=KEY_CHECK_TIMEOUT_MS, retry_options=types.HttpRetryOptions(attempts=1)))
+    try:
+        client.models.get(model=KEY_CHECK_MODEL)
+    except errors.ClientError as exc:
+        code = getattr(exc, "code", None)
+        text = str(exc)
+        if code in (400, 401, 403) and ("API key" in text or "API_KEY" in text or code in (401, 403)):
+            return {"key": "rejected", "message": f"Google rejected the key ({code}): {text[:200]}"}
+        if code == 429:
+            return {"key": "accepted", "message": "the key works, but it is over its quota right now"}
+        if code == 404:                    # authenticated; only the probe model is gone
+            return {"key": "accepted", "message": None}
+        return {"key": "unreachable", "message": f"Gemini answered {code}: {text[:200]}"}
+    except errors.APIError as exc:
+        return {"key": "unreachable", "message": f"Gemini error: {str(exc)[:200]}"}
+    except Exception as exc:   # network down, proxy, TLS, timeout
+        return {"key": "unreachable", "message": f"couldn't reach Gemini: {type(exc).__name__}: {str(exc)[:200]}"}
+    return {"key": "accepted", "message": None}
 
 
 # --- model dispatch -----------------------------------------------------------------

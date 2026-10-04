@@ -957,11 +957,24 @@ def cmd_stt(args) -> int:
             return 2
         try:
             s = transcription_summary()
+            if args.check_key:
+                from .transcriber import check_gemini_key
+                s["key_check"] = check_gemini_key(_daemon_env())
         except Exception as exc:   # a bug, not a state: no half-written JSON on stdout
             print(f"can't work out the transcription state: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 1
         print(json.dumps(s, sort_keys=True))
         return 0
+    if args.check_key:
+        if args.engine is not None or args.language is not None:
+            print("--check-key only checks the key; set the engine without it", file=sys.stderr)
+            return 2
+        from .transcriber import check_gemini_key
+        res = check_gemini_key(_daemon_env())
+        words = {"accepted": "accepted by Google", "rejected": "REJECTED by Google",
+                 "missing": "not set", "unreachable": "couldn't be checked (Gemini unreachable)"}
+        print(f"gemini key: {words[res['key']]}" + (f" — {res['message']}" if res.get("message") else ""))
+        return 0 if res["key"] == "accepted" else 1
     if args.engine is None and args.language is None:
         print("\n".join(stt_lines(transcription_summary())))
         return 0
@@ -1190,6 +1203,7 @@ def main(argv: list[str] | None = None) -> int:
     # (process env > file > default), before anything reads them.
     config.apply()
     parser = argparse.ArgumentParser(prog="meeting-capture")
+    parser.add_argument("--version", action="version", version=f"meeting-capture {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("status", help="show daemon status").set_defaults(func=cmd_status)
@@ -1244,6 +1258,9 @@ def main(argv: list[str] | None = None) -> int:
                      help="also set the on-device language (like `meeting-capture language`), in one restart")
     stt.add_argument("--json", action="store_true",
                      help="print the current state as one JSON object (for other programs; README: Contract)")
+    stt.add_argument("--check-key", action="store_true",
+                     help="ask Google whether the recorder's Gemini key is accepted (one tiny API call, "
+                          "no audio); with --json it adds key_check")
     stt.set_defaults(func=cmd_stt)
     language = sub.add_parser("language", help="show or set the on-device transcription language "
                                                "(e.g. en-US, en-IN, hi-IN); installs its model")

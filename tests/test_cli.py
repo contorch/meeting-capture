@@ -630,3 +630,12 @@ def test_status_counts_audio_a_stopped_daemon_left_in_the_queue(fake_helper, age
     (tmp_path / "audio" / "chunk-1714003200-them.wav").write_bytes(b"RIFF")
     cli.main(["status"])
     assert "waiting audio:    1 chunk(s) in the transcription queue" in capsys.readouterr().out
+
+
+def test_the_package_version_is_pyprojects():
+    """`--version`, status and stt --json all say __version__: keep it the
+    release's version."""
+    import re
+    from meeting_capture import __version__
+    pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    assert __version__ == re.search(r'^version = "([^"]+)"', pyproject, re.M).group(1)
