@@ -55,6 +55,8 @@ CLI commands for inspection and control:
 | `meeting-capture resume` | Resume capture |
 | `meeting-capture new` | Start a new meeting (speech from now on goes into a new transcript) |
 | `meeting-capture stt [auto\|apple\|gemini] [--language L]` | Show the transcription engine in use and why, or switch it (restarts the daemon); `--json` prints the state for other programs (see [Contract](#contract)) |
+| `meeting-capture stt --check-key` | Ask Google whether the recorder's Gemini key is accepted (exit 0 accepted, 1 otherwise) |
+| `meeting-capture --version` | Print the version |
 | `meeting-capture language [LOCALE]` | Show or set the on-device language (installs its model first) |
 | `meeting-capture ui` | Settings page: audio source, interface inputs and levels, transcription engine and language |
 | `meeting-capture install` | Install the launchd auto-start agent |
@@ -199,8 +201,10 @@ The daemon self-exits (and launchd respawns it) if its `phys_footprint` exceeds 
 | `on_device_hint` | the exact command that makes batch transcription run on this Mac under `auto` (installing the model if needed) — with a key, Gemini stays its backup (`gemini_fallback`); `null` when it already does or can't |
 | `on_device_only_hint` | the exact command that makes it run on this Mac **and never upload** (`meeting-capture stt apple`, which installs the model if needed); `null` when it already does or can't |
 | `gemini_key`, `notice` | a key the recorder will see; the upgrade note (`null` when none) |
+| `on_device_line`, `on_device_for_mac_language` | one sentence about what this Mac can transcribe itself, to show as it is (it never says "this Mac can transcribe meetings" when on-device can't do the Mac's own language and `auto` keeps Gemini); whether on-device covers the Mac's language |
+| `key_check` | only with `--check-key`: `{key: accepted \| rejected \| missing \| unreachable, message}` — one tiny read-only Gemini call (`models.get`, no audio, no retries) with the key the recorder would use |
 
-Privacy wording belongs to these fields only: audio leaves the Mac now when `uploads` or `live.active` is true, and may leave it when `may_upload` is true; say "never leaves this Mac" only when `may_upload` is false. A caller that asks in the background (a menu bar timer) should run the venv's own `~/.meeting-capture/venv/bin/meeting-capture` — the code the recorder runs — not the Homebrew wrapper: after a `brew upgrade` the wrapper deletes and rebuilds that venv, under the running recorder. `meeting-capture stt auto|apple|gemini [--language L]` and `meeting-capture language L` are safe to run from another program: no prompts, progress as lines on stdout (model download percentages included), errors on stderr, exit 0 when applied (then ask `stt --json` for the result), 1 when refused with the plist untouched, 2 for usage errors.
+Privacy wording belongs to these fields only: audio leaves the Mac now when `uploads` or `live.active` is true, and may leave it when `may_upload` is true; say "never leaves this Mac" only when `may_upload` is false. A caller that asks in the background (a menu bar timer) should run the venv's own `~/.meeting-capture/venv/bin/meeting-capture` — the code the recorder runs — not the Homebrew wrapper: after a `brew upgrade` the wrapper deletes and rebuilds that venv, under the running recorder. `meeting-capture stt auto|apple|gemini [--language L]` and `meeting-capture language L` are safe to run from another program: no prompts, progress as lines on stdout (model download percentages included), errors on stderr, exit 0 when applied (then ask `stt --json` for the result), 1 when refused with the configuration untouched, 2 for usage errors.
 
 ## Tests
 

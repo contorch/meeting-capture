@@ -602,3 +602,9 @@ def test_status_counts_audio_a_stopped_daemon_left_in_the_queue(fake_helper, age
     (tmp_path / "audio" / "chunk-1714003200-them.wav").write_bytes(b"RIFF")
     cli.main(["status"])
     assert "waiting audio:    1 chunk(s) in the transcription queue" in capsys.readouterr().out
+
+
+def test_the_package_version_is_the_installed_distributions():
+    import importlib.metadata
+    from meeting_capture import __version__
+    assert __version__ == importlib.metadata.version("meeting-capture")

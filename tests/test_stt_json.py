@@ -23,6 +23,7 @@ SCHEMA_1 = {
     "locale", "locale_source", "locale_why", "locale_guessed", "mac_language",
     "uploads", "gemini_fallback", "gemini_key", "notice", "live", "apple",
     "needs_model", "install_hint", "on_device_hint", "on_device_only_hint", "may_upload",
+    "on_device_line", "on_device_for_mac_language",
 }
 APPLE_FIELDS = {"available", "usable", "installable", "installed", "reason", "locale", "supported",
                 "installed_locales", "exit_code", "os", "arch", "helper"}
@@ -370,3 +371,134 @@ def test_as_a_separate_process(fake_helper, tmp_path):
     assert (s["engine"], s["locale"], s["agent_installed"], s["gemini_key"]) == ("apple", "en-GB", True, False)
     assert s["live"]["active"] is False
     assert not (home / ".meeting-capture").exists()                   # read-only: creates nothing
+
+
+# --- the on-device line setup shows as it is (#26 follow-up) ----------------------------------
+
+def test_on_device_line_on_a_mac_whose_language_runs_on_device(fake_helper, agent, mac, capsys):
+    mac("en-IN", region="en_IN")
+    s = stt_json(capsys)
+    assert s["on_device_line"].startswith("This Mac can transcribe meetings itself") and "en-IN" in s["on_device_line"]
+    assert s["on_device_for_mac_language"] is True
+
+
+def test_on_device_line_never_claims_a_language_the_mac_doesnt_speak(fake_helper, agent, mac, key_file, capsys):
+    """A Polish Mac with a key: auto keeps Gemini (it detects the language),
+    so the line must not say "This Mac can transcribe meetings" first."""
+    mac("pl-PL", region="pl_PL")
+    s = stt_json(capsys)
+    assert s["engine"] == "gemini" and s["locale_guessed"] is True and s["apple"]["usable"] is True
+    assert "can transcribe meetings itself" not in s["on_device_line"]
+    assert "pl-PL" in s["on_device_line"] and "meeting-capture language en-US" in s["on_device_line"]
+    assert s["on_device_for_mac_language"] is False
+
+
+def test_on_device_line_where_it_cant_run(fake_helper, agent, capsys):
+    fake_helper.configure(probe_rc=69, reason="needs macOS 26 or later on Apple silicon", supported=[])
+    s = stt_json(capsys)
+    assert s["on_device_line"].startswith("On-device transcription isn't available on this Mac: needs macOS 26")
+    assert s["on_device_for_mac_language"] is False
+
+
+def test_on_device_line_when_the_model_still_has_to_download(fake_helper, agent, mac, capsys):
+    mac("hi-IN", region="en_IN")
+    s = stt_json(capsys)
+    assert "once Apple's speech model is downloaded" in s["on_device_line"] and "hi-IN" in s["on_device_line"]
+
+
+# --- stt --check-key ---------------------------------------------------------------------------
+
+class _FakeModels:
+    def __init__(self, outcome):
+        self.outcome, self.calls = outcome, []
+
+    def get(self, model):
+        self.calls.append(model)
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return {"name": model}
+
+
+@pytest.fixture
+def genai_stub(monkeypatch):
+    """google.genai.Client stubbed: no network, records the key it got."""
+    from google import genai
+    seen = {}
+
+    def install(outcome):
+        models = _FakeModels(outcome)
+
+        class Client:
+            def __init__(self, api_key=None, http_options=None):
+                seen["key"] = api_key
+                seen["attempts"] = http_options.retry_options.attempts
+                self.models = models
+        monkeypatch.setattr(genai, "Client", Client)
+        return models
+    install.seen = seen
+    return install
+
+
+def _client_error(code, message):
+    from google.genai import errors
+    return errors.ClientError(code, {"error": {"code": code, "message": message, "status": "X"}})
+
+
+def test_check_key_accepted(fake_helper, agent, key_file, genai_stub, capsys):
+    models = genai_stub(None)
+    t.clear_apple_status_cache()
+    assert cli.main(["stt", "--json", "--check-key"]) == 0
+    s = json.loads(capsys.readouterr().out)
+    assert s["key_check"] == {"key": "accepted", "message": None}
+    assert models.calls == [t.KEY_CHECK_MODEL] and genai_stub.seen["key"] == key_file
+    assert genai_stub.seen["attempts"] == 1                       # no retry loop on a 429
+
+
+def test_check_key_rejected(fake_helper, agent, key_file, genai_stub, capsys):
+    genai_stub(_client_error(400, "API key not valid. Please pass a valid API key."))
+    assert cli.main(["stt", "--check-key"]) == 1
+    assert "REJECTED" in capsys.readouterr().out
+    t.clear_apple_status_cache()
+    assert cli.main(["stt", "--json", "--check-key"]) == 0
+    assert json.loads(capsys.readouterr().out)["key_check"]["key"] == "rejected"
+
+
+def test_check_key_missing_never_calls_google(fake_helper, agent, genai_stub, gemini_key, capsys):
+    """A key only in the caller's shell doesn't count: the recorder never sees it."""
+    models = genai_stub(None)
+    t.clear_apple_status_cache()
+    assert cli.main(["stt", "--json", "--check-key"]) == 0
+    assert json.loads(capsys.readouterr().out)["key_check"]["key"] == "missing"
+    assert models.calls == []
+
+
+@pytest.mark.parametrize("outcome,expect", [
+    (OSError("network is unreachable"), "unreachable"),
+    ("500", "unreachable"),
+    ("429", "accepted"),
+    ("404", "accepted"),
+])
+def test_check_key_other_outcomes(fake_helper, agent, key_file, genai_stub, capsys, outcome, expect):
+    from google.genai import errors
+    if outcome == "500":
+        outcome = errors.ServerError(500, {"error": {"code": 500, "message": "internal", "status": "X"}})
+    elif outcome in ("429", "404"):
+        outcome = _client_error(int(outcome), "quota" if outcome == "429" else "model not found")
+    genai_stub(outcome)
+    t.clear_apple_status_cache()
+    assert cli.main(["stt", "--json", "--check-key"]) == 0
+    assert json.loads(capsys.readouterr().out)["key_check"]["key"] == expect
+
+
+def test_without_check_key_there_is_no_key_check_and_no_call(fake_helper, agent, key_file, genai_stub, capsys):
+    models = genai_stub(None)
+    s = stt_json(capsys)
+    assert "key_check" not in s and models.calls == []
+
+
+def test_version_flag(capsys):
+    from meeting_capture import __version__
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--version"])
+    assert e.value.code == 0
+    assert capsys.readouterr().out.strip() == f"meeting-capture {__version__}"
