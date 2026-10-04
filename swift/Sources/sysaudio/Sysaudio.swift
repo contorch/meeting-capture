@@ -22,6 +22,8 @@
 //
 // `sysaudio transcribe …` is a separate subcommand (Transcribe.swift):
 // on-device speech-to-text of an audio file. It captures nothing.
+// `sysaudio check …` (Check.swift) reports the Screen & System Audio Recording
+// and Microphone permissions. It captures nothing either.
 
 import Foundation
 import ScreenCaptureKit
@@ -336,6 +338,11 @@ struct SysAudio {
         // handling below stays exactly as it was.
         if args.first == "transcribe" {
             exit(await TranscribeCommand.run(Array(args.dropFirst())))
+        }
+        // `sysaudio check` (Check.swift): reads (or, with --request, asks for)
+        // the two permissions capture needs. It captures nothing.
+        if args.first == "check" {
+            exit(await CheckCommand.run(Array(args.dropFirst())))
         }
         while !args.isEmpty {
             let a = args.removeFirst()

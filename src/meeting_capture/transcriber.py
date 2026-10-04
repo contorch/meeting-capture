@@ -439,19 +439,21 @@ OLD_HELPER_REASON = ("this sysaudio predates on-device transcription — "
 
 def _run_helper(binary: Path, args: list[str], timeout: float,
                 on_stderr=None) -> subprocess.CompletedProcess:
-    """Run `binary transcribe ARGS`. With `on_stderr`, each stderr line is
-    also handed to it as the helper prints it (download progress)."""
+    """Run `binary transcribe ARGS` as its own responsible process (tccspawn),
+    so --probe, --install and FILE all run as the same identity whoever calls
+    them (onboarding, CLI, daemon). With `on_stderr`, each stderr line is also
+    handed to it as the helper prints it (download progress)."""
+    from . import tccspawn
     cmd = [str(binary), "transcribe", *args]
     if on_stderr is None:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                              stdin=subprocess.DEVNULL)
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            stdin=subprocess.DEVNULL)
-    out: list[str] = []
+        return tccspawn.run(cmd, timeout=timeout)
+    proc = tccspawn.spawn(cmd, stdin=tccspawn.DEVNULL, stdout=tccspawn.PIPE, stderr=tccspawn.PIPE)
+    out: list[bytes] = []
     err: list[str] = []
 
     def _stderr() -> None:
-        for line in proc.stderr:
+        for raw in iter(proc.stderr.readline, b""):
+            line = raw.decode("utf-8", "replace")
             err.append(line)
             try:
                 on_stderr(line.rstrip("\n"))
@@ -471,7 +473,7 @@ def _run_helper(binary: Path, args: list[str], timeout: float,
     finally:
         for t in readers:
             t.join(timeout=5)
-    return subprocess.CompletedProcess(cmd, rc, "".join(out), "".join(err))
+    return subprocess.CompletedProcess(cmd, rc, b"".join(out).decode("utf-8", "replace"), "".join(err))
 
 
 def _probe(binary: Path, locale: str) -> AppleStatus:

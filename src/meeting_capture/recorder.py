@@ -25,7 +25,6 @@ underlying mechanism and worked immediately. Lesson preserved as repo_knowledge.
 """
 from __future__ import annotations
 
-import ctypes
 import os
 import platform
 import select
@@ -41,6 +40,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from . import tccspawn
 from .paths import LAUNCHD_PLIST
 
 SAMPLE_RATE = 16_000
@@ -199,102 +199,13 @@ def mic_capture_enabled() -> bool:
     return mic_capture_supported()
 
 
-class _DisclaimedProc:
-    """Minimal Popen-alike that spawns via posix_spawn with TCC responsibility
-    disclaimed (`responsibility_spawnattrs_setdisclaim`).
-
-    Why: TCC resolves permission prompts against the *responsible process*.
-    Under launchd that's the daemon's python — an unbundled binary with no
-    usage description — so a mic permission request is auto-denied without
-    ever showing a prompt (and nothing appears in System Settings to toggle).
-    Disclaiming makes the child (sysaudio, which embeds an Info.plist with
-    NSMicrophoneUsageDescription) its own responsible process, so the prompt
-    fires and the grant sticks to "sysaudio" in every launch context. Same
-    mechanism Chromium and Karabiner use for their helper binaries; the
-    symbol is private but stable since macOS 10.14.
-    """
-
-    def __init__(self, cmd: list[str]) -> None:
-        libc = ctypes.CDLL(None, use_errno=True)
-        # posix_spawnattr_t / posix_spawn_file_actions_t are pointer-sized
-        # opaque types on darwin.
-        attr = ctypes.c_void_p()
-        if libc.posix_spawnattr_init(ctypes.byref(attr)) != 0:
-            raise OSError("posix_spawnattr_init failed")
-        libc.responsibility_spawnattrs_setdisclaim(ctypes.byref(attr), 1)
-
-        fa = ctypes.c_void_p()
-        libc.posix_spawn_file_actions_init(ctypes.byref(fa))
-        r, w = os.pipe()
-        os.set_inheritable(w, True)
-        libc.posix_spawn_file_actions_adddup2(ctypes.byref(fa), w, 1)
-        libc.posix_spawn_file_actions_addclose(ctypes.byref(fa), r)
-
-        argv = (ctypes.c_char_p * (len(cmd) + 1))(
-            *[c.encode() for c in cmd], None
-        )
-        env_items = [f"{k}={v}".encode() for k, v in os.environ.items()]
-        envp = (ctypes.c_char_p * (len(env_items) + 1))(*env_items, None)
-
-        pid = ctypes.c_int()
-        try:
-            rc = libc.posix_spawn(
-                ctypes.byref(pid), cmd[0].encode(),
-                ctypes.byref(fa), ctypes.byref(attr), argv, envp,
-            )
-        finally:
-            libc.posix_spawn_file_actions_destroy(ctypes.byref(fa))
-            libc.posix_spawnattr_destroy(ctypes.byref(attr))
-            os.close(w)
-        if rc != 0:
-            os.close(r)
-            raise OSError(rc, f"posix_spawn failed for {cmd[0]}")
-
-        self.pid = pid.value
-        self.stdout = os.fdopen(r, "rb", buffering=0)
-        self._returncode: int | None = None
-
-    def poll(self) -> int | None:
-        if self._returncode is None:
-            done, status = os.waitpid(self.pid, os.WNOHANG)
-            if done == self.pid:
-                self._returncode = os.waitstatus_to_exitcode(status)
-        return self._returncode
-
-    def wait(self, timeout: float | None = None) -> int:
-        deadline = None if timeout is None else time.time() + timeout
-        while self.poll() is None:
-            if deadline is not None and time.time() >= deadline:
-                raise subprocess.TimeoutExpired(cmd=str(self.pid), timeout=timeout)
-            time.sleep(0.05)
-        return self._returncode  # type: ignore[return-value]
-
-    def _send(self, sig: int) -> None:
-        if self._returncode is None:
-            try:
-                os.kill(self.pid, sig)
-            except ProcessLookupError:
-                pass
-
-    def terminate(self) -> None:
-        self._send(_signal.SIGTERM)
-
-    def kill(self) -> None:
-        self._send(_signal.SIGKILL)
-
-
-def _spawn_capture(cmd: list[str], disclaim: bool):
-    """Spawn the capture binary; disclaim TCC responsibility for mic-mode sysaudio."""
-    if disclaim and sys.platform == "darwin":
-        try:
-            return _DisclaimedProc(cmd)
-        except (OSError, AttributeError) as exc:
-            print(
-                f"disclaimed spawn failed ({exc}) — falling back to plain spawn "
-                "(mic permission prompts may not work under launchd)",
-                file=sys.stderr, flush=True,
-            )
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=0)
+def _spawn_capture(cmd: list[str]):
+    """Start the capture binary as its OWN responsible process (tccspawn), in
+    every mode: its Screen & System Audio Recording and Microphone checks then
+    answer for sysaudio (inside Contorch.app: the app's one Privacy row;
+    Homebrew: the sysaudio path), never for whoever started the daemon.
+    stderr is inherited so sysaudio's log lands in the daemon log."""
+    return tccspawn.spawn(cmd, stdin=tccspawn.DEVNULL, stdout=tccspawn.PIPE, stderr=None)
 
 
 def _rms_int16(block: np.ndarray) -> float:
@@ -448,10 +359,7 @@ def stream_chunks(
         cmd += ["--chunk-duration", str(CHUNK_DURATION)]
     if mic_mode:
         cmd.append("--mic")
-    # Inherit our stderr so the binary's diagnostic log lands in the daemon log via
-    # launchd. In mic mode, spawn with TCC responsibility disclaimed so sysaudio's
-    # embedded Info.plist can drive the Microphone permission prompt.
-    proc = _spawn_capture(cmd, disclaim=mic_mode)
+    proc = _spawn_capture(cmd)
     if proc.stdout is None:
         raise RuntimeError("audio-capture subprocess has no stdout")
 

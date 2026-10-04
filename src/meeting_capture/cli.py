@@ -195,10 +195,11 @@ def cmd_doctor(_args) -> int:
     mac_ver = platform.mac_ver()[0]
     if mac_ver:
         major = int(mac_ver.split(".")[0])
-        if major >= 13:
+        if major >= 15:
             _ok(f"macOS {mac_ver}")
         else:
-            _fail(f"macOS {mac_ver} too old", "Need 13.0+ for ScreenCaptureKit. Update macOS.")
+            _fail(f"macOS {mac_ver} is older than meeting-capture supports",
+                  "Need macOS 15.0+ (ScreenCaptureKit with the microphone). Update macOS.")
 
     print("\nBinaries:")
     sysaudio = find_sysaudio()
@@ -332,13 +333,23 @@ def cmd_doctor(_args) -> int:
     else:
         print("  · capture mode: batch (`meeting-capture mode live` streams calls to Gemini for the copilot)")
 
+    print("\nPermissions (`meeting-capture check`):")
+    from . import permissions
+    perms = permissions.document(env=_daemon_env())
+    if perms.get("error"):
+        print(f"  · {perms['error']['message']}")
+    for row in perms["permissions"]:
+        label = {"screen_audio": "Screen & System Audio Recording", "microphone": "Microphone"}[row["id"]]
+        if not row["required"]:
+            print(f"  · {label}: {row['status'].replace('_', ' ')} (not needed with these settings)")
+        elif row["status"] == "granted":
+            _ok(label, f"granted to {perms['identity']['subject']}")
+        elif row["status"] in ("unknown", "not_determined"):
+            print(f"  ?  {label}: {row['status'].replace('_', ' ')} — {row['hint']}")
+        else:
+            _fail(f"{label}: {row['status'].replace('_', ' ')}", row["hint"])
+
     print("\nManual gates (cannot be checked from code):")
-    print("  ?  Screen Recording TCC granted to the sysaudio binary itself (bin/sysaudio)")
-    print("     System Settings -> Privacy & Security -> Screen & System Audio Recording")
-    print("     (re-add it after a macOS update or a sysaudio rebuild — either")
-    print("      invalidates the grant; the daemon log then shows 'declined TCCs')")
-    print("  ?  Microphone TCC granted to sysaudio (own-voice capture; prompt fires on first session)")
-    print("     System Settings -> Privacy & Security -> Microphone")
     print("  ?  Claude Code restarted (so the orchestrator MCP server is live)")
 
     print()
@@ -456,8 +467,12 @@ def cmd_new(_args) -> int:
 
 
 def cmd_run(_args) -> int:
+    from . import tccspawn
     from .daemon import run
 
+    # A terminal-started recorder must not ask (or record) as the terminal:
+    # re-run as its own responsible process, like the launchd job.
+    tccspawn.become_own_responsible()
     run()
     return 0
 
@@ -471,13 +486,11 @@ def cmd_start(args) -> int:
     if pid and _is_running(pid):
         print(f"already running (pid {pid})")
         return 0
+    from . import tccspawn
     log = open(LOG_FILE, "ab")
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "meeting_capture.daemon"],
-        stdout=log,
-        stderr=log,
-        start_new_session=True,
-    )
+    # own responsible process (setsid alone keeps the terminal's TCC identity)
+    proc = tccspawn.spawn([sys.executable, "-m", "meeting_capture.daemon"],
+                          stdin=tccspawn.DEVNULL, stdout=log, stderr=log)
     print(f"started (pid {proc.pid})")
     return 0
 
@@ -667,8 +680,14 @@ def cmd_source(args) -> int:
 
 
 def cmd_ui(args) -> int:
+    from . import tccspawn
     from .ui import cmd_ui as run_ui
 
+    # The meters open the line-in device in THIS process: make it its own
+    # responsible process so the meters and the recorder share one identity
+    # (Contorch.app: the app; Homebrew: the venv interpreter), not the
+    # terminal's or the menu bar's.
+    tccspawn.become_own_responsible()
     return run_ui(args)
 
 
@@ -1059,30 +1078,31 @@ def cmd_uninstall(_args) -> int:
     return 0
 
 
-def cmd_check(_args) -> int:
-    from .recorder import find_audiotee, find_sysaudio
+def cmd_check(args) -> int:
+    """The recorder's two permissions (Screen & System Audio Recording, and the
+    microphone) as sysaudio sees them, with what to do about each. --json: one
+    `meeting-capture.permissions/1` document (README "Contract"); --request
+    asks macOS first (it shows its prompt once; afterwards only System Settings
+    can change the answer)."""
+    from . import jsonout, permissions
 
-    sysaudio = find_sysaudio()
+    if args.json:
+        with jsonout.reserved_stdout() as out:
+            try:
+                doc = permissions.document(request=args.request, env=_daemon_env())
+            except Exception as exc:   # a bug, not a state: still one JSON document
+                doc = {"schema": permissions.SCHEMA, "ok": False,
+                       "error": jsonout.error("internal", f"{type(exc).__name__}: {exc}")}
+            jsonout.emit(doc, out)
+        return 0
+    doc = permissions.document(request=args.request, env=_daemon_env())
+    print("\n".join(permissions.text_lines(doc)))
+    from .recorder import find_audiotee
     audiotee = find_audiotee()
-
-    if sysaudio is None and audiotee is None:
-        print("No audio-capture binary found. Run setup.sh to build sysaudio.")
-        return 1
-
-    if sysaudio is not None:
-        print(f"sysaudio (SCK):    {sysaudio}")
-        print("  Permission: System Settings -> Privacy & Security -> Screen & System Audio Recording.")
-        print("  Permission attaches to the sysaudio binary itself (spawned with TCC")
-        print("  responsibility disclaimed) — re-add it after a macOS update or rebuild.")
-    else:
-        print("sysaudio (SCK):    NOT FOUND")
-
     if audiotee is not None:
-        print(f"audiotee (Tap):    {audiotee}  (fallback)")
-        print("  Permission: System Settings -> Privacy & Security -> System Audio Recording Only.")
-    else:
-        print("audiotee (Tap):    not built (fine, fallback only)")
-    return 0
+        print(f"audiotee (fallback): {audiotee} — System Settings › Privacy & Security › "
+              "System Audio Recording Only")
+    return 1 if doc["identity"]["helper"] is None else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1098,7 +1118,13 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("run", help="run daemon in foreground").set_defaults(func=cmd_run)
     sub.add_parser("install", help="install launchd auto-start agent").set_defaults(func=cmd_install)
     sub.add_parser("uninstall", help="remove launchd agent").set_defaults(func=cmd_uninstall)
-    sub.add_parser("check", help="verify audiotee is built and prompt audio-capture permission").set_defaults(func=cmd_check)
+    check = sub.add_parser("check", help="the recorder's permissions (screen & system audio, microphone) "
+                                         "and how to fix each")
+    check.add_argument("--json", action="store_true",
+                       help="one JSON document on stdout (meeting-capture.permissions/1; README: Contract)")
+    check.add_argument("--request", choices=["screen_audio", "microphone"],
+                       help="ask macOS for this permission first (shows its prompt the first time)")
+    check.set_defaults(func=cmd_check)
     sub.add_parser("mic", help="show current mic-activity state (the gate that triggers recording)").set_defaults(func=cmd_mic)
     sub.add_parser("last", help="print the most recent transcript").set_defaults(func=cmd_last)
     sub.add_parser("tail", help="follow the daemon log").set_defaults(func=cmd_tail)

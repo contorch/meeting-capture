@@ -10,7 +10,7 @@ Pairs with [context-orchestrator](https://github.com/contorch/context-orchestrat
 
 ## Requirements
 
-- macOS 13.0 or later (ScreenCaptureKit); macOS 15.0+ for own-voice ("me") capture
+- macOS 15.0 or later (ScreenCaptureKit with the microphone, for both sides of a call)
 - Python 3.10+
 - Xcode command-line tools (`xcode-select --install`)
 - For on-device transcription: macOS 26+ on Apple silicon (nothing else — no key, no account)
@@ -28,7 +28,7 @@ cd meeting-capture
 
 After setup:
 
-1. Open **System Settings → Privacy & Security → Screen & System Audio Recording**, click **+**, and add `bin/sysaudio` from the repo (⌘⇧G in the file dialog to type the path). Make sure it's enabled under the **System Audio Recording Only** list in the same pane too — system audio captures as silence until that grant lands. The daemon spawns sysaudio with TCC responsibility disclaimed, so permissions attach to the `sysaudio` binary itself — the same grant works under your terminal and under launchd, with no terminal-restart dance.
+1. Open **System Settings → Privacy & Security → Screen & System Audio Recording**, click **+**, and add `bin/sysaudio` from the repo (⌘⇧G in the file dialog to type the path). Make sure it's enabled under the **System Audio Recording Only** list in the same pane too — system audio captures as silence until that grant lands. Every sysaudio run (capture, `transcribe`, `check`) is started with TCC responsibility disclaimed, so permissions attach to the `sysaudio` binary itself — the same grant works under your terminal and under launchd, with no terminal-restart dance. `meeting-capture check` shows both permissions as sysaudio sees them.
 2. The first recording session pops a **Microphone** permission prompt titled "sysaudio" (for own-voice capture) — click Allow. Deny it (or skip it) and you get system-audio-only transcripts.
 3. After rebuilding sysaudio (`setup.sh` or `swift build`), re-add it in step 1 — the ad-hoc code signature changes with each build, which invalidates the previous grant.
 
@@ -48,6 +48,7 @@ CLI commands for inspection and control:
 |---|---|
 | `meeting-capture status` | Daemon state, mic state, last transcript, last log line |
 | `meeting-capture doctor` | Full health check of all prerequisites and components |
+| `meeting-capture check [--request screen_audio\|microphone]` | The recorder's two permissions as sysaudio sees them, and how to fix each; `--json` for other programs (see [Contract](#contract)) |
 | `meeting-capture mic` | Show current microphone-activity state |
 | `meeting-capture last` | Print the path of the most recent transcript |
 | `meeting-capture tail` | Follow the daemon log |
@@ -181,6 +182,16 @@ Only needed for Gemini (chosen, or the fallback of `auto` when on-device isn't a
 The daemon self-exits (and launchd respawns it) if its `phys_footprint` exceeds `MEETING_CAPTURE_MAX_FOOTPRINT_MB` (default 2048) — a backstop against any runaway-memory regression. The check uses `phys_footprint`, not RSS, because leaked memory is often compressed/swapped and invisible to RSS.
 
 ## Contract
+
+**`meeting-capture check --json`** (schema `meeting-capture.permissions/1`) is the recorder's permission state: pipeline-monitor's menu, doctor and setup show its rows as they are instead of writing their own hints. It runs `sysaudio check --json` (schema `sysaudio.check/1`, read-only: `CGPreflightScreenCaptureAccess` and `AVCaptureDevice.authorizationStatus`) as its own responsible process, the identity it captures as. `--request screen_audio|microphone` asks macOS first (`CGRequestScreenCaptureAccess` / `requestAccess`; macOS shows its prompt once). One document on stdout, exit 0:
+
+| Field | Meaning |
+|---|---|
+| `schema`, `ok`, `error{code,message}` | `ok: false` when the state couldn't be read: `no_helper`, `helper_too_old` (a sysaudio before 0.7), `helper_failed`, `helper_timeout` |
+| `channel` | `$CONTORCH_CHANNEL`: `app` \| `brew` \| `dev` (unset) |
+| `identity.helper`, `identity.subject` | the sysaudio the recorder runs, and who macOS asks about: the outermost app bundle's id (Contorch.app), else the binary's real path |
+| `permissions[]` | one row each for `screen_audio` and `microphone` (line-in included): `status` (`granted` \| `not_granted` \| `denied` \| `not_determined` \| `restricted` \| `unknown`), `required` (with the current source and mic setting), `can_request`, `hint` (what to do, worded for the channel; `null` when granted), `settings_url` (the Privacy pane) |
+| `requested` | the `--request` given, else `null` |
 
 **`meeting-capture stt --json`** is how other programs learn how meetings get transcribed. pipeline-monitor (the Contorch menu bar, `contorch setup`, `status`, `doctor`) runs it instead of re-implementing the rules in `transcriber.py` — this repo is the only implementation; change the fields here and in pipeline-monitor's `transcription.py` together (its README has the same section). It prints one JSON object on stdout (diagnostics go to stderr) describing what the recorder's configuration — the launchd plist env, or this shell's when no agent is installed; a key only in the caller's shell doesn't count for an installed agent — resolves to, and exits 0 whenever it could answer (1: it couldn't, nothing on stdout; 2: usage — a meeting-capture without `stt --json` also exits 2, which callers read as "too old"). It runs the helper's read-only probe once per language (≈ 0.1–0.2 s in all). `"schema": 1`; adding a field keeps the schema, removing or redefining one bumps it.
 
