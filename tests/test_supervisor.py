@@ -307,6 +307,7 @@ def test_the_old_plist_config_store_stays_deleted():
         assert not re.search(rf"\b{gone}\b", cli_text), gone
     for py in src.glob("*.py"):
         text = py.read_text(encoding="utf-8")
-        if py.name != "supervisor.py":
+        # daemon.py may only unload its own job (the bundle-gone guard)
+        if py.name not in ("supervisor.py", "daemon.py"):
             assert '"launchctl"' not in text, f"{py.name} runs launchctl itself"
         assert '"kickstart", "-k"' not in text, py.name
