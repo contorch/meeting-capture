@@ -456,7 +456,12 @@ def test_unavailable_engine_parks_audio_and_waits_until_it_is_back(dirs, monkeyp
         return "back again"
 
     monkeypatch.setattr(daemon, "transcribe", fake)
-    monkeypatch.setattr(daemon, "resolve_backend", lambda: _ready(ready=up["ok"]))
+    from meeting_capture.transcriber import Backend
+    reason = "the on-device model for en-US isn't installed yet"
+    # The worker rechecks the engine every ENGINE_RECHECK_S and then reports
+    # the backend's own reason, so the stub must give the same one.
+    monkeypatch.setattr(daemon, "resolve_backend",
+                        lambda: Backend("apple", "auto", reason, "en-US", up["ok"]))
     monkeypatch.setattr(daemon.TranscriptionWorker, "_maybe_install_model", lambda self: None)
     w = daemon.TranscriptionWorker().start()
     w.submit(_chunk(audio, 1714003200), "meeting-a")

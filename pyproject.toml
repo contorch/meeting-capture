@@ -1,6 +1,6 @@
 [project]
 name = "meeting-capture"
-version = "0.6.0"
+version = "0.7.0"
 description = "Always-on meeting capture daemon — both sides of a call to transcripts, transcribed on-device (macOS 26+) or with Gemini."
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
