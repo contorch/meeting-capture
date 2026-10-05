@@ -58,8 +58,24 @@ _K_SCOPE_INPUT = _fourcc("inpt")
 
 # HAL process objects whose input activity does NOT mean "the user is in a
 # call". replayd is ScreenCaptureKit's capture backend: our own sysaudio
-# --mic session lands there, as do Cluely/Loom/OBS-style recorders.
-_EXCLUDED_INPUT_BUNDLES = frozenset({"com.apple.replayd"})
+# --mic session lands there (sck backend), as do Cluely/Loom/OBS-style
+# recorders. With the taps backend sysaudio holds the mic and the tap's
+# aggregate device itself: excluded by its bundle id (if the HAL reports
+# one for it) and, always, by pid (register_own_capture).
+_EXCLUDED_INPUT_BUNDLES = frozenset({"com.apple.replayd", "com.contorch.meeting-capture.sysaudio"})
+
+# Capture children this process started (recorder._spawn_capture).
+_own_capture_pids: set[int] = set()
+
+
+def register_own_capture(pid) -> None:
+    """A sysaudio this process spawned: its input is our recording, not a call."""
+    if isinstance(pid, int) and pid > 0:
+        _own_capture_pids.add(pid)
+
+
+def unregister_own_capture(pid) -> None:
+    _own_capture_pids.discard(pid)
 
 
 class _AudioObjectPropertyAddress(ctypes.Structure):
@@ -266,32 +282,34 @@ UI_PID_FRESH_S = 10.0
 
 def _excluded_pids() -> set[int]:
     """Our own processes that open an input without being a call: the
-    settings page (`meeting-capture ui`) meters the interface, and must not
-    make the daemon think a meeting started."""
+    settings page (`meeting-capture ui`) meters the interface, and the
+    capture child this process is recording with (taps backend), neither of
+    which may make the daemon think a meeting started (or never ended)."""
     import os
     import time
 
     from .paths import UI_PID_FILE
 
+    ours = set(_own_capture_pids)
     try:
         # The page re-touches the file every couple of seconds. A stale one
         # (page killed -9, crashed) must not keep excluding a PID macOS may
         # hand to Zoom next.
         if time.time() - UI_PID_FILE.stat().st_mtime > UI_PID_FRESH_S:
-            return set()
+            return ours
         pid = int(UI_PID_FILE.read_text().strip())
         os.kill(pid, 0)
-        return {pid}
+        return ours | {pid}
     except (OSError, ValueError):
-        return set()
+        return ours
 
 
 def is_mic_active() -> bool:
     """True if a non-excluded process is currently running audio input.
 
     "In a call" gating signal: process-level attribution (macOS 14+) so our
-    own SCK mic capture — attributed to com.apple.replayd — doesn't trip the
-    gate; device-level fallback on older macOS.
+    own capture — SCK's attributed to com.apple.replayd, taps' to sysaudio's
+    own pid — doesn't trip the gate; device-level fallback on older macOS.
     """
     procs = _process_object_ids()
     if procs:
@@ -306,11 +324,28 @@ def is_mic_active() -> bool:
             return True
         return False
     # Fallback (macOS 13 / query failure): device-wide check. Safe there
-    # because we never open the mic ourselves on macOS < 15.
+    # because we never open the mic ourselves on macOS < 15 (auto never picks
+    # taps below 15; a forced `backend taps` on 14.x has process objects).
     for dev_id in _all_device_ids():
         if _has_input_streams(dev_id) and _is_device_running(dev_id):
             return True
     return False
+
+
+def input_processes() -> list[dict]:
+    """Every HAL process object running audio input: {pid, bundle_id,
+    excluded} (diagnostics: `meeting-capture mic`; the taps lab checks which
+    bundle id the HAL reports for sysaudio)."""
+    ours = _excluded_pids()
+    out = []
+    for obj in _process_object_ids():
+        if not _process_is_running_input(obj):
+            continue
+        pid = _process_pid(obj)
+        bundle = _process_bundle_id(obj)
+        out.append({"pid": pid, "bundle_id": bundle,
+                    "excluded": bundle in _EXCLUDED_INPUT_BUNDLES or (pid in ours)})
+    return out
 
 
 def active_mic_name() -> str | None:

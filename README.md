@@ -48,7 +48,7 @@ CLI commands for inspection and control:
 |---|---|
 | `meeting-capture status` | Daemon state, mic state, last transcript, last log line |
 | `meeting-capture doctor` | Full health check of all prerequisites and components |
-| `meeting-capture check [--request screen_audio\|microphone]` | The recorder's two permissions as sysaudio sees them, and how to fix each; `--json` for other programs (see [Contract](#contract)) |
+| `meeting-capture check [--request screen_audio\|system_audio\|microphone]` | The recorder's permissions as sysaudio sees them (and which capture backend they select), and how to fix each; `--json` for other programs (see [Contract](#contract)) |
 | `meeting-capture mic` | Show current microphone-activity state |
 | `meeting-capture last` | Print the path of the most recent transcript |
 | `meeting-capture tail` | Follow the daemon log |
@@ -101,7 +101,20 @@ Capture never waits for transcription: the capture loop decides each chunk's mee
 
 On macOS 15+ `sysaudio` captures the microphone alongside system audio in the same ScreenCaptureKit stream (`--mic`; framed stdout protocol, both channels 16 kHz mono int16). Each channel runs through its own silence chunker, and transcript lines are labeled `**Me:**` (your mic) or `**Them:**` (system audio). Speaker attribution across the me/them boundary is therefore exact; multiple remote speakers within a "them" chunk still get best-effort `[SPEAKER_n]` labels when Gemini transcribes. Set `MEETING_CAPTURE_MIC=0` to opt out (system audio only). On macOS 13/14 the daemon runs system-audio-only automatically.
 
-Mic-activity gating uses per-process Core Audio HAL attribution (`kAudioProcessPropertyIsRunningInput`) and ignores `com.apple.replayd`, ScreenCaptureKit's capture backend — otherwise the daemon's own mic capture would hold the "mic in use" gate open forever. Real meeting apps hold the mic under their own process, so gating is unaffected.
+Mic-activity gating uses per-process Core Audio HAL attribution (`kAudioProcessPropertyIsRunningInput`) and ignores `com.apple.replayd`, ScreenCaptureKit's capture backend, and the recorder's own sysaudio child (by pid; the taps backend opens the mic under sysaudio's own process) — otherwise the daemon's own mic capture would hold the "mic in use" gate open forever. Real meeting apps hold the mic under their own process, so gating is unaffected. `meeting-capture mic` lists every process holding an input.
+
+### Capture backends: ScreenCaptureKit or Core Audio taps
+
+`sysaudio --backend sck|taps` picks how the other side of the call is captured; the stdout protocol (raw, or `S`/`M` frames of 16 kHz mono int16) is the same for both, so everything downstream is unchanged.
+
+| | `sck` (ScreenCaptureKit) | `taps` (Core Audio process taps) |
+|---|---|---|
+| macOS | 13+ (mic: 15+) | 14.2+ |
+| "Them" permission | Screen & System Audio Recording (macOS re-confirms it about monthly) | System Audio Recording Only (`NSAudioCaptureUsageDescription`), no re-confirmation |
+| "Me" | SCK's microphone capture | the default input through the HAL |
+| Device changes | ScreenCaptureKit's | rebuilt by sysaudio on output/input switches, rate changes, a device dying, IO stalls (sleep/wake); gives up (exit 2, the recorder respawns it) rather than hang |
+
+`MEETING_CAPTURE_BACKEND` = `auto` (default) \| `taps` \| `sck` (`meeting-capture config set backend sck` is the rollback). **auto** uses taps on macOS 15+ when sysaudio has them and System Audio Recording Only is allowed — or when Screen & System Audio Recording isn't (a new install is only ever asked for the narrower permission); a Mac already recording with the screen grant stays on sck, with no new prompt, until `meeting-capture check --request system_audio` (or setup) allows system audio. A sysaudio that predates `--backend` is run exactly as before. The daemon log names the choice once per change (`capture backend: taps — …`), and `check --json` reports it (`backend`).
 
 Note on echo: without headphones, your mic also picks up the other side from the speakers, so "me" chunks can contain "them" speech. Headphones (incl. AirPods) avoid this; OS-level echo cancellation is a possible future addition.
 
@@ -236,14 +249,15 @@ The recorder stops cleanly on SIGTERM (Quit, an update, `meeting-capture stop`, 
 
 Privacy wording belongs to these fields only: audio leaves the Mac now when `uploads` or `live.active` is true, and may leave it when `may_upload` is true; say "never leaves this Mac" only when `may_upload` is false. A caller that asks in the background (a menu bar timer) should run the venv's own `~/.meeting-capture/venv/bin/meeting-capture` — the code the recorder runs — not the Homebrew wrapper: after a `brew upgrade` the wrapper deletes and rebuilds that venv, under the running recorder. `meeting-capture stt auto|apple|gemini [--language L]` and `meeting-capture language L` are safe to run from another program: no prompts, progress as lines on stdout (model download percentages included), errors on stderr, exit 0 when applied (then ask `stt --json` for the result), 1 when refused with the configuration untouched, 2 for usage errors.
 
-**`meeting-capture check --json`** (schema `meeting-capture.permissions/1`) is the recorder's permission state: pipeline-monitor's menu, doctor and setup show its rows as they are instead of writing their own hints. It runs `sysaudio check --json` (schema `sysaudio.check/1`, read-only: `CGPreflightScreenCaptureAccess` and `AVCaptureDevice.authorizationStatus`) as its own responsible process, the identity it captures as. `--request screen_audio|microphone` asks macOS first (`CGRequestScreenCaptureAccess` / `requestAccess`; macOS shows its prompt once). One document on stdout, exit 0:
+**`meeting-capture check --json`** (schema `meeting-capture.permissions/1`) is the recorder's permission state: pipeline-monitor's menu, doctor and setup show its rows as they are instead of writing their own hints. It runs `sysaudio check --json` (schema `sysaudio.check/1`, read-only: `CGPreflightScreenCaptureAccess`, `AVCaptureDevice.authorizationStatus` and TCC's preflight for `kTCCServiceAudioCapture`; it also lists the `backends` this sysaudio runs here) as its own responsible process, the identity it captures as. `--request screen_audio|system_audio|microphone` asks macOS first (`CGRequestScreenCaptureAccess` / TCC's request, or a briefly started tap whose samples are discarded / `requestAccess`; macOS shows its prompt once). One document on stdout, exit 0:
 
 | Field | Meaning |
 |---|---|
 | `schema`, `ok`, `error{code,message}` | `ok: false` when the state couldn't be read: `no_helper`, `helper_too_old` (a sysaudio without `check`), `helper_failed`, `helper_timeout` |
 | `channel` | `$CONTORCH_CHANNEL`: `app` \| `brew` \| `dev` (unset) |
 | `identity.helper`, `identity.subject` | the sysaudio the recorder runs, and who macOS asks about: the outermost app bundle's id (Contorch.app), else the binary's real path |
-| `permissions[]` | one row each for `screen_audio` and `microphone` (line-in included): `status` (`granted` \| `not_granted` \| `denied` \| `not_determined` \| `restricted` \| `unknown`), `required` (with the current source and mic setting), `can_request`, `hint` (what to do, worded for the channel; `null` when granted), `settings_url` (the Privacy pane) |
+| `permissions[]` | one row each for `screen_audio`, `system_audio` (System Audio Recording Only) and `microphone` (line-in included): `status` (`granted` \| `not_granted` \| `denied` \| `not_determined` \| `restricted` \| `unknown` \| `unsupported`), `required` (with the current source, mic setting and backend: exactly one of `screen_audio`/`system_audio` with source `sck`), `can_request`, `hint` (what to do, worded for the channel; `null` when granted), `settings_url` (the Privacy pane) |
+| `backend` | `selected` (`taps` \| `sck`), `setting` (`MEETING_CAPTURE_BACKEND`), `reason`, `available` (sysaudio's `backends`, `null` for one that predates them). `system_audio` and `backend` were added within schema 1 |
 | `requested` | the `--request` given, else `null` |
 
 ## Tests

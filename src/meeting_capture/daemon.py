@@ -817,8 +817,17 @@ class FailureBackoff:
 
 
 def _permission_hint() -> str:
+    from . import recorder as _rec
     binary = find_sysaudio()
     where = str(binary) if binary else "bin/sysaudio"
+    if (_rec.last_plan or {}).get("selected") == "taps":
+        return (
+            "sysaudio (Core Audio taps) is most likely being refused System Audio "
+            f"Recording Only for {where}: System Settings -> Privacy & Security -> "
+            "Screen & System Audio Recording -> System Audio Recording Only "
+            "(`meeting-capture check` shows it; `meeting-capture config set backend sck` "
+            "goes back to ScreenCaptureKit), then the next session will pick it up automatically."
+        )
     return (
         "sysaudio is most likely being denied Screen Recording. Re-add "
         f"{where} under System Settings -> Privacy & Security -> Screen & System "

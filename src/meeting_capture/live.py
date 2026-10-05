@@ -38,7 +38,10 @@ from .recorder import (
     ROLE_SYSTEM,
     SAMPLE_RATE,
     _FrameParser,
+    _reap_capture,
     _spawn_capture,
+    capture_command,
+    capture_plan,
     find_capture_binary,
     mic_capture_enabled,
 )
@@ -246,8 +249,8 @@ async def _run(should_record: Callable[[], bool], session_stem: str, append: Cal
     if binary is None:
         raise RuntimeError("no audio-capture binary (sysaudio) found")
     want_mic = binary.name == "sysaudio" and mic_capture_enabled()
-    cmd = [str(binary), "--sample-rate", str(SAMPLE_RATE)] + (["--mic"] if want_mic else [])
-    proc = _spawn_capture(cmd)
+    plan = capture_plan(binary) if binary.name == "sysaudio" else None
+    proc = _spawn_capture(capture_command(binary, SAMPLE_RATE, want_mic, plan))
 
     client = genai.Client(api_key=api_key, http_options=_http_options(types))
     feed = _FeedWriter(session_stem)
@@ -282,11 +285,7 @@ async def _run(should_record: Callable[[], bool], session_stem: str, append: Cal
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
+        _reap_capture(proc)
     log.info("live: session ended")
 
 

@@ -1,10 +1,18 @@
-"""Always-on system audio capture via the sysaudio CLI (ScreenCaptureKit, macOS 13+).
+"""Always-on system audio capture via the sysaudio CLI.
 
-sysaudio is our own small Swift binary that uses ScreenCaptureKit's SCStream
-with capturesAudio=true to tap system audio output. On macOS 15+ it also
-captures the default microphone (SCK captureMicrophone) so both sides of a
-meeting are recorded: system audio = the other participants ("them"), the
-mic = the device owner ("me").
+sysaudio is our own small Swift binary with two capture backends and one
+output contract (below):
+  - sck:  ScreenCaptureKit's SCStream with capturesAudio=true (macOS 13+;
+          needs Screen & System Audio Recording, which macOS re-confirms
+          about monthly). On macOS 15+ it also captures the default
+          microphone (SCK captureMicrophone).
+  - taps: Core Audio process taps (sysaudio >= the taps release, macOS
+          14.2+): a global tap of every app's output but sysaudio's, plus the
+          default input through the HAL. Needs only System Audio Recording
+          Only (plus the Microphone, as before).
+choose_backend() decides which one a session uses (MEETING_CAPTURE_BACKEND,
+default auto). Either way both sides of a meeting are recorded: system
+audio = the other participants ("them"), the mic = the device owner ("me").
 
 Wire protocol from sysaudio:
   - without --mic: raw int16 LE mono PCM on stdout (audiotee-compatible).
@@ -22,6 +30,12 @@ We previously used audiotee (Core Audio Process Tap, macOS 14.2+). Switched
 no errors logged, "audio device started successfully" — but every PCM byte
 was 0. Survived `sudo killall coreaudiod` and a reboot. SCK has a different
 underlying mechanism and worked immediately. Lesson preserved as repo_knowledge.
+The likely cause: a tap without the System Audio Recording grant delivers
+silence instead of failing, and audiotee had no NSAudioCaptureUsageDescription,
+so macOS could never ask. sysaudio's taps backend carries the usage string,
+reads the grant up front (`sysaudio check`: system_audio) and logs an all-zero
+first five seconds; auto only picks taps once that grant exists or when no
+screen grant would be reused instead.
 """
 from __future__ import annotations
 
@@ -93,6 +107,14 @@ AUDIOTEE_ENV_VAR = "MEETING_CAPTURE_AUDIOTEE"
 # Mic (own-voice) capture: on by default where supported; set to 0/false/off
 # to force system-audio-only capture.
 MIC_ENV_VAR = "MEETING_CAPTURE_MIC"
+
+# Which sysaudio backend captures the other side: auto (default) | taps | sck.
+# `meeting-capture config set backend sck` is the rollback.
+BACKEND_ENV_VAR = "MEETING_CAPTURE_BACKEND"
+BACKEND_SETTINGS = ("auto", "taps", "sck")
+# auto picks taps only from this macOS (the app's minimum, where the lab
+# verifies it); `backend taps` forces them from 14.2.
+TAPS_AUTO_MIN_MACOS = 15
 
 FRAME_TAG_SYSTEM = 0x53  # 'S'
 FRAME_TAG_MIC = 0x4D     # 'M'
@@ -194,13 +216,127 @@ def mic_capture_enabled() -> bool:
     return mic_capture_supported()
 
 
+def backend_setting(env=None) -> str:
+    """MEETING_CAPTURE_BACKEND as one of BACKEND_SETTINGS (unset or unknown → auto)."""
+    env = os.environ if env is None else env
+    v = (env.get(BACKEND_ENV_VAR) or "auto").strip().lower()
+    return v if v in BACKEND_SETTINGS else "auto"
+
+
+def _macos_major() -> int:
+    try:
+        return int(platform.mac_ver()[0].split(".")[0])
+    except (ValueError, IndexError):
+        return 0
+
+
+def choose_backend(setting: str, check_doc: dict | None, macos_major: int) -> dict:
+    """Which sysaudio backend captures "them". Pure (tests drive it).
+
+    `check_doc` is `sysaudio check --json` (sysaudio.check/1) or None when it
+    couldn't be read. Returns {"selected": "taps"|"sck", "flag": bool (pass
+    --backend; False for a sysaudio that predates it), "setting", "reason",
+    "available"}.
+
+    auto: taps where sysaudio has them and macOS >= TAPS_AUTO_MIN_MACOS, when
+    System Audio Recording Only is already allowed, or when Screen & System
+    Audio Recording isn't (a new install is asked for the narrower grant).
+    A Mac that records today with the screen grant keeps sck, with no new
+    prompt, until it allows system audio (`meeting-capture check --request
+    system_audio`, or setup)."""
+    setting = setting if setting in BACKEND_SETTINGS else "auto"
+    available = check_doc.get("backends") if isinstance(check_doc, dict) else None
+    out = {"setting": setting, "available": available if isinstance(available, list) else None}
+
+    def pick(selected: str, reason: str, flag: bool = True) -> dict:
+        return {**out, "selected": selected, "flag": flag, "reason": reason}
+
+    if not isinstance(available, list):
+        why = ("couldn't ask sysaudio which backends it has" if check_doc is None
+               else "this sysaudio predates --backend")
+        return pick("sck", f"{why} (ScreenCaptureKit)", flag=False)
+    has_taps = "taps" in available
+    if setting == "sck":
+        return pick("sck", f"{BACKEND_ENV_VAR}=sck")
+    if setting == "taps":
+        if has_taps:
+            return pick("taps", f"{BACKEND_ENV_VAR}=taps")
+        return pick("sck", "Core Audio taps need macOS 14.2 or later")
+    if not has_taps or macos_major < TAPS_AUTO_MIN_MACOS:
+        return pick("sck", f"auto uses Core Audio taps from macOS {TAPS_AUTO_MIN_MACOS}")
+    audio = check_doc.get("system_audio")
+    screen = check_doc.get("screen_capture")
+    if audio == "granted":
+        return pick("taps", "System Audio Recording Only is allowed")
+    if screen == "granted":
+        return pick("sck", "Screen & System Audio Recording is allowed and System Audio Recording Only "
+                           "isn't yet (`meeting-capture check --request system_audio` moves to taps)")
+    return pick("taps", "asks for System Audio Recording Only rather than Screen Recording")
+
+
+# The plan the last capture session ran with (daemon diagnostics).
+last_plan: dict | None = None
+_last_logged: tuple | None = None
+
+
+def capture_plan(binary: Path, env=None) -> dict:
+    """choose_backend for this binary, reading its `check --json` (no prompt).
+    audiotee (the old fallback) has no backends."""
+    global last_plan, _last_logged
+    doc = None
+    if binary.name == "sysaudio":
+        from . import permissions
+        doc, _err = permissions._sysaudio_check(binary, None)
+    plan = choose_backend(backend_setting(env), doc, _macos_major())
+    last_plan = plan
+    key = (plan["selected"], plan["reason"])
+    if key != _last_logged:
+        _last_logged = key
+        print(f"capture backend: {plan['selected']} — {plan['reason']}", file=sys.stderr, flush=True)
+    return plan
+
+
+def capture_command(binary: Path, sample_rate: int, mic_mode: bool, plan: dict | None) -> list[str]:
+    """The capture argv for `binary` (sysaudio or the audiotee fallback)."""
+    cmd = [str(binary), "--sample-rate", str(sample_rate)]
+    if binary.name == "audiotee":
+        cmd += ["--chunk-duration", str(CHUNK_DURATION)]
+    if mic_mode:
+        cmd.append("--mic")
+    if plan and plan.get("flag"):
+        cmd += ["--backend", plan["selected"]]
+    return cmd
+
+
 def _spawn_capture(cmd: list[str]):
     """Start the capture binary as its OWN responsible process (tccspawn), in
     every mode: its Screen & System Audio Recording and Microphone checks then
     answer for sysaudio (inside Contorch.app: the app's one Privacy row;
     Homebrew: the sysaudio path), never for whoever started the daemon.
     stderr is inherited so sysaudio's log lands in the daemon log."""
-    return tccspawn.spawn(cmd, stdin=tccspawn.DEVNULL, stdout=tccspawn.PIPE, stderr=None)
+    from . import mic
+    proc = tccspawn.spawn(cmd, stdin=tccspawn.DEVNULL, stdout=tccspawn.PIPE, stderr=None)
+    # With the taps backend sysaudio opens the mic (and the tap's aggregate
+    # device) under its own pid, not replayd's: the call gate must not count
+    # our own capture as "someone is in a call".
+    mic.register_own_capture(getattr(proc, "pid", None))
+    return proc
+
+
+def _reap_capture(proc) -> None:
+    """Stop a capture child started by _spawn_capture and forget its pid."""
+    from . import mic
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+    except Exception:
+        pass
+    finally:
+        mic.unregister_own_capture(getattr(proc, "pid", None))
 
 
 def _rms_int16(block: np.ndarray) -> float:
@@ -350,13 +486,9 @@ def stream_chunks(
 
     mic_mode = binary.name == "sysaudio" and mic_capture_enabled()
 
-    # sysaudio takes --sample-rate and --mic. audiotee also accepts --chunk-duration.
-    cmd = [str(binary), "--sample-rate", str(sample_rate)]
-    if binary.name == "audiotee":
-        cmd += ["--chunk-duration", str(CHUNK_DURATION)]
-    if mic_mode:
-        cmd.append("--mic")
-    proc = _spawn_capture(cmd)
+    # sysaudio takes --sample-rate, --mic and --backend. audiotee also accepts --chunk-duration.
+    plan = capture_plan(binary) if binary.name == "sysaudio" else None
+    proc = _spawn_capture(capture_command(binary, sample_rate, mic_mode, plan))
     if proc.stdout is None:
         raise RuntimeError("audio-capture subprocess has no stdout")
 
@@ -466,11 +598,7 @@ def stream_chunks(
             if chunk is not None:
                 yield chunk
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        _reap_capture(proc)
 
 
 def _trim_trailing_silence(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
