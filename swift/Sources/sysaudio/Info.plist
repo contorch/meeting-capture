@@ -8,6 +8,8 @@
 	<string>sysaudio</string>
 	<key>CFBundleShortVersionString</key>
 	<string>1.0</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>meeting-capture records the other side of your meetings (the "Them" channel in transcripts) from this Mac's sound output. Audio is transcribed and deleted; nothing is kept.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>meeting-capture records your side of meetings (the "Me" channel in transcripts). Audio is transcribed and deleted; nothing is kept.</string>
 </dict>

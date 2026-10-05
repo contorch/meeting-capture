@@ -3,7 +3,10 @@
 # capture path, which would need Screen Recording and the mic. It checks:
 #   - the capture CLI still parses as before (--help; an unknown flag exits 1
 #     with "unknown arg"),
-#   - `check --json` (sysaudio.check/1) reads both permissions without asking,
+#   - `--backend sck|taps` parses (a bad value is a usage error); the taps
+#     backend is never started (it would need System Audio Recording),
+#   - `check --json` (sysaudio.check/1) reads the three permissions and the
+#     available backends without asking,
 #   - the `transcribe` exit-code contract that meeting_capture relies on
 #     (see swift/Sources/sysaudio/Transcribe.swift),
 #   - that a ready probe means this binary's bundle id holds a reservation for
@@ -169,6 +172,15 @@ check "sysaudio --help keeps its usage line" grep -q "Usage: sysaudio \[--sample
 run 30 "$TMP/out" "$TMP/err" "$BIN" --no-such-flag
 expect "sysaudio --no-such-flag" 1
 check "capture arg parser still says 'unknown arg'" grep -q "unknown arg: --no-such-flag" "$TMP/err"
+# --backend (sck | taps) is parsed before anything starts; a bad value is a
+# usage error and captures nothing. The taps backend itself is never started
+# here: it would need the System Audio Recording grant (M5 lab, step 16).
+run 30 "$TMP/out" "$TMP/err" "$BIN" --help
+check "sysaudio --help documents --backend sck|taps" grep -q -- "--backend sck|taps" "$TMP/out"
+run 30 "$TMP/out" "$TMP/err" "$BIN" --backend coreaudio
+expect "sysaudio --backend coreaudio (usage error)" 1
+check "a bad --backend names the choices" grep -q "takes sck or taps" "$TMP/err"
+check "a bad --backend prints nothing on stdout" stdout_empty "$TMP/out"
 
 # --- check (reads the two permissions; never --request: no prompt in CI) ---
 run 30 "$TMP/out" "$TMP/err" "$BIN" check --help
@@ -180,14 +192,19 @@ run 60 "$TMP/check.json" "$TMP/err" "$BIN" check --json
 expect "check --json" 0
 cat "$TMP/check.json"
 check "check JSON has every contract key" \
-    json_keys "$TMP/check.json" schema screen_capture microphone os arch requested
+    json_keys "$TMP/check.json" schema screen_capture microphone system_audio backends os arch requested
 check "check JSON words are the contract's" python3 - "$TMP/check.json" <<'PY'
 import json, sys
 d = json.loads(open(sys.argv[1], encoding="utf-8").read())
 assert d["schema"] == "sysaudio.check/1", d
 assert d["screen_capture"] in ("granted", "not_granted"), d
 assert d["microphone"] in ("granted", "denied", "not_determined", "restricted"), d
+assert d["system_audio"] in ("granted", "denied", "not_determined", "unknown", "unsupported"), d
 assert d["requested"] is None, d
+assert d["backends"][0] == "sck", d
+major, minor = (int(x) for x in (d["os"].split(".") + ["0"])[:2])
+assert ("taps" in d["backends"]) == ((major, minor) >= (14, 2)), d
+assert (d["system_audio"] == "unsupported") == ("taps" not in d["backends"]), d
 PY
 
 # --- transcribe ---

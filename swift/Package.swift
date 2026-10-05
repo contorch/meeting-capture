@@ -5,8 +5,9 @@ let package = Package(
     name: "sysaudio",
     platforms: [.macOS(.v13)],
     targets: [
-        // The embedded __info_plist section (bundle id + NSMicrophoneUsageDescription)
-        // is what lets an unbundled CLI binary present the Microphone TCC prompt.
+        // The embedded __info_plist section (bundle id + NSMicrophoneUsageDescription
+        // + NSAudioCaptureUsageDescription) is what lets an unbundled CLI binary
+        // present the Microphone and System Audio Recording TCC prompts.
         // Without it, a launchd-spawned sysaudio (no app ancestor) is auto-denied
         // silently and never appears in System Settings → Privacy → Microphone.
         .executableTarget(
