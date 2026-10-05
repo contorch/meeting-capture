@@ -65,5 +65,35 @@ for arch in arm64 x86_64; do
 done
 vtool -show-build "$BIN" | grep -E "architecture|minos" || true
 
+# The taps backend (Core Audio process taps, macOS 14.2+) must stay optional:
+# the binary is built for macOS 13 and Homebrew users there must still load
+# it (taps unavailable → sck). Its entry points have to be weak imports, and
+# the CoreAudio Swift overlay a weak dylib, in both slices.
+for arch in arm64 x86_64; do
+    SYMS=$(nm -m -arch "$arch" "$BIN")
+    for sym in _AudioHardwareCreateProcessTap _AudioHardwareDestroyProcessTap; do
+        if printf '%s\n' "$SYMS" | grep -E "\(undefined\) weak external $sym " >/dev/null; then
+            echo "$arch slice: $sym is a weak import"
+        else
+            echo "FATAL: the $arch slice imports $sym strongly (would not load before macOS 14.2)"
+            printf '%s\n' "$SYMS" | grep "$sym" || true
+            exit 1
+        fi
+    done
+    if otool -arch "$arch" -L "$BIN" | grep "libswiftCoreAudio.dylib" | grep -qv "weak"; then
+        echo "FATAL: the $arch slice links libswiftCoreAudio strongly"
+        exit 1
+    fi
+    # The embedded Info.plist carries both usage strings (the Microphone and
+    # the System Audio Recording prompts) and the stable bundle id TCC keys on.
+    PLIST=$(strings -arch "$arch" "$BIN")
+    for key in NSAudioCaptureUsageDescription NSMicrophoneUsageDescription com.contorch.meeting-capture.sysaudio; do
+        case "$PLIST" in
+            *"$key"*) ;;
+            *) echo "FATAL: the $arch slice's embedded Info.plist has no $key"; exit 1 ;;
+        esac
+    done
+done
+
 cp "$BIN" ../sysaudio
 echo "built $(cd .. && pwd)/sysaudio"

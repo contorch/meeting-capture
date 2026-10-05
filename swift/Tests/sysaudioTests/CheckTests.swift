@@ -44,10 +44,13 @@ struct CheckTests {
 
     @Test("the JSON document carries the schema and every key")
     func document() {
-        let d = CheckCommand.document(screen: "granted", mic: "denied", requested: .mic)
+        let d = CheckCommand.document(screen: "granted", mic: "denied", systemAudio: "unknown", backends: ["sck"],
+                                      requested: .mic)
         #expect(d["schema"] as? String == CHECK_SCHEMA)
-        #expect(Set(d.keys) == ["schema", "screen_capture", "microphone", "os", "arch", "requested"])
+        #expect(Set(d.keys) == ["schema", "screen_capture", "microphone", "system_audio", "backends", "os", "arch",
+                                "requested"])
         #expect(d["requested"] as? String == "mic")
-        #expect(CheckCommand.document(screen: "granted", mic: "granted", requested: nil)["requested"] is NSNull)
+        #expect(CheckCommand.document(screen: "granted", mic: "granted", systemAudio: "granted", backends: ["sck"],
+                                      requested: nil)["requested"] is NSNull)
     }
 }

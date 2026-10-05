@@ -85,3 +85,36 @@ jobs:
       # too (best effort).
       - name: Smoke-test (capture CLI parsing, transcribe exit-code contract)
         run: .github/scripts/sysaudio-smoke.sh ./sysaudio --try-install
+      # Informational, never blocking: does the taps backend start and keep
+      # IO flowing on a runner (no person, so no System Audio Recording grant:
+      # silence is expected)? The verdict is the M5 lab, protocol step 16.
+      - name: Taps backend probe on the runner (informational)
+        continue-on-error: true
+        timeout-minutes: 3
+        run: .github/scripts/taps-ci-probe.sh ./sysaudio
+      - name: Keep the PR build for the macOS 15 load check
+        uses: actions/upload-artifact@v4
+        with:
+          name: sysaudio-pr
+          path: sysaudio
+          retention-days: 3
+
+  # The binary is built for macOS 13 with everything newer (Speech, Core Audio
+  # taps) weak-linked; run the same no-capture smoke on macOS 15 to prove it
+  # loads and answers the contract on an older OS (transcribe answers 69 there).
+  sysaudio-macos15:
+    needs: sysaudio
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: sysaudio-pr
+      - run: chmod +x sysaudio && codesign -dv --verbose=2 sysaudio 2>&1 | grep -E "Identifier|flags" || true
+      - name: Smoke-test on macOS 15 (no capture)
+        run: .github/scripts/sysaudio-smoke.sh ./sysaudio
+      - name: Taps backend probe on the runner (informational)
+        continue-on-error: true
+        timeout-minutes: 3
+        run: .github/scripts/taps-ci-probe.sh ./sysaudio

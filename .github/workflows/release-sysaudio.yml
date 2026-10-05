@@ -72,6 +72,16 @@ jobs:
           echo "== entitlements ==" && codesign -d --entitlements - --xml sysaudio 2>/dev/null | grep -q "audio-input" \
             && echo "audio-input entitlement present" \
             || { echo "FATAL: audio-input entitlement missing after signing"; exit 1; }
+          # TCC keys every grant (Microphone, Screen & System Audio Recording,
+          # System Audio Recording Only) on this identifier + the team's
+          # designated requirement: it must never change between releases.
+          codesign -dv sysaudio 2>&1 | grep -qx "Identifier=com.contorch.meeting-capture.sysaudio" \
+            || { echo "FATAL: signing identifier is not com.contorch.meeting-capture.sysaudio"; exit 1; }
+          codesign -d -r- sysaudio 2>&1 | grep -E "designated" || true
+          # The taps backend's prompt needs NSAudioCaptureUsageDescription in
+          # the embedded Info.plist (build-sysaudio.sh checks both slices).
+          launchctl plist __TEXT,__info_plist sysaudio | grep -q NSAudioCaptureUsageDescription \
+            || { echo "FATAL: NSAudioCaptureUsageDescription missing from the embedded Info.plist"; exit 1; }
 
       # On the signed binary. Never captures: it checks the capture CLI still
       # parses as before and that `sysaudio transcribe --probe` runs and exits

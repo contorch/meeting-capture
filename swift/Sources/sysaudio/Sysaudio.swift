@@ -1,10 +1,15 @@
-// sysaudio: capture system audio (and optionally the microphone) via ScreenCaptureKit.
-// macOS 13+ for system audio; --mic needs macOS 15+ (SCK microphone capture).
-// Requires Screen Recording TCC permission; --mic additionally requires the
-// Microphone TCC permission (both user-grantable, attributed to the parent
-// terminal/launcher, no admin).
+// sysaudio: capture system audio (and optionally the microphone).
+// Two backends, one output contract (CaptureArgs.swift):
+//   --backend sck   (default) ScreenCaptureKit, macOS 13+; --mic needs macOS 15+
+//                   (SCK microphone capture). Needs Screen & System Audio Recording.
+//   --backend taps  Core Audio process taps, macOS 14.2+ (Tap.swift). Needs only
+//                   System Audio Recording Only; --mic reads the default input
+//                   through the HAL.
+// --mic additionally requires the Microphone TCC permission. Permissions are
+// charged to sysaudio's responsible process (meeting_capture disclaims it via
+// tccspawn, so they are sysaudio's own), no admin.
 //
-// Output contract on stdout:
+// Output contract on stdout (both backends):
 //   default:  raw int16 LE mono PCM, system audio only (audiotee-compatible).
 //   --mic:    framed. Each frame is 1 tag byte ('S' system | 'M' microphone),
 //             a 4-byte little-endian payload length, then the payload
@@ -16,14 +21,17 @@
 // logs to stderr and continues with system audio only — a meeting is never
 // lost to a missing mic grant.
 //
-// Usage: sysaudio [--sample-rate N] [--mic]
+// Usage: sysaudio [--sample-rate N] [--mic] [--backend sck|taps]
 //   --sample-rate  output sample rate in Hz (default 16000)
 //   --mic          also capture the default microphone as a second channel
+//   --backend      sck (default) or taps
 //
 // `sysaudio transcribe …` is a separate subcommand (Transcribe.swift):
 // on-device speech-to-text of an audio file. It captures nothing.
-// `sysaudio check …` (Check.swift) reports the Screen & System Audio Recording
-// and Microphone permissions. It captures nothing either.
+// `sysaudio check …` (Check.swift) reports the Screen & System Audio Recording,
+// System Audio Recording Only and Microphone permissions, and which backends
+// this binary can run here. It captures nothing either (unless --request
+// system_audio has to fall back to starting a tap so macOS asks).
 
 import Foundation
 import ScreenCaptureKit
@@ -281,24 +289,7 @@ func run(sampleRate: Int, wantMic: Bool) async throws {
     // and request explicitly so the first --mic run pops the system dialog
     // and a denial degrades loudly to system-audio-only.
     if wantMic {
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized:
-            break
-        case .notDetermined:
-            logErr("sysaudio: requesting microphone permission (watch for the macOS prompt)...")
-            let granted = await AVCaptureDevice.requestAccess(for: .audio)
-            if !granted {
-                logErr("sysaudio: microphone permission denied — continuing with system audio only")
-                micActive = false
-            }
-        default:
-            logErr(
-                "sysaudio: microphone permission denied/restricted — continuing with system "
-                + "audio only. Grant it under System Settings → Privacy & Security → Microphone "
-                + "(to the parent terminal/launcher), then restart the daemon."
-            )
-            micActive = false
-        }
+        micActive = await micPermission()
     }
 
     if micActive {
@@ -316,7 +307,7 @@ func run(sampleRate: Int, wantMic: Bool) async throws {
     _ = stream
 
     let mode = micActive ? "system+mic, framed" : (wantMic ? "system only (mic fallback), framed" : "system only, raw")
-    logErr("sysaudio: stream started (sample rate \(sampleRate), int16 LE, \(mode)), piping PCM to stdout")
+    logErr("sysaudio: stream started (backend sck, sample rate \(sampleRate), int16 LE, \(mode)), piping PCM to stdout")
 
     // Run forever; SIGTERM/SIGINT will exit the process.
     while true {
@@ -328,9 +319,7 @@ func run(sampleRate: Int, wantMic: Bool) async throws {
 @main
 struct SysAudio {
     static func main() async {
-        var sampleRate = 16000
-        var wantMic = false
-        var args = Array(CommandLine.arguments.dropFirst())
+        let args = Array(CommandLine.arguments.dropFirst())
         // `sysaudio transcribe …` (Transcribe.swift) is a separate tool that
         // shares this signed binary, its Developer ID and its bundle id. Route
         // it before the capture flags are parsed: it never touches
@@ -344,29 +333,31 @@ struct SysAudio {
         if args.first == "check" {
             exit(await CheckCommand.run(Array(args.dropFirst())))
         }
-        while !args.isEmpty {
-            let a = args.removeFirst()
-            switch a {
-            case "--sample-rate":
-                if let n = args.first.flatMap(Int.init) { sampleRate = n; args.removeFirst() }
-            case "--mic":
-                wantMic = true
-            case "-h", "--help":
-                print("Usage: sysaudio [--sample-rate N] [--mic]")
-                print("  --sample-rate  output sample rate in Hz (default 16000)")
-                print("  --mic          also capture the default microphone (framed output, macOS 15+)")
-                exit(0)
-            default:
-                FileHandle.standardError.write("unknown arg: \(a)\n".data(using: .utf8)!)
-                exit(1)
-            }
+        let opts: CaptureArgs
+        switch CaptureCommand.parse(args) {
+        case .help:
+            print(CaptureCommand.usage)
+            exit(0)
+        case .usage(let msg):
+            FileHandle.standardError.write("\(msg)\n".data(using: .utf8)!)
+            exit(1)
+        case .run(let o):
+            opts = o
         }
 
         signal(SIGTERM, SIG_DFL)
         signal(SIGINT, SIG_DFL)
 
+        if opts.backend == .taps {
+            guard #available(macOS 14.2, *) else {
+                logErr("sysaudio error: --backend taps needs macOS 14.2 or later (use --backend sck)")
+                exit(1)
+            }
+            await runTaps(sampleRate: opts.sampleRate, wantMic: opts.mic)
+        }
+
         do {
-            try await run(sampleRate: sampleRate, wantMic: wantMic)
+            try await run(sampleRate: opts.sampleRate, wantMic: opts.mic)
         } catch {
             FileHandle.standardError.write("sysaudio error: \(error)\n".data(using: .utf8)!)
             exit(1)
