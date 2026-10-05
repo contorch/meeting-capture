@@ -36,7 +36,7 @@ with wave.open(sys.argv[1], "wb") as w:
                            for i in range(rate * secs)))
 PY
 
-# 1) nothing playing, 4 s; 2) a tone playing, 6 s. One sysaudio run each.
+# 1) nothing playing, 8 s; 2) a tone playing, 6 s. One sysaudio run each.
 run_probe() {
     local secs="$1" out="$2" err="$3"
     perl -e 'alarm shift; exec @ARGV' "$secs" "$BIN" --backend taps --sample-rate 16000 >"$out" 2>"$err"
@@ -44,8 +44,8 @@ run_probe() {
     sed 's/^/    stderr: /' "$err" | head -20
 }
 
-echo "-- silence"
-run_probe 4 "$TMP/silence.pcm" "$TMP/silence.err"
+echo "-- silence (8 s)"
+run_probe 8 "$TMP/silence.pcm" "$TMP/silence.err"
 echo "-- tone"
 afplay "$TMP/tone.wav" &
 sleep 1

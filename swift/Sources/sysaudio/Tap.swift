@@ -161,6 +161,16 @@ final class Stamp {
 
 func uptime() -> Double { ProcessInfo.processInfo.systemUptime }
 
+/// Which HAL call a (re)build is in. Read by the slow-start notice: with
+/// System Audio Recording undecided, macOS can hold a tap's start until the
+/// user answers its prompt, and the log should say where it waits.
+enum BuildStage {
+    private static let lock = NSLock()
+    private static var value = "idle"
+    static func set(_ s: String) { lock.lock(); value = s; lock.unlock() }
+    static func get() -> String { lock.lock(); defer { lock.unlock() }; return value }
+}
+
 // MARK: - One output channel: buffers → mono → resample → batch → writer
 
 /// Lives on the IO queue only. Survives rebuilds (the batcher keeps its
@@ -261,6 +271,7 @@ final class TapSource {
         desc.isPrivate = true
         desc.muteBehavior = .unmuted
         var tap = AudioObjectID(kAudioObjectUnknown)
+        BuildStage.set("AudioHardwareCreateProcessTap")
         try check(AudioHardwareCreateProcessTap(desc, &tap), "AudioHardwareCreateProcessTap")
         tapID = tap
 
@@ -292,6 +303,7 @@ final class TapSource {
             composition[kAudioAggregateDeviceSubDeviceListKey] = [[kAudioSubDeviceUIDKey: uid]]
         }
         var agg = AudioObjectID(kAudioObjectUnknown)
+        BuildStage.set("AudioHardwareCreateAggregateDevice")
         try check(AudioHardwareCreateAggregateDevice(composition as CFDictionary, &agg),
                   "AudioHardwareCreateAggregateDevice")
         aggregateID = agg
@@ -303,7 +315,9 @@ final class TapSource {
             handler(input, f, take)
         }, "AudioDeviceCreateIOProcIDWithBlock")
         procID = proc
+        BuildStage.set("AudioDeviceStart (tap aggregate)")
         try check(AudioDeviceStart(aggregateID, procID), "AudioDeviceStart (tap aggregate)")
+        BuildStage.set("running")
     }
 
     /// The tap's format now (nil if unreadable).
@@ -418,6 +432,14 @@ final class TapsCapture {
     /// backend's start failure) and, if wanted and allowed, the mic (a mic
     /// failure only logs: system audio is never lost to the mic).
     func start(micAllowed: Bool) throws {
+        let started = Stamp()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5) {
+            if started.get() == 0 {
+                logErr("sysaudio: the tap is taking more than 5 s to start (in \(BuildStage.get())) — "
+                       + "macOS may be waiting for an answer to its System Audio Recording prompt")
+            }
+        }
+        defer { started.set(1) }
         try control.sync {
             try buildTap()
             tapPolicy.built(ok: true, now: uptime())
