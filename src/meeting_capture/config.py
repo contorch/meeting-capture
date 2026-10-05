@@ -55,6 +55,7 @@ SETTINGS = (
     "MEETING_CAPTURE_STT",             # auto | apple | gemini
     "MEETING_CAPTURE_LOCALE",          # on-device language
     "MEETING_CAPTURE_MIC",             # 0 = system audio only
+    "MEETING_CAPTURE_BACKEND",         # auto | taps | sck (how sysaudio captures "them")
     "MEETING_CAPTURE_DIARIZE",
     "MEETING_CAPTURE_GEMINI_MODEL",
     "MEETING_CAPTURE_COPILOT_MODEL",

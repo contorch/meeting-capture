@@ -35,10 +35,14 @@ from .recorder import (
     FRAME_TAG_MIC,
     FRAME_TAG_SYSTEM,
     ROLE_MIC,
+    PERMISSION_WAIT_S,
     ROLE_SYSTEM,
     SAMPLE_RATE,
     _FrameParser,
+    _reap_capture,
     _spawn_capture,
+    capture_command,
+    capture_plan,
     find_capture_binary,
     mic_capture_enabled,
 )
@@ -186,7 +190,7 @@ async def _channel(
             await asyncio.sleep(2.0)
 
 
-async def _pump_pcm(proc, queues: dict, stop: asyncio.Event) -> None:
+async def _pump_pcm(proc, queues: dict, stop: asyncio.Event, first_byte_wait_s: float = STALL_BAIL_S) -> None:
     """Read framed PCM from sysaudio and fan out to per-channel queues.
 
     Runs the blocking pipe read in an executor so the event loop keeps serving
@@ -196,6 +200,7 @@ async def _pump_pcm(proc, queues: dict, stop: asyncio.Event) -> None:
     fd = proc.stdout.fileno()
     loop = asyncio.get_event_loop()
     silent_s = 0.0
+    got_any = False
 
     def _read() -> bytes:
         ready, _, _ = select.select([fd], [], [], READ_POLL_S)
@@ -210,11 +215,12 @@ async def _pump_pcm(proc, queues: dict, stop: asyncio.Event) -> None:
         data = await loop.run_in_executor(None, _read)
         if not data:
             silent_s += READ_POLL_S
-            if silent_s >= STALL_BAIL_S:
+            if silent_s >= (STALL_BAIL_S if got_any else first_byte_wait_s):
                 log.warning("live: sysaudio produced no PCM for %.0fs — stopping so daemon respawns", silent_s)
                 stop.set()
             continue
         silent_s = 0.0
+        got_any = True
         try:
             frames = parser.feed(data)
         except ValueError as exc:
@@ -246,8 +252,8 @@ async def _run(should_record: Callable[[], bool], session_stem: str, append: Cal
     if binary is None:
         raise RuntimeError("no audio-capture binary (sysaudio) found")
     want_mic = binary.name == "sysaudio" and mic_capture_enabled()
-    cmd = [str(binary), "--sample-rate", str(SAMPLE_RATE)] + (["--mic"] if want_mic else [])
-    proc = _spawn_capture(cmd)
+    plan = capture_plan(binary) if binary.name == "sysaudio" else None
+    proc = _spawn_capture(capture_command(binary, SAMPLE_RATE, want_mic, plan))
 
     client = genai.Client(api_key=api_key, http_options=_http_options(types))
     feed = _FeedWriter(session_stem)
@@ -269,7 +275,8 @@ async def _run(should_record: Callable[[], bool], session_stem: str, append: Cal
             await asyncio.sleep(1.0)
         stop.set()
 
-    tasks = [asyncio.create_task(_pump_pcm(proc, queues, stop)), asyncio.create_task(_gate())]
+    wait_s = PERMISSION_WAIT_S if (plan or {}).get("awaiting_permission") else STALL_BAIL_S
+    tasks = [asyncio.create_task(_pump_pcm(proc, queues, stop, wait_s)), asyncio.create_task(_gate())]
     for r in roles:
         tasks.append(asyncio.create_task(_channel(client, types, r, queues[r], on_event, stop)))
 
@@ -282,11 +289,7 @@ async def _run(should_record: Callable[[], bool], session_stem: str, append: Cal
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
+        _reap_capture(proc)
     log.info("live: session ended")
 
 

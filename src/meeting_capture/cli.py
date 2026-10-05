@@ -157,6 +157,10 @@ def cmd_mic(_args) -> int:
     print(f"in use by other app: {is_mic_active()}")
     if is_mic_active():
         print(f"active device:       {active_mic_name() or '(unknown)'}")
+    from .mic import input_processes
+    for p in input_processes():
+        print(f"  input held by pid {p['pid']} ({p['bundle_id'] or 'no bundle id'})"
+              + ("  — ours/excluded, not a call" if p["excluded"] else ""))
     return 0
 
 
@@ -355,7 +359,7 @@ def cmd_doctor(_args) -> int:
     if perms.get("error"):
         print(f"  · {perms['error']['message']}")
     for row in perms["permissions"]:
-        label = {"screen_audio": "Screen & System Audio Recording", "microphone": "Microphone"}[row["id"]]
+        label = permissions.TITLE[row["id"]]
         if not row["required"]:
             print(f"  · {label}: {row['status'].replace('_', ' ')} (not needed with these settings)")
         elif row["status"] == "granted":
@@ -1261,7 +1265,8 @@ def cmd_config(args) -> int:
 
 
 def cmd_check(args) -> int:
-    """The recorder's two permissions (Screen & System Audio Recording, and the
+    """The recorder's permissions (Screen & System Audio Recording or System
+    Audio Recording Only, whichever the capture backend needs, and the
     microphone) as sysaudio sees them, with what to do about each. --json: one
     `meeting-capture.permissions/1` document (README "Contract"); --request
     asks macOS first (it shows its prompt once; afterwards only System Settings
@@ -1328,11 +1333,11 @@ def main(argv: list[str] | None = None) -> int:
     cfg.set_defaults(func=cmd_config)
     sub.add_parser("install", help="install launchd auto-start agent").set_defaults(func=cmd_install)
     sub.add_parser("uninstall", help="remove launchd agent").set_defaults(func=cmd_uninstall)
-    check = sub.add_parser("check", help="the recorder's permissions (screen & system audio, microphone) "
-                                         "and how to fix each")
+    check = sub.add_parser("check", help="the recorder's permissions (screen & system audio or system audio "
+                                         "only, microphone) and how to fix each")
     check.add_argument("--json", action="store_true",
                        help="one JSON document on stdout (meeting-capture.permissions/1; README: Contract)")
-    check.add_argument("--request", choices=["screen_audio", "microphone"],
+    check.add_argument("--request", choices=["screen_audio", "system_audio", "microphone"],
                        help="ask macOS for this permission first (shows its prompt the first time)")
     check.set_defaults(func=cmd_check)
     sub.add_parser("mic", help="show current mic-activity state (the gate that triggers recording)").set_defaults(func=cmd_mic)
