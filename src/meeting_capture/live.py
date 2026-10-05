@@ -35,6 +35,7 @@ from .recorder import (
     FRAME_TAG_MIC,
     FRAME_TAG_SYSTEM,
     ROLE_MIC,
+    PERMISSION_WAIT_S,
     ROLE_SYSTEM,
     SAMPLE_RATE,
     _FrameParser,
@@ -189,7 +190,7 @@ async def _channel(
             await asyncio.sleep(2.0)
 
 
-async def _pump_pcm(proc, queues: dict, stop: asyncio.Event) -> None:
+async def _pump_pcm(proc, queues: dict, stop: asyncio.Event, first_byte_wait_s: float = STALL_BAIL_S) -> None:
     """Read framed PCM from sysaudio and fan out to per-channel queues.
 
     Runs the blocking pipe read in an executor so the event loop keeps serving
@@ -199,6 +200,7 @@ async def _pump_pcm(proc, queues: dict, stop: asyncio.Event) -> None:
     fd = proc.stdout.fileno()
     loop = asyncio.get_event_loop()
     silent_s = 0.0
+    got_any = False
 
     def _read() -> bytes:
         ready, _, _ = select.select([fd], [], [], READ_POLL_S)
@@ -213,11 +215,12 @@ async def _pump_pcm(proc, queues: dict, stop: asyncio.Event) -> None:
         data = await loop.run_in_executor(None, _read)
         if not data:
             silent_s += READ_POLL_S
-            if silent_s >= STALL_BAIL_S:
+            if silent_s >= (STALL_BAIL_S if got_any else first_byte_wait_s):
                 log.warning("live: sysaudio produced no PCM for %.0fs — stopping so daemon respawns", silent_s)
                 stop.set()
             continue
         silent_s = 0.0
+        got_any = True
         try:
             frames = parser.feed(data)
         except ValueError as exc:
@@ -272,7 +275,8 @@ async def _run(should_record: Callable[[], bool], session_stem: str, append: Cal
             await asyncio.sleep(1.0)
         stop.set()
 
-    tasks = [asyncio.create_task(_pump_pcm(proc, queues, stop)), asyncio.create_task(_gate())]
+    wait_s = PERMISSION_WAIT_S if (plan or {}).get("awaiting_permission") else STALL_BAIL_S
+    tasks = [asyncio.create_task(_pump_pcm(proc, queues, stop, wait_s)), asyncio.create_task(_gate())]
     for r in roles:
         tasks.append(asyncio.create_task(_channel(client, types, r, queues[r], on_event, stop)))
 

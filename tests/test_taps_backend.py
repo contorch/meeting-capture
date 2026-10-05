@@ -221,3 +221,52 @@ def test_live_mode_spawns_the_same_argv(tmp_path, monkeypatch):
     monkeypatch.setattr(recorder, "mic_capture_supported", lambda: True)
     plan = live.capture_plan(exe)
     assert live.capture_command(exe, live.SAMPLE_RATE, True, plan)[-2:] == ["--backend", "taps"]
+
+
+# ---------------------------------------------------------------------------
+# A pending System Audio Recording prompt: sysaudio's start waits for it
+
+
+def test_awaiting_permission_is_flagged_only_for_an_undecided_taps_grant():
+    assert recorder.choose_backend("auto", doc(screen="not_granted", audio="not_determined"), 26)["awaiting_permission"]
+    assert recorder.choose_backend("taps", doc(audio="unknown"), 26)["awaiting_permission"]
+    assert not recorder.choose_backend("auto", doc(audio="granted"), 26)["awaiting_permission"]
+    assert not recorder.choose_backend("sck", doc(audio="not_determined"), 26)["awaiting_permission"]
+    assert not recorder.choose_backend("auto", None, 26)["awaiting_permission"]
+
+
+SLOW = r'''#!{python}
+import json, os, sys, time
+here = os.path.dirname(os.path.abspath(__file__))
+if sys.argv[1:2] == ["check"]:
+    print(json.dumps({"schema": "sysaudio.check/1", "screen_capture": "not_granted", "microphone": "granted",
+                      "system_audio": os.environ.get("FAKE_AUDIO", "not_determined"),
+                      "backends": ["sck", "taps"]})); sys.exit(0)
+time.sleep(float(os.environ.get("FAKE_SILENT_S", "12")))   # "waiting for the user to answer"
+sys.stdout.buffer.write(b"\0\0" * 16000); sys.stdout.flush()
+open(os.path.join(here, "wrote"), "w").write("1")
+time.sleep(30)
+'''
+
+
+@pytest.mark.parametrize("audio,survives", [("not_determined", True), ("granted", False)])
+def test_first_byte_grace_while_the_prompt_is_up(tmp_path, monkeypatch, audio, survives):
+    """Stall limits shrunk 10x: an undecided grant gets PERMISSION_WAIT_S
+    before the first byte; a decided one only STALL_BAIL_S."""
+    d = tmp_path / "bin"
+    d.mkdir()
+    exe = d / "sysaudio"
+    exe.write_text(SLOW.replace("{python}", sys.executable))
+    exe.chmod(0o755)
+    monkeypatch.setenv("FAKE_AUDIO", audio)
+    monkeypatch.setenv("FAKE_SILENT_S", "6")
+    monkeypatch.setenv(recorder.MIC_ENV_VAR, "0")
+    monkeypatch.setattr(recorder, "_macos_major", lambda: 26)
+    monkeypatch.setattr(recorder, "SELECT_POLL_S", 0.5)
+    monkeypatch.setattr(recorder, "STALL_BAIL_S", 3.0)
+    monkeypatch.setattr(recorder, "PERMISSION_WAIT_S", 30.0)
+    out = tmp_path / "audio"
+    out.mkdir()
+    t0 = time.time()
+    list(recorder.stream_chunks(out, lambda: time.time() - t0 < 9, capture_binary=exe))
+    assert (d / "wrote").exists() is survives

@@ -76,6 +76,13 @@ MAX_CHUNK_SECONDS = 600.0
 SELECT_POLL_S = 5.0
 STALL_BAIL_S = 30.0
 
+# With the taps backend and System Audio Recording Only not decided yet,
+# macOS asks when sysaudio creates the tap's aggregate device and holds that
+# call until the user answers (seen on the CI runners: the start waits in
+# AudioHardwareCreateAggregateDevice). Give the user this long to answer
+# before the first byte, instead of killing sysaudio (and its prompt) at 30 s.
+PERMISSION_WAIT_S = 300.0
+
 # When sysaudio is alive AND producing PCM but every byte is zero-amplitude,
 # something has stolen system audio capture out from under us — most often
 # another SCK consumer (Cluely, Loom, OBS, recall.ai-based tools) starting
@@ -249,7 +256,10 @@ def choose_backend(setting: str, check_doc: dict | None, macos_major: int) -> di
     out = {"setting": setting, "available": available if isinstance(available, list) else None}
 
     def pick(selected: str, reason: str, flag: bool = True) -> dict:
-        return {**out, "selected": selected, "flag": flag, "reason": reason}
+        # taps with an undecided grant: sysaudio's start waits for the prompt.
+        awaiting = (selected == "taps" and isinstance(check_doc, dict)
+                    and check_doc.get("system_audio") in ("not_determined", "unknown"))
+        return {**out, "selected": selected, "flag": flag, "reason": reason, "awaiting_permission": awaiting}
 
     if not isinstance(available, list):
         why = ("couldn't ask sysaudio which backends it has" if check_doc is None
@@ -501,6 +511,8 @@ def stream_chunks(
     parser = _FrameParser() if mic_mode else None
 
     stdout_fd = proc.stdout.fileno()
+    first_byte_wait_s = PERMISSION_WAIT_S if (plan or {}).get("awaiting_permission") else STALL_BAIL_S
+    got_any = False
     silent_pipe_s = 0.0          # seconds since sysaudio last produced any data
     last_emit_ts = time.time()   # wall-clock of the last successful chunk emit
     last_system_data_ts = time.time()  # last time SYSTEM-channel bytes arrived
@@ -516,7 +528,7 @@ def stream_chunks(
             ready, _, _ = select.select([stdout_fd], [], [], SELECT_POLL_S)
             if not ready:
                 silent_pipe_s += SELECT_POLL_S
-                if silent_pipe_s >= STALL_BAIL_S:
+                if silent_pipe_s >= (STALL_BAIL_S if got_any else first_byte_wait_s):
                     _bail(
                         f"sysaudio stalled for {silent_pipe_s:.0f}s without "
                         "producing PCM — bailing so daemon can respawn it"
@@ -532,6 +544,9 @@ def stream_chunks(
                 break
             if not got:
                 break  # clean EOF — sysaudio exited
+            if not got_any:
+                got_any = True
+                last_system_data_ts = last_emit_ts = time.time()   # the clocks start at the first byte
             silent_pipe_s = 0.0
             now = time.time()
 
