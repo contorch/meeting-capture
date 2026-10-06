@@ -133,6 +133,8 @@ def test_an_older_state_file_has_no_source_fields_and_status_still_answers():
      "UMC404HD 192k not connected — this Mac's calls are recorded instead"),
     ({"code": "linein_device_missing", "fallback": "off"},
      "UMC404HD 192k not connected — not recording (line-in fallback is off)"),
+    ({"code": "linein_device_missing", "fallback": "active", "returned": 5.0},
+     "UMC404HD 192k is back — recording this Mac's call audio until the call ends"),
 ])
 def test_describe_source(problem, expect):
     doc = {"source": "linein", "input": {"device": "UMC404HD 192k", "me_channel": 0, "them_channel": 1},
@@ -308,8 +310,11 @@ def test_missing_interface_during_a_call_records_this_macs_audio_then_goes_back(
     # The interface comes back mid-call: the call isn't split; it stays on this
     # Mac's audio until it ends, then the recorder is back on line-in.
     rig.plug(BUILTIN, UMC)
-    time.sleep(1.0)
-    assert (rig.ctl / "sck-recording").exists() and rig.status()["recording"] is True
+    _wait(lambda: _problem(rig.status()).get("returned"), what="the interface noted as back")
+    s = rig.status()
+    assert (rig.ctl / "sck-recording").exists() and s["recording"] is True
+    assert _problem(s)["fallback"] == "active" and s["effective_source"] == "sck"
+    assert "is connected again — staying on this Mac's call audio until the call ends" in rig.log()
     rig.call(False)
     _wait(lambda: rig.status().get("effective_source") == "linein" and not rig.status().get("problem"),
           what="back on line-in")

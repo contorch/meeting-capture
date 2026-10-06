@@ -981,6 +981,22 @@ class LineinWatch:
     def recheck_soon(self) -> None:
         self.next_probe = 0.0
 
+    def peek(self) -> None:
+        """During a fallback call: is the interface back? Probed quietly at
+        most every LINEIN_RETRY_SECONDS (no stream is open in this process,
+        so the PortAudio re-scan is safe). It is not used before the call
+        ends — `problem["returned"]` says when it came back meanwhile."""
+        if self.problem is None or self.problem.get("returned") or self.clock() < self.next_probe:
+            return
+        self.next_probe = self.clock() + LINEIN_RETRY_SECONDS
+        try:
+            self.probe()
+        except Exception:
+            return
+        self.problem = {**self.problem, "returned": self.clock()}
+        log.info("line-in: %s is connected again — staying on this Mac's call audio until the call ends",
+                 repr(self.device) if self.device else "the input")
+
     def what(self) -> str:
         """'UMC404HD 192k' not connected / the line-in input is unavailable — for log lines."""
         if self.problem and self.problem["code"] == "linein_device_missing" and self.device:
@@ -1279,6 +1295,10 @@ def run() -> None:
             st.set("recording" if time.time() - _rec.last_voice_at < LINEIN_ACTIVE_S else "idle",
                    current_session)
             return True
+        if watch is not None and watch.problem is not None and not watch.problem.get("returned"):
+            watch.peek()                    # a fallback call: say when the interface is back
+            if watch.problem.get("returned"):
+                _publish_source(active=True)
         return is_mic_active() and not _is_paused()
 
     def _linein_chunks():

@@ -17,7 +17,9 @@ atomically at every transition, and every HEARTBEAT_S while it records:
     problem           null, or {"code": "linein_device_missing" |
                       "linein_unavailable", "device", "message", "since",
                       "fallback": "active" (recording this Mac's call audio
-                      now) | "armed" (will, when a call starts) | "off"}
+                      now) | "armed" (will, when a call starts) | "off",
+                      "returned"?: when the interface came back during a
+                      fallback call (used again once the call ends)}
 
 `meeting-capture status --json` (`meeting-capture.status/1`) turns it into the
 answer other programs act on — pipeline-monitor's ● REC, the update gate
@@ -218,6 +220,8 @@ def describe_source(doc: dict | None, configured: dict | None = None) -> str:
     problem = (doc or {}).get("problem")
     if not problem:
         return f"line-in — {dev} ({_inputs(inp)})"
+    if problem.get("returned") and problem.get("fallback") == "active":
+        return f"{dev} is back — recording this Mac's call audio until the call ends"
     what = (f"{dev} not connected" if problem.get("code") == "linein_device_missing"
             else f"line-in unavailable ({problem.get('message') or problem.get('code')})")
     fb = problem.get("fallback")
