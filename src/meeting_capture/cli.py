@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__, config, paths, store, supervisor
+from . import __version__, config, paths, state, store, supervisor
 from .mic import active_mic_name, is_mic_active, mic_name
 from .paths import (
     AUDIO_DIR,
@@ -75,7 +75,7 @@ def cmd_status(args) -> int:
     if getattr(args, "json", False):
         # The one answer to "is a meeting being recorded right now?"
         # (state.py; README "Contract"). Read-only, exit 0 in every case.
-        from . import jsonout, state
+        from . import jsonout
         with jsonout.reserved_stdout() as out:
             try:
                 doc = state.status()
@@ -97,7 +97,13 @@ def cmd_status(args) -> int:
         print(f"  mic in use:       True ({active_mic_name() or 'unknown device'})")
     else:
         print(f"  mic in use:       False (default: {mic_name() or 'unknown device'})")
-    if running and mic_on and not paused:
+    try:
+        said = state.status() if running else {}
+    except Exception:
+        said = {}
+    if said.get("recording") is not None:          # the daemon's own word (state.json)
+        print(f"  state:            {'ACTIVELY RECORDING' if said['recording'] else said.get('state')}")
+    elif running and mic_on and not paused:
         print(f"  state:            ACTIVELY RECORDING")
     elif running and not paused:
         print(f"  state:            idle (waiting for mic to activate)")
@@ -105,6 +111,16 @@ def cmd_status(args) -> int:
         print(f"  state:            paused")
     else:
         print(f"  state:            not running")
+
+    try:
+        sdoc = said if said.get("pid") and said.get("reason") != "daemon_not_running" else None
+        print(f"  source:           {state.describe_source(sdoc, current_source())}")
+        prob = (sdoc or {}).get("problem")
+        if prob and prob.get("since"):
+            print(f"  source problem:   since {time.strftime('%H:%M', time.localtime(prob['since']))} — "
+                  f"{prob.get('message')}")
+    except Exception as exc:   # a status line must not break `status`
+        print(f"  source:           ? ({type(exc).__name__}: {exc})")
 
     last = _last_transcript()
     if last is not None:
@@ -276,6 +292,21 @@ def cmd_doctor(_args) -> int:
             _fail("recorder agent not loaded (stopped)", "meeting-capture start")
     else:
         _fail("recorder agent not installed", "meeting-capture install")
+    try:
+        said = state.status()
+        live = said if said.get("pid") and said.get("reason") != "daemon_not_running" else None
+        line = f"source: {state.describe_source(live, current_source())}"
+        prob = (live or {}).get("problem")
+        if prob:
+            since = time.strftime("%H:%M", time.localtime(prob["since"])) if prob.get("since") else "?"
+            _fail(f"{line} (since {since})",
+                  "plug the interface in, or `meeting-capture source sck` to record this Mac's call audio"
+                  + ("" if prob.get("fallback") != "off" else
+                     "; or `meeting-capture config set linein_fallback 1` to record this Mac's calls meanwhile"))
+        else:
+            _ok(line)
+    except Exception:
+        pass
     print(f"  · settings: {paths.ENV_FILE}")
     if config.restart_pending():
         _fail("settings changed since the recorder started", "meeting-capture restart")

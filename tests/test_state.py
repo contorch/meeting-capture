@@ -30,7 +30,8 @@ def test_transitions_are_written_atomically_with_the_schema():
     r.set("idle")
     d = _doc()
     assert d == {"schema": "meeting-capture.state/1", "pid": os.getpid(), "state": "idle", "since": 1000.0,
-                 "meeting_id": None, "source": "sck", "updated_at": 1000.0}
+                 "meeting_id": None, "source": "sck", "updated_at": 1000.0,
+                 "input": None, "effective_source": "sck", "linein_fallback": True, "problem": None}
     clock.t = 1005
     r.set("recording")
     r.meeting("meeting-2026-10-04T10-00-00")

@@ -60,7 +60,17 @@ from .recorder import (
     mic_capture_supported,
     stream_chunks,
 )
-from .linein import linein_mode_enabled, stream_chunks_linein
+from .linein import (
+    FALLBACK_ENV as LINEIN_FALLBACK_ENV,
+    configured as linein_configured,
+    fallback_enabled as linein_fallback_enabled,
+    linein_mode_enabled,
+    me_channel,
+    problem_code,
+    stream_chunks_linein,
+    them_channel,
+    validate as linein_validate,
+)
 from .live import LIVE_FIXES, live_blocker, live_mode_enabled, run_live_session
 from .transcriber import (
     ChunkFailed,
@@ -90,8 +100,9 @@ BUNDLE_MISSES = 3
 # Line-in listens all the time; it counts as recording while there was sound
 # on an input within this many seconds (state.json).
 LINEIN_ACTIVE_S = 60.0
-# Line-in mode: how long to wait before retrying when the USB interface can't be
-# opened (unplugged, wrong name), so a missing device doesn't crash-loop launchd.
+# Line-in mode: how often to look for the USB interface again while it can't be
+# used (unplugged, wrong name). Meanwhile the call gate is polled every
+# MIC_POLL_INTERVAL, so the fallback to this Mac's call audio starts promptly.
 LINEIN_RETRY_SECONDS = 30.0
 MIC_POLL_INTERVAL = 2.0
 
@@ -925,6 +936,67 @@ def request_stop(reason: str) -> None:
 _stop_timers: list[threading.Timer] = []
 
 
+class LineinWatch:
+    """Configured line-in: can the interface be used? Asked without opening a
+    stream (linein.validate): right away while it works, then at most every
+    LINEIN_RETRY_SECONDS once it doesn't (and right after a fallback call).
+
+    Each failure is logged as before — "line-in capture unavailable: … —
+    retrying in 30s" (pipeline-monitor reads it from older daemons' logs) —
+    and `problem` says what's wrong and since when, for state.json. The
+    interface coming back is logged once."""
+
+    def __init__(self, probe, device: str | None, clock=time.time) -> None:
+        self.probe, self.device, self.clock = probe, device, clock
+        self.problem: dict | None = None
+        self.next_probe = 0.0
+
+    def ready(self) -> bool:
+        if self.problem is not None and self.clock() < self.next_probe:
+            return False
+        try:
+            self.probe()
+        except Exception as exc:   # RuntimeError from validate; anything PortAudio raises
+            self.failed(exc)
+            return False
+        return True
+
+    def opened(self) -> None:
+        """A stream on the interface is running: the outage (if any) is over.
+        Not on a probe alone — a device that lists but won't open stays a
+        problem, with its first "since"."""
+        if self.problem is not None:
+            log.info("line-in: %s is back (unavailable for %s) — recording from the interface again",
+                     repr(self.device) if self.device else "the input", _duration(self.clock() - self.problem["since"]))
+            self.problem = None
+
+    def failed(self, exc: BaseException | str) -> None:
+        msg = str(exc) or type(exc).__name__
+        now = self.clock()
+        log.error("line-in capture unavailable: %s — retrying in %.0fs", msg, LINEIN_RETRY_SECONDS)
+        since = self.problem["since"] if self.problem else now
+        self.problem = {"code": problem_code(msg), "device": self.device, "message": msg[:300], "since": since}
+        self.next_probe = now + LINEIN_RETRY_SECONDS
+
+    def recheck_soon(self) -> None:
+        self.next_probe = 0.0
+
+    def what(self) -> str:
+        """'UMC404HD 192k' not connected / the line-in input is unavailable — for log lines."""
+        if self.problem and self.problem["code"] == "linein_device_missing" and self.device:
+            return f"{self.device!r} not connected"
+        return "the line-in input is unavailable"
+
+
+def _duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 120:
+        return f"{seconds}s"
+    if seconds < 7200:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
 class BundleGuard:
     """Contorch.app moved to the Trash: the recorder must not keep running
     from a deleted bundle (or be restarted at login). Only in the app channel:
@@ -1078,10 +1150,14 @@ def run() -> None:
 
     log.info("meeting-capture daemon starting (pid=%s, mic=%s)", os.getpid(), mic_name() or "unknown")
     _log_engine()
-    linein = linein_mode_enabled()
-    if linein:
+    linein_cfg = linein_mode_enabled()
+    fallback_on = linein_fallback_enabled()
+    if linein_cfg:
         log.info("SOURCE: line-in — reading the USB audio interface continuously "
                  "(not a call participant; chunks only on speech)")
+        log.info("line-in fallback: %s", "on — if the interface is missing during a call on this Mac, "
+                 "this Mac's call audio is recorded instead" if fallback_on else
+                 f"off ({LINEIN_FALLBACK_ENV}) — nothing is recorded while the interface is missing")
     elif live_mode_enabled() and live_permitted():
         log.info("MODE: live — real-time streaming transcription (in-meeting copilot feed)")
     else:
@@ -1093,8 +1169,22 @@ def run() -> None:
     else:
         log.info("mic capture (own voice): disabled via MEETING_CAPTURE_MIC (system audio only)")
 
-    st = state.Recorder(source="linein" if linein else "sck")
+    st = state.Recorder(source="linein" if linein_cfg else "sck",
+                        input=linein_configured() if linein_cfg else None, linein_fallback=fallback_on)
+    watch = LineinWatch(lambda: linein_validate(None, me_channel(), them_channel()),
+                        linein_configured()["device"]) if linein_cfg else None
+    # This session's source: "linein", or "sck" (configured, or the fallback).
+    effective = "linein" if linein_cfg else "sck"
     st.set("paused" if _is_paused() else "idle")
+
+    def _publish_source(active: bool = False) -> None:
+        if watch is None:
+            st.source_state("sck")
+        elif watch.problem is None:
+            st.source_state("linein")
+        else:
+            fb = "active" if active else ("armed" if fallback_on else "off")
+            st.source_state("sck" if fallback_on else None, {**watch.problem, "fallback": fb})
     bundle = BundleGuard()
 
     current_session: str | None = None
@@ -1147,7 +1237,8 @@ def run() -> None:
         # if the call ended, drop back to the idle poll immediately.
         return is_mic_active() and not _is_paused() and not _stopping.is_set()
 
-    def _should_record() -> bool:
+    def _housekeeping() -> bool:
+        """Every poll, recording or not: False once the daemon must stop."""
         if _stopping.is_set():
             return False
         if bundle.gone():
@@ -1171,11 +1262,19 @@ def run() -> None:
                     last_devices.get("output"), devs.get("output"),
                 )
                 last_devices = devs
-        if linein:
+        return True
+
+    def _should_record() -> bool:
+        if not _housekeeping():
+            return False
+        if effective == "linein":
             # Not a call participant, so there is no "mic in use" to wait for:
             # read continuously; the chunker only emits on actual speech.
             if _is_paused():
                 return False
+            if watch.problem is not None:   # called from inside the running stream: it opened
+                watch.opened()
+                _publish_source()
             from . import recorder as _rec
             st.set("recording" if time.time() - _rec.last_voice_at < LINEIN_ACTIVE_S else "idle",
                    current_session)
@@ -1185,29 +1284,75 @@ def run() -> None:
     def _linein_chunks():
         try:
             yield from stream_chunks_linein(AUDIO_DIR, _should_record)
-        except RuntimeError as exc:
-            log.error("line-in capture unavailable: %s — retrying in %.0fs",
-                      exc, LINEIN_RETRY_SECONDS)
-            _stopping.wait(LINEIN_RETRY_SECONDS)
+        except Exception as exc:   # can't open it (RuntimeError), or unplugged mid-stream (PortAudioError)
+            watch.failed(exc)
+            _publish_source()
+
+    def _fallback_ended() -> None:
+        # The call is over: look for the interface again right away; until
+        # it's back the fallback waits for the next call.
+        watch.recheck_soon()
+        _publish_source()
+        log.info("line-in fallback: the call ended — %s",
+                 "looking for the interface again" if not _stopping.is_set() else "stopping")
+
+    off_call_warned: float | None = None   # the outage (its "since") a no-fallback call was logged for
+
+    def _next_source() -> str | None:
+        """Idle until there is something to record. Configured sck: a call
+        on this Mac (another app holds the mic). Line-in: the interface, as
+        long as it can be used; while it can't, a call on this Mac when the
+        fallback is on. None: the daemon is stopping."""
+        nonlocal off_call_warned
+        while _housekeeping():
+            if watch is None:
+                if _should_record():
+                    return "sck"
+            elif not _is_paused():
+                if watch.ready():
+                    _publish_source()
+                    return "linein"
+                _publish_source()
+                if is_mic_active():
+                    if fallback_on:
+                        return "sck"
+                    if off_call_warned != watch.problem["since"]:
+                        off_call_warned = watch.problem["since"]
+                        log.warning("line-in: %s and this Mac is in a call — NOT recording (the line-in "
+                                    "fallback is off; `meeting-capture config set linein_fallback 1` records "
+                                    "this Mac's call audio meanwhile)", watch.what())
+            st.set("paused" if _is_paused() else "idle")
+            _watchdog_tick()
+            _stopping.wait(MIC_POLL_INTERVAL)
+        return None
 
     try:
         while not _stopping.is_set():
-            # Outer loop: idle until the mic is in use by another app (= we're in a call).
-            while not _should_record():
-                if _stopping.is_set():
-                    break
-                st.set("paused" if _is_paused() else "idle")
-                _watchdog_tick()
-                _stopping.wait(MIC_POLL_INTERVAL)
-            if _stopping.is_set():
+            # Outer loop: idle until there's something to record (a call on
+            # this Mac, or the line-in interface).
+            src = _next_source()
+            if src is None:
                 break
+            effective = src
+            linein = src == "linein"
+            fallback = watch is not None and not linein
+            if fallback:
+                # Same chunk/meeting pipeline: a meeting already going on
+                # continues in the same row (SESSION_GAP_SECONDS).
+                _publish_source(active=True)
+                log.warning("line-in: %s — this Mac is in a call: recording this Mac's call audio instead "
+                            "(line-in fallback; %s=0 turns it off)", watch.what(), LINEIN_FALLBACK_ENV)
 
             log.info("line-in: listening on the interface" if linein
                      else "mic active — starting recording session")
             if not linein:
                 st.set("recording")      # the meeting is known at the first chunk
             session_started = time.time()
-            worker.begin_session()
+            if not linein:
+                # A call's "session ended" is logged after its last chunk unless
+                # another call already began. Line-in isn't a call: going back
+                # to it right after a fallback call keeps that call's end line.
+                worker.begin_session()
 
             if live_mode_enabled() and not linein and live_permitted():
                 # Live path: stream to Gemini in real time; finals land in the
@@ -1235,6 +1380,8 @@ def run() -> None:
                 last_chunk_end = time.time()
                 log.info("mic inactive — session ended")
                 st.set("paused" if _is_paused() else "idle")
+                if fallback:
+                    _fallback_ended()
                 if _stopping.is_set():
                     break
                 _after_session(started, session_chunks)
@@ -1255,9 +1402,12 @@ def run() -> None:
 
             worker.end_session()   # logs "mic inactive — session ended" after the last chunk
             st.set("paused" if _is_paused() else "idle")
+            if fallback:
+                _fallback_ended()
             if _stopping.is_set():
                 break
-            _after_session(session_started, session_chunks)
+            if not linein:     # the permission-dialog storm guard is sysaudio's; line-in has the 30 s retry
+                _after_session(session_started, session_chunks)
     except KeyboardInterrupt:
         log.info("interrupted")
     finally:
