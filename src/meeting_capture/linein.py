@@ -45,10 +45,32 @@ SOURCE_ENV = "MEETING_CAPTURE_SOURCE"
 DEVICE_ENV = "MEETING_CAPTURE_INPUT_DEVICE"
 ME_CHANNEL_ENV = "MEETING_CAPTURE_ME_CHANNEL"      # 0-based; default 0 (interface input 1)
 THEM_CHANNEL_ENV = "MEETING_CAPTURE_THEM_CHANNEL"  # 0-based; default 1 (interface input 2)
+# When the line-in device can't be used (unplugged, renamed, PortAudio missing)
+# and this Mac is in a call, record this Mac's own call audio instead of
+# nothing. Default on; 0/off/false/no turns it off.
+FALLBACK_ENV = "MEETING_CAPTURE_LINEIN_FALLBACK"
 
 
 def linein_mode_enabled() -> bool:
     return os.environ.get(SOURCE_ENV, "").strip().lower() == "linein"
+
+
+def fallback_enabled() -> bool:
+    return os.environ.get(FALLBACK_ENV, "").strip().lower() not in ("0", "off", "false", "no")
+
+
+def configured() -> dict:
+    """The line-in settings as this process sees them, for state.json:
+    {device (the spec, or None = default input), me_channel, them_channel}."""
+    return {"device": (os.environ.get(DEVICE_ENV) or "").strip() or None,
+            "me_channel": me_channel(), "them_channel": them_channel()}
+
+
+def problem_code(message: str) -> str:
+    """`linein_device_missing` when the configured device isn't there (the
+    message resolve_device raises), `linein_unavailable` for anything else
+    (PortAudio missing, too few inputs, a stream that failed)."""
+    return "linein_device_missing" if message.startswith("no input device matching") else "linein_unavailable"
 
 
 def _channel(env: str, default: int) -> int:

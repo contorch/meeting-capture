@@ -52,6 +52,7 @@ SETTINGS = (
     "MEETING_CAPTURE_INPUT_DEVICE",    # line-in device (name substring or index)
     "MEETING_CAPTURE_ME_CHANNEL",      # line-in, 0-based
     "MEETING_CAPTURE_THEM_CHANNEL",    # line-in, 0-based
+    "MEETING_CAPTURE_LINEIN_FALLBACK", # line-in device missing during a call: record this Mac's audio (default 1)
     "MEETING_CAPTURE_STT",             # auto | apple | gemini
     "MEETING_CAPTURE_LOCALE",          # on-device language
     "MEETING_CAPTURE_MIC",             # 0 = system audio only

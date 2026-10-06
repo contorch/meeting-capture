@@ -639,3 +639,28 @@ def test_the_package_version_is_pyprojects():
     from meeting_capture import __version__
     pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
     assert __version__ == re.search(r'^version = "([^"]+)"', pyproject, re.M).group(1)
+
+
+def test_status_and_doctor_name_the_source_and_a_missing_interface(fake_helper, agent, monkeypatch, capsys,
+                                                                  tmp_path):
+    import os
+    from meeting_capture import state
+    _quiet_system(monkeypatch, tmp_path)
+    cli._save_settings({"MEETING_CAPTURE_SOURCE": "linein", "MEETING_CAPTURE_INPUT_DEVICE": "UMC404HD 192k",
+                        "MEETING_CAPTURE_ME_CHANNEL": "0", "MEETING_CAPTURE_THEM_CHANNEL": "1"})
+    cli.main(["status"])                                       # no daemon: the settings
+    assert "source:           line-in — UMC404HD 192k (Me in 1 · Them in 2)" in capsys.readouterr().out
+
+    (tmp_path / "daemon.pid").write_text(str(os.getpid()))    # "the daemon" is this process
+    r = state.Recorder(source="linein", input={"device": "UMC404HD 192k", "me_channel": 0, "them_channel": 1})
+    r.set("idle")
+    r.source_state("sck", {"code": "linein_device_missing", "device": "UMC404HD 192k", "since": 1_790_000_000.0,
+                           "message": "no input device matching 'UMC404HD 192k'", "fallback": "armed"})
+    cli.main(["status"])
+    out = capsys.readouterr().out
+    assert "source:           UMC404HD 192k not connected — this Mac's calls are recorded instead" in out
+    assert "source problem:   since " in out
+    assert "state:            idle" in out
+    assert cli.main(["doctor"]) == 1
+    out = capsys.readouterr().out
+    assert "✗ source: UMC404HD 192k not connected — this Mac's calls are recorded instead (since " in out
