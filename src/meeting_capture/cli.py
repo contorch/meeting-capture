@@ -1,5 +1,5 @@
 """CLI: meeting-capture {start,stop,pause,resume,new,status,install,uninstall,run,mic,last,tail,doctor,
-mode,source,stt,language,vocab,devices,ui,live,copilot}."""
+mode,source,linein-fallback,stt,language,vocab,devices,ui,live,copilot}."""
 from __future__ import annotations
 
 import argparse
@@ -97,6 +97,9 @@ def cmd_status(_args) -> int:
     else:
         print(f"  state:            not running")
 
+    for line in _source_lines(pid if running else None):
+        print(line)
+
     last = _last_transcript()
     if last is not None:
         size_kb = len(last["body"].encode("utf-8")) / 1024
@@ -126,6 +129,32 @@ def cmd_status(_args) -> int:
     if parked:
         print(f"  waiting audio:    {parked}")
     return 0
+
+
+def _source_problem(pid: int | None) -> dict | None:
+    """The line-in outage the running daemon reports in its log (sourcelog),
+    or None — also None when no daemon runs or it isn't on line-in."""
+    from . import sourcelog
+    if not pid:
+        return None
+    doc = sourcelog.current(pid, LOG_FILE)
+    return doc["problem"] if doc.get("source") == "linein" else None
+
+
+def _source_lines(pid: int | None) -> list[str]:
+    """`source:` (+ `source problem:`) for status: where the audio comes from
+    and, while the line-in interface can't be used, since when and what the
+    recorder does instead. A status line must not break `status`."""
+    from . import sourcelog
+    try:
+        prob = _source_problem(pid)
+        out = [f"  source:           {sourcelog.describe(current_source(), prob)}"]
+        if prob:
+            since = time.strftime("%H:%M", time.localtime(prob["since"]))
+            out.append(f"  source problem:   since {since} — {prob.get('message')}")
+        return out
+    except Exception as exc:  # noqa: BLE001
+        return [f"  source:           ? ({type(exc).__name__}: {exc})"]
 
 
 def _parked_line() -> str:
@@ -262,6 +291,20 @@ def cmd_doctor(_args) -> int:
             _fail("launchd service not loaded", f"launchctl load -w {LAUNCHD_PLIST}")
     else:
         _fail("launchd plist not installed", "meeting-capture install")
+    try:
+        from . import sourcelog
+        prob = _source_problem(pid if pid and _is_running(pid) else None)
+        line = f"source: {sourcelog.describe(current_source(), prob)}"
+        if prob:
+            since = time.strftime("%H:%M", time.localtime(prob["since"]))
+            _fail(f"{line} (since {since})",
+                  "plug the interface in, or `meeting-capture source sck` to record this Mac's call audio"
+                  + ("; or `meeting-capture linein-fallback on` to record this Mac's calls meanwhile"
+                     if prob.get("fallback") == "off" else ""))
+        else:
+            _ok(line)
+    except Exception:
+        pass
 
     print("\nPaths & data:")
     try:
@@ -663,6 +706,29 @@ def cmd_source(args) -> int:
     print(msg)
     if args.source == "linein":
         print("daemon restarted. It records whenever either input carries speech.")
+    return 0
+
+
+def cmd_linein_fallback(args) -> int:
+    """While the line-in interface is missing, record this Mac's call audio
+    during a call (on, the default) or nothing (off). Stored in the launchd
+    plist (MEETING_CAPTURE_LINEIN_FALLBACK) like every other setting."""
+    from .linein import FALLBACK_ENV, fallback_enabled
+    if args.state is None:
+        on = fallback_enabled(_plist_env())
+        print("on" if on else "off")
+        print("  while the line-in interface is missing, a call on this Mac is "
+              + ("recorded from this Mac's call audio" if on else "not recorded"))
+        return 0
+    if not LAUNCHD_PLIST.exists():
+        print("no launchd agent installed — run `meeting-capture install` first", file=sys.stderr)
+        return 1
+    if args.state == "on":
+        _update_plist_env({}, remove=(FALLBACK_ENV,))
+    else:
+        _update_plist_env({FALLBACK_ENV: "0"})
+    _relaunch()
+    print(f"line-in fallback: {args.state}; daemon restarted")
     return 0
 
 
@@ -1129,6 +1195,10 @@ def main(argv: list[str] | None = None) -> int:
     language.add_argument("locale", nargs="?", help="omit to show the current language and the supported ones")
     language.set_defaults(func=cmd_language)
     sub.add_parser("devices", help="list audio input devices (for line-in)").set_defaults(func=cmd_devices)
+    fb = sub.add_parser("linein-fallback", help="line-in interface missing during a call on this Mac: record "
+                                                "this Mac's call audio instead (on, default) or nothing (off)")
+    fb.add_argument("state", nargs="?", choices=["on", "off"], help="omit to show the setting")
+    fb.set_defaults(func=cmd_linein_fallback)
     ui = sub.add_parser("ui", help="open the recording settings page (source, interface inputs, levels) in the browser")
     ui.add_argument("--port", type=int, default=0, help="port on 127.0.0.1 (default: any free port)")
     ui.add_argument("--no-open", action="store_true", help="print the URL instead of opening the browser")
